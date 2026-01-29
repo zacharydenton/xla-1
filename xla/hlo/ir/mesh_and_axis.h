@@ -128,7 +128,7 @@ class Mesh {
 // C++ representation for corresponding `OpSharding::AxisRef`proto so same
 // documentation applies.
 class AxisRef {
- private:
+ public:
   struct SubAxis {
     int64_t pre_size;
     int64_t size;
@@ -140,6 +140,7 @@ class AxisRef {
     }
   };
 
+ private:
   // Index corresponding to axis in the mesh. It should be a valid index into
   // `mesh.axes_names_`.
   int64_t mesh_axis_index_;
