@@ -376,7 +376,16 @@ NVPTXCompiler::GetCodegenBackends(
           stream_exec, &debug_options, this, target_config));
     }
     if (debug_options.xla_gpu_cublas_fallback()) {
-      if (is_backend_enabled(DebugOptions::AUTOTUNE_BACKEND_CUBLAS)) {
+      bool enable_cublaslt = debug_options.xla_gpu_enable_cublaslt();
+      // Disable cublaslt for pre-Hopper GPUs due to b/481894850.
+      if (target_config->device_description.gpu_compute_capability().IsCuda() &&
+          !target_config->device_description.gpu_compute_capability()
+               .cuda_compute_capability()
+               ->IsAtLeastHopper()) {
+        enable_cublaslt = false;
+      }
+      if (!enable_cublaslt &&
+          is_backend_enabled(DebugOptions::AUTOTUNE_BACKEND_CUBLAS)) {
         backends.push_back(std::make_unique<FissionBackend>(
             &debug_options, this, target_config,
             std::make_unique<CublasBackend>(stream_exec, &debug_options, this,
