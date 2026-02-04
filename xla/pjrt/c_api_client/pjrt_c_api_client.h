@@ -693,6 +693,9 @@ class PjRtCApiExecutable : public PjRtExecutable {
   std::optional<std::vector<OpSharding>> GetOutputShardings() const override;
 
   absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
+  GetParameterLayouts() const override;
+
+  absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
   GetOutputLayouts() const override;
 
   absl::StatusOr<std::vector<std::vector<absl::string_view>>>
