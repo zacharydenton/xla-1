@@ -83,7 +83,11 @@ extern char** environ;
 namespace tsl {
 
 SubProcess::SubProcess(int nfds)
-    : running_(false), pid_(-1), exec_path_(nullptr), exec_argv_(nullptr) {
+    : running_(false),
+      pid_(-1),
+      exit_cb_(nullptr),
+      exec_path_(nullptr),
+      exec_argv_(nullptr) {
   // The input 'nfds' parameter is currently ignored and the internal constant
   // 'kNFds' is used to support the 3 channels (stdin, stdout, stderr).
   for (int i = 0; i < kNFds; i++) {
@@ -173,6 +177,15 @@ void SubProcess::SetChannelAction(Channel chan, ChannelAction action) {
   } else {
     action_[chan] = action;
   }
+}
+
+void SubProcess::SetExitCallback(std::function<void(SubProcess*)> cb) {
+  absl::MutexLock procLock(&proc_mu_);
+  if (running_) {
+    LOG(FATAL) << "SetExitCallback called after the process was started.";
+    return;
+  }
+  exit_cb_ = cb;
 }
 
 #if USE_POSIX_SPAWN
@@ -500,11 +513,16 @@ bool SubProcess::WaitInternal(int* status) {
   }
 
   proc_mu_.Lock();
+  std::function<void(SubProcess*)> cb;
   if ((running_ == running) && (pid_ == pid)) {
     running_ = false;
     pid_ = -1;
+    cb = exit_cb_;
   }
   proc_mu_.Unlock();
+  if (cb != nullptr) {
+    cb(this);
+  }
   return ret;
 }
 
