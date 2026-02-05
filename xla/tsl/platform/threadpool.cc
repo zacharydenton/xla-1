@@ -105,8 +105,8 @@ struct EigenEnvironment {
     return Task(std::move(f), Context(ContextKind::kThread), id);
   }
 
-  void ExecuteTask(const Task& t) {
-    WithContext wc(t.f->context);
+  void ExecuteTask(Task&& t) {
+    WithContext wc(std::move(t.f->context));
     tracing::ScopedRegion region(tracing::EventCategory::kRunClosure,
                                  t.f->trace_id);
     t.f->fn();
