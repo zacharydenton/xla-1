@@ -275,13 +275,14 @@ TEST(PjRtCompilerTest, CompilerFactoryRegistered) {
   EXPECT_TRUE(absl::IsUnimplemented(res.status()));
 }
 
-TEST(PjRtCompilerTest, InitializeCompilerVariant) {
+TEST(PjRtCompilerInitializationTest, InitializeCompilerVariant) {
   const std::string platform = "init_test_platform";
   const std::string variant = "init_variant";
-  const std::string unknown_variant = "unknown_variant";
   auto factory_call_count = std::make_shared<int>(0);
 
-  PjRtRegisterCompilerFactory(
+  PjRtCompilerRegistry compiler_registry;
+
+  compiler_registry.RegisterFactory(
       platform, variant,
       [&]() -> absl::StatusOr<std::unique_ptr<PjRtCompiler>> {
         (*factory_call_count)++;
@@ -291,42 +292,95 @@ TEST(PjRtCompilerTest, InitializeCompilerVariant) {
   EXPECT_EQ(*factory_call_count, 0);
 
   // First call should invoke the factory.
-  auto status = PjRtInitializeCompilerVariant(platform, variant);
+  auto status = compiler_registry.InitializeVariant(platform, variant);
   EXPECT_TRUE(status.ok());
   EXPECT_EQ(*factory_call_count, 1);
 
   // Second call should be a no-op as the compiler is already in the registry.
-  status = PjRtInitializeCompilerVariant(platform, variant);
+  status = compiler_registry.InitializeVariant(platform, variant);
   EXPECT_TRUE(status.ok());
   EXPECT_EQ(*factory_call_count, 1);
 
   // Verify it's actually registered by looking it up.
-  auto compiler = GetPjRtCompiler(platform, variant);
+  auto compiler = compiler_registry.GetCompiler(platform, variant);
   ASSERT_TRUE(compiler.ok());
   EXPECT_NE(*compiler, nullptr);
 }
 
-TEST(PjRtCompilerTest, FactoryError) {
+TEST(PjRtCompilerInitializationTest, InitializeCompilerVariants) {
+  const std::string platform_1 = "platform_1";
+  const std::string platform_2 = "platform_2";
+  const std::string variant_1 = "variant_1";
+  const std::string variant_2 = "variant_2";
+  auto factory_call_count_1 = std::make_shared<int>(0);
+  auto factory_call_count_2 = std::make_shared<int>(0);
+
+  PjRtCompilerRegistry compiler_registry;
+
+  // Register two different compiler factories.
+  compiler_registry.RegisterFactory(
+      platform_1, variant_1,
+      [factory_call_count_1]()
+          -> absl::StatusOr<std::unique_ptr<PjRtCompiler>> {
+        (*factory_call_count_1)++;
+        return std::make_unique<PjRtDeserializeCompiler>();
+      });
+
+  compiler_registry.RegisterFactory(
+      platform_2, variant_2,
+      [factory_call_count_2]()
+          -> absl::StatusOr<std::unique_ptr<PjRtCompiler>> {
+        (*factory_call_count_2)++;
+        return std::make_unique<PjRtDeserializeCompiler>();
+      });
+
+  // Verify factories haven't been called yet.
+  EXPECT_EQ(*factory_call_count_1, 0);
+  EXPECT_EQ(*factory_call_count_2, 0);
+
+  // Initialize all registered variants.
+  auto status = compiler_registry.InitializeAllVariants();
+  EXPECT_TRUE(status.ok());
+
+  // Both new factories should have been invoked exactly once.
+  EXPECT_EQ(*factory_call_count_1, 1);
+  EXPECT_EQ(*factory_call_count_2, 1);
+
+  // Verify the compilers are now available in the registry.
+  auto compiler1 = compiler_registry.GetCompiler(platform_1, variant_1);
+  EXPECT_OK(compiler1);
+  EXPECT_NE(*compiler1, nullptr);
+
+  auto compiler2 = compiler_registry.GetCompiler(platform_2, variant_2);
+  EXPECT_OK(compiler2);
+  EXPECT_NE(*compiler2, nullptr);
+}
+
+TEST(PjRtCompilerInitializationTest, FactoryError) {
   const std::string platform = "error_test_platform";
   const std::string variant = "error_variant";
 
-  PjRtRegisterCompilerFactory(
+  PjRtCompilerRegistry compiler_registry;
+
+  compiler_registry.RegisterFactory(
       platform, variant, []() -> absl::StatusOr<std::unique_ptr<PjRtCompiler>> {
         return absl::InternalError("factory failed");
       });
 
   // The error from the factory should be propagated.
-  auto status = PjRtInitializeCompilerVariant(platform, variant);
+  auto status = compiler_registry.InitializeVariant(platform, variant);
   EXPECT_TRUE(absl::IsInternal(status));
   EXPECT_EQ(status.message(), "factory failed");
 }
 
-TEST(PjRtCompilerTest, UnknownVariantError) {
+TEST(PjRtCompilerInitializationTest, UnknownVariantError) {
   const std::string platform = "unknown_test_platform";
   const std::string variant = "no_such_variant";
 
+  PjRtCompilerRegistry compiler_registry;
+
   // Requesting a variant that has no factory and no registered compiler.
-  auto status = PjRtInitializeCompilerVariant(platform, variant);
+  auto status = compiler_registry.InitializeVariant(platform, variant);
   EXPECT_THAT(
       status,
       StatusIs(absl::StatusCode::kNotFound,
@@ -334,19 +388,20 @@ TEST(PjRtCompilerTest, UnknownVariantError) {
                          "unknown_test_platform, variant: no_such_variant")));
 }
 
-TEST(PjRtCompilerTest, RegistriesOutOfSync) {
+TEST(PjRtCompilerInitializationTest, RegistriesOutOfSync) {
   const std::string platform = "sync_test_platform";
   const std::string variant = "";  // Default variant
   auto factory_called = std::make_shared<bool>(false);
+  PjRtCompilerRegistry compiler_registry;
 
   // Manually register a compiler in the CompilerRegistry.
-  PjRtRegisterDefaultCompiler(platform,
-                              std::make_unique<PjRtDeserializeCompiler>());
+  compiler_registry.RegisterCompiler(
+      platform, variant, std::make_unique<PjRtDeserializeCompiler>());
 
   // Register a factory for the same key in the CompilerFactoryRegistry.
   // This simulates the "out of sync" state where both maps have entries,
   // but the compiler is already "initialized".
-  PjRtRegisterCompilerFactory(
+  compiler_registry.RegisterFactory(
       platform, variant,
       [&]() -> absl::StatusOr<std::unique_ptr<PjRtCompiler>> {
         *factory_called = true;
@@ -354,7 +409,7 @@ TEST(PjRtCompilerTest, RegistriesOutOfSync) {
       });
 
   // Initialize/Access the compiler.
-  auto status = PjRtInitializeCompilerVariant(platform, variant);
+  auto status = compiler_registry.InitializeVariant(platform, variant);
   EXPECT_OK(status);
 
   // Verify that the existing compiler was used and the factory was NOT called.
