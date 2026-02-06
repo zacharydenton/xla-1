@@ -20,6 +20,9 @@ limitations under the License.
 #include <algorithm>
 #include <string>
 
+#include "absl/synchronization/notification.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/tsl/platform/test.h"
 #include "tsl/platform/path.h"
@@ -57,6 +60,12 @@ std::string NoopProgram() {
 std::string StdErrProgram() {
   std::string path = io::JoinPath(testing::XlaSrcRoot(), "tsl", "platform",
                                   "testdata", "test_stderr");
+  return tsl::io::AppendDotExeIfWindows(path);
+}
+
+std::string CrashProgram() {
+  std::string path = io::JoinPath(testing::XlaSrcRoot(), "tsl", "platform",
+                                  "testdata", "test_crash");
   return tsl::io::AppendDotExeIfWindows(path);
 }
 
@@ -227,6 +236,75 @@ TEST_F(SubProcessTest, KillProc) {
   EXPECT_TRUE(proc.Wait());
 
   EXPECT_FALSE(proc.Kill(SIGKILL));
+}
+
+TEST_F(SubProcessTest, ExitCallbackNormal) {
+  tsl::SubProcess proc;
+  proc.SetProgram(NoopProgram(), {NoopProgram()});
+  absl::Notification notification;
+  proc.SetExitCallback([&](SubProcess* p) { notification.Notify(); });
+
+  EXPECT_TRUE(proc.Start());
+  EXPECT_TRUE(proc.Wait());
+  EXPECT_TRUE(notification.HasBeenNotified());
+}
+
+TEST_F(SubProcessTest, ExitCallbackChildKilled) {
+  tsl::SubProcess proc;
+  proc.SetProgram(EchoProgram(), {EchoProgram()});
+  proc.SetChannelAction(CHAN_STDIN, ACTION_PIPE);
+  absl::Notification notification;
+  proc.SetExitCallback([&](SubProcess* p) { notification.Notify(); });
+
+  EXPECT_TRUE(proc.Start());
+  EXPECT_TRUE(proc.Kill(SIGKILL));
+  EXPECT_TRUE(proc.Wait());
+  EXPECT_TRUE(notification.HasBeenNotified());
+}
+
+TEST_F(SubProcessTest, ExitCallbackChildCrash) {
+  tsl::SubProcess proc;
+  proc.SetProgram(CrashProgram(), {CrashProgram()});
+  proc.SetChannelAction(CHAN_STDIN, ACTION_PIPE);
+  absl::Notification notification;
+  proc.SetExitCallback([&](SubProcess* p) { notification.Notify(); });
+
+  EXPECT_TRUE(proc.Start());
+  EXPECT_TRUE(proc.Wait());
+  EXPECT_TRUE(notification.HasBeenNotified());
+}
+
+TEST_F(SubProcessTest, CheckRunningBeforeStart) {
+  tsl::SubProcess proc;
+  proc.SetProgram(NoopProgram(), {NoopProgram()});
+  EXPECT_FALSE(proc.CheckRunning());
+}
+
+TEST_F(SubProcessTest, CheckRunningWhileRunning) {
+  tsl::SubProcess proc;
+  proc.SetProgram(EchoProgram(), {EchoProgram()});
+  proc.SetChannelAction(CHAN_STDIN, ACTION_PIPE);
+  EXPECT_TRUE(proc.Start());
+  EXPECT_TRUE(proc.CheckRunning());  // Should be running, waiting for stdin
+  EXPECT_TRUE(proc.Kill(SIGKILL));
+  EXPECT_TRUE(proc.Wait());
+  EXPECT_FALSE(proc.CheckRunning());  // Should be false now
+}
+
+TEST_F(SubProcessTest, CheckRunningReapsProcess) {
+  tsl::SubProcess proc;
+  proc.SetProgram(NoopProgram(), {NoopProgram()});
+  absl::Notification notification;
+  proc.SetExitCallback([&](SubProcess* p) { notification.Notify(); });
+
+  EXPECT_TRUE(proc.Start());
+  // Poll until process exits and CheckRunning returns false.
+  while (proc.CheckRunning()) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_TRUE(notification.HasBeenNotified());
+  // Since CheckRunning reaped it, Wait should return false.
+  EXPECT_FALSE(proc.Wait());
 }
 
 }  // namespace
