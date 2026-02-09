@@ -49,10 +49,20 @@ PjRtDevice* XdnaBuffer::device() const { return device_; }
 
 PjRtClient* XdnaBuffer::client() const { return client_; }
 
+namespace {
+class XdnaExternalReference : public PjRtBuffer::ExternalReference {
+ public:
+  explicit XdnaExternalReference(void* data_ptr) { data_ptr_ = data_ptr; }
+  ~XdnaExternalReference() override = default;
+};
+}  // namespace
+
 absl::StatusOr<std::unique_ptr<PjRtBuffer::ExternalReference>>
 XdnaBuffer::AcquireExternalReference() {
-  return absl::UnimplementedError(
-      "AcquireExternalReference not supported for XDNA buffers.");
+  if (is_deleted_) {
+    return absl::InternalError("Buffer has been deleted.");
+  }
+  return std::make_unique<XdnaExternalReference>(data_.data());
 }
 
 Future<> XdnaBuffer::ToLiteral(MutableLiteralBase* literal) {
