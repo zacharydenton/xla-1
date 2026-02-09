@@ -38,7 +38,6 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/numeric/bits.h"
 #include "absl/status/status.h"
-#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
@@ -51,7 +50,6 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/ir/hlo_original_value.h"
-#include "xla/hlo/ir/hlo_sharding.h"
 #include "xla/hlo/utils/hlo_sharding_util.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
@@ -818,7 +816,8 @@ bool AlgebraicSimplifierVisitor::ReplaceInstructionIfCompatible(
     return false;
   }
   return ReplaceInstruction(old_instruction, new_instruction,
-                            /*preserve_sharding=*/true)
+                            /*preserve_sharding=*/true,
+                            /*preserve_frontend_attributes=*/true)
       .value();
 }
 
@@ -851,7 +850,8 @@ bool AlgebraicSimplifierVisitor::ReplaceInstructionIfCompatible(
     }
   }
   return ReplaceInstruction(old_instruction, MaybeMakeTuple(new_instructions),
-                            /*preserve_sharding=*/true)
+                            /*preserve_sharding=*/true,
+                            /*preserve_frontend_attributes=*/true)
       .value();
 }
 
@@ -1646,8 +1646,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleBitcastConvert(
       if (!ShapeUtil::LastDimIsMinorMost(shape)) {
         return false;
       }
-      const int type_bit_width =
-          primitive_util::StorageBitWidth(shape.element_type());
+      const int type_bit_width = primitive_util::BitWidth(shape.element_type());
       if (!shape.has_layout() || shape.layout().element_size_in_bits() == 0) {
         return type_bit_width % 8 == 0;
       }
@@ -2724,15 +2723,11 @@ absl::StatusOr<bool> AlgebraicSimplifierVisitor::MoveDotParamToRhs(
   }
   TF_ASSIGN_OR_RETURN(HloInstruction * new_transpose,
                       MakeTransposeHlo(new_dot, permutation));
-  dot->SetupDerivedInstruction(new_dot);
-  dot->SetupDerivedInstruction(new_transpose);
-  TF_RETURN_IF_ERROR(ReplaceInstruction(dot, new_transpose));
-  // Don't propagate the user-guided fusion attribute to the new auto-generated
-  // transpose if it is not an intervening instruction before another must-fuse
-  // instruction.
-  // Note: This is used for backend-specific optimization. In the future, we
-  // should find a better way that does not expose it to the third-party.
-  AmendUserGuidedFusionAttr(new_transpose);
+  SetupDerivedInstruction(dot, new_dot, /*preserve_user_fusion_attr=*/true);
+  SetupDerivedInstruction(dot, new_transpose,
+                          /*preserve_user_fusion_attr=*/false);
+  TF_RETURN_IF_ERROR(ReplaceInstruction(
+      dot, new_transpose, /*preserve_frontend_attributes=*/false));
   return true;
 }
 
@@ -4022,18 +4017,6 @@ absl::Status AlgebraicSimplifierVisitor::HandleDot(HloInstruction* dot) {
     return RewriteAsMultiplyDotWithZeroLhsContractingDim(dot, lhs, rhs, dnums);
   }
 
-  if (dot->user_count() == 1 &&
-      dot->users().front()->IsCustomCall("Sharding")) {
-    const HloInstruction* user = dot->users().front();
-    if (user->has_frontend_attributes()) {
-      std::optional<std::string> sharding_attr =
-          user->get_frontend_attribute(HloSharding::kShardingFrontendAttrName);
-      if (sharding_attr && absl::StrContains(*sharding_attr, "unreduced")) {
-        return absl::OkStatus();
-      }
-    }
-  }
-
   // Reorder nested dots with associativity using flops as a heuristic
   if (options_.use_associative_reordering()) {
     TF_ASSIGN_OR_RETURN(RewriteResult result,
@@ -5284,6 +5267,14 @@ std::optional<std::vector<Chunk>> FindContiguousChunks(
   auto factors =
       CommonFactors(reshape_shape.dimensions(), transpose_shape.dimensions());
 
+  if (factors.empty() ||
+      factors.back() !=
+          std::make_pair(
+              static_cast<int64_t>(reshape_shape.dimensions().size()),
+              static_cast<int64_t>(transpose_shape.dimensions().size()))) {
+    return std::nullopt;
+  }
+
   std::vector<Chunk> chunks;
   chunks.reserve(factors.size() - 1);
 
@@ -6464,7 +6455,8 @@ absl::Status AlgebraicSimplifierVisitor::HandleReshape(
   // Delete no-op reshapes, i.e. where shape = operand shape.
   if (SameShape(reshape, operand)) {
     VLOG(3) << "deleting no-op reshape";
-    return ReplaceInstruction(reshape, operand);
+    return ReplaceInstruction(reshape, operand,
+                              /*preserve_frontend_attributes=*/false);
   }
 
   // Merge reshapes.
@@ -6485,10 +6477,7 @@ absl::Status AlgebraicSimplifierVisitor::HandleReshape(
     return absl::OkStatus();
   }
 
-  if (!options_.is_layout_sensitive() &&
-      // TODO: b/480285332 - Remove the flag once we can enable on all
-      // accelerators.
-      options_.enable_hoist_transpose_of_reshape()) {
+  if (!options_.is_layout_sensitive()) {
     ASSIGN_OR_RETURN(bool hoisted, TryHoistTransposeOfReshape(reshape));
     if (hoisted) {
       return absl::OkStatus();
@@ -7538,19 +7527,25 @@ absl::Status AlgebraicSimplifierVisitor::HandleDynamicSlice(
   if (Match(operand, m::Reshape(&reshape, m::Op(&reshape_operand))) &&
       reshape->ReshapeMerelyInsertsOrDeletes1SizedDimensions().has_value() &&
       !options_.is_layout_sensitive()) {
-    auto unmodified_dims = ShapeUtil::DimensionsUnmodifiedByReshape(
-        reshape_operand->shape(), reshape->shape());
+    int64_t slice_dim = 0;
     HloInstruction* zero = MakeScalarLike(dynamic_slice->mutable_operand(1), 0);
-    std::vector<HloInstruction*> starts(
-        reshape_operand->shape().dimensions().size(), zero);
-    std::vector<int64_t> slice_sizes(
-        reshape_operand->shape().dimensions().size(), 1);
-    for (const auto& [input_dim, output_dim] : unmodified_dims) {
-      if (reshape_operand->shape().dimensions(input_dim) == 1) {
+    std::vector<HloInstruction*> starts;
+    starts.reserve(reshape_operand->shape().dimensions().size());
+    std::vector<int64_t> slice_sizes;
+    slice_sizes.reserve(reshape_operand->shape().dimensions().size());
+    for (int64_t dim = 0; dim < reshape_operand->shape().dimensions().size();
+         ++dim) {
+      if (reshape_operand->shape().dimensions(dim) == 1) {
+        starts.push_back(zero);
+        slice_sizes.push_back(1);
         continue;
       }
-      starts[input_dim] = dynamic_slice->mutable_operand(1 + output_dim);
-      slice_sizes[input_dim] = dynamic_slice->slice_sizes(output_dim);
+      while (dynamic_slice->operand(0)->shape().dimensions(slice_dim) == 1) {
+        ++slice_dim;
+      }
+      starts.push_back(dynamic_slice->mutable_operand(1 + slice_dim));
+      slice_sizes.push_back(dynamic_slice->slice_sizes(slice_dim));
+      ++slice_dim;
     }
     HloInstruction* new_dynamic_slice =
         dynamic_slice->AddInstruction(HloInstruction::CreateDynamicSlice(
