@@ -20,7 +20,6 @@ limitations under the License.
 #include <functional>
 #include <memory>
 #include <string>
-#include <vector>
 
 #include "absl/functional/any_invocable.h"
 #include "absl/status/statusor.h"
@@ -29,6 +28,7 @@ limitations under the License.
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_future.h"
 #include "xla/shape.h"
+#include "xrt/xrt_bo.h"
 
 namespace xla {
 
@@ -36,7 +36,7 @@ class XdnaBuffer : public PjRtBuffer {
  public:
   XdnaBuffer(PjRtClient* client, PjRtDevice* device,
              PjRtMemorySpace* memory_space, Shape on_device_shape,
-             std::vector<uint8_t> data);
+             xrt::bo bo);
 
   ~XdnaBuffer() override = default;
 
@@ -71,14 +71,12 @@ class XdnaBuffer : public PjRtBuffer {
   Future<> GetReadyFuture() override;
   bool IsOnCpu() const override;
 
-  const std::vector<uint8_t>& raw_data() const { return data_; }
-
  private:
   PjRtClient* client_;
   PjRtDevice* device_;
   PjRtMemorySpace* memory_space_;
   Shape on_device_shape_;
-  std::vector<uint8_t> data_;
+  xrt::bo xrt_bo_;
   bool is_deleted_ = false;
 };
 

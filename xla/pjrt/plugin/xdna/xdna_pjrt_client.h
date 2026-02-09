@@ -22,6 +22,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -33,12 +34,12 @@ limitations under the License.
 
 namespace xla {
 
-// Creates the XDNA PJRT client. The client opens the NPU device via XRT.
-std::unique_ptr<PjRtClient> CreateXdnaPjrtClient();
+// Creates the XDNA PJRT client. Returns an error if no NPU device is available.
+absl::StatusOr<std::unique_ptr<PjRtClient>> CreateXdnaPjrtClient();
 
 class XdnaPjrtClient : public PjRtClient {
  public:
-  XdnaPjrtClient();
+  explicit XdnaPjrtClient(xrt::device device);
   ~XdnaPjrtClient() override = default;
 
   absl::string_view platform_name() const override;
@@ -70,7 +71,7 @@ class XdnaPjrtClient : public PjRtClient {
   std::vector<PjRtDevice*> addressable_devices_;
   std::vector<PjRtMemorySpace*> memory_spaces_;
   std::string platform_version_;
-  std::optional<xrt::device> xrt_device_;
+  xrt::device xrt_device_;
 };
 
 }  // namespace xla

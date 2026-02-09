@@ -30,79 +30,77 @@ limitations under the License.
 namespace xla {
 namespace {
 
-TEST(XdnaPjrtClientTest, PlatformName) {
-  auto client = CreateXdnaPjrtClient();
-  EXPECT_EQ(client->platform_name(), "xdna");
+class XdnaPjrtClientTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    auto client_or = CreateXdnaPjrtClient();
+    if (!client_or.ok()) {
+      GTEST_SKIP() << "No XDNA device: " << client_or.status().message();
+    }
+    client_ = std::move(*client_or);
+  }
+
+  std::unique_ptr<PjRtClient> client_;
+};
+
+TEST_F(XdnaPjrtClientTest, PlatformName) {
+  EXPECT_EQ(client_->platform_name(), "xdna");
 }
 
-TEST(XdnaPjrtClientTest, PlatformVersion) {
-  auto client = CreateXdnaPjrtClient();
-  EXPECT_FALSE(client->platform_version().empty());
-  // Should contain "XDNA NPU" regardless of whether hardware is present.
-  EXPECT_THAT(std::string(client->platform_version()),
+TEST_F(XdnaPjrtClientTest, PlatformVersion) {
+  EXPECT_THAT(std::string(client_->platform_version()),
               ::testing::HasSubstr("XDNA NPU"));
 }
 
-TEST(XdnaPjrtClientTest, DeviceCount) {
-  auto client = CreateXdnaPjrtClient();
-  EXPECT_EQ(client->device_count(), 1);
+TEST_F(XdnaPjrtClientTest, DeviceCount) {
+  EXPECT_EQ(client_->device_count(), 1);
 }
 
-TEST(XdnaPjrtClientTest, AddressableDeviceCount) {
-  auto client = CreateXdnaPjrtClient();
-  EXPECT_EQ(client->addressable_device_count(), 1);
+TEST_F(XdnaPjrtClientTest, AddressableDeviceCount) {
+  EXPECT_EQ(client_->addressable_device_count(), 1);
 }
 
-TEST(XdnaPjrtClientTest, DevicesNotEmpty) {
-  auto client = CreateXdnaPjrtClient();
-  EXPECT_FALSE(client->devices().empty());
-  EXPECT_EQ(client->devices().size(), 1);
+TEST_F(XdnaPjrtClientTest, DevicesNotEmpty) {
+  EXPECT_FALSE(client_->devices().empty());
+  EXPECT_EQ(client_->devices().size(), 1);
 }
 
-TEST(XdnaPjrtClientTest, DeviceIsAddressable) {
-  auto client = CreateXdnaPjrtClient();
-  EXPECT_TRUE(client->devices()[0]->IsAddressable());
+TEST_F(XdnaPjrtClientTest, DeviceIsAddressable) {
+  EXPECT_TRUE(client_->devices()[0]->IsAddressable());
 }
 
-TEST(XdnaPjrtClientTest, DeviceKind) {
-  auto client = CreateXdnaPjrtClient();
-  EXPECT_EQ(client->devices()[0]->device_kind(), "XDNA");
+TEST_F(XdnaPjrtClientTest, DeviceKind) {
+  EXPECT_EQ(client_->devices()[0]->device_kind(), "XDNA");
 }
 
-TEST(XdnaPjrtClientTest, MemorySpacesNotEmpty) {
-  auto client = CreateXdnaPjrtClient();
-  EXPECT_FALSE(client->memory_spaces().empty());
-  EXPECT_EQ(client->memory_spaces().size(), 1);
+TEST_F(XdnaPjrtClientTest, MemorySpacesNotEmpty) {
+  EXPECT_FALSE(client_->memory_spaces().empty());
+  EXPECT_EQ(client_->memory_spaces().size(), 1);
 }
 
-TEST(XdnaPjrtClientTest, LookupDevice) {
-  auto client = CreateXdnaPjrtClient();
-  auto device = client->LookupDevice(PjRtGlobalDeviceId(0));
+TEST_F(XdnaPjrtClientTest, LookupDevice) {
+  auto device = client_->LookupDevice(PjRtGlobalDeviceId(0));
   ASSERT_TRUE(device.ok());
   EXPECT_EQ((*device)->global_device_id(), PjRtGlobalDeviceId(0));
 }
 
-TEST(XdnaPjrtClientTest, LookupDeviceNotFound) {
-  auto client = CreateXdnaPjrtClient();
-  auto device = client->LookupDevice(PjRtGlobalDeviceId(999));
+TEST_F(XdnaPjrtClientTest, LookupDeviceNotFound) {
+  auto device = client_->LookupDevice(PjRtGlobalDeviceId(999));
   EXPECT_FALSE(device.ok());
 }
 
-TEST(XdnaPjrtClientTest, BufferRoundTrip) {
-  auto client = CreateXdnaPjrtClient();
-  // Create a buffer with known data.
+TEST_F(XdnaPjrtClientTest, BufferRoundTrip) {
   std::vector<float> host_data = {1.0f, 2.0f, 3.0f, 4.0f};
-  auto buffer_or = client->BufferFromHostBuffer(
+  auto buffer_or = client_->BufferFromHostBuffer(
       host_data.data(), PrimitiveType::F32, {4},
       /*byte_strides=*/std::nullopt,
       PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
       /*on_done_with_host_buffer=*/nullptr,
-      client->memory_spaces()[0],
+      client_->memory_spaces()[0],
       /*device_layout=*/nullptr);
   ASSERT_TRUE(buffer_or.ok());
   auto buffer = std::move(*buffer_or);
 
-  // Read the data back.
   auto literal = LiteralUtil::CreateR1<float>({0.0f, 0.0f, 0.0f, 0.0f});
   auto status = buffer->ToLiteral(&literal);
   ASSERT_TRUE(status.Await().ok());
@@ -113,15 +111,14 @@ TEST(XdnaPjrtClientTest, BufferRoundTrip) {
   EXPECT_EQ(literal.Get<float>({3}), 4.0f);
 }
 
-TEST(XdnaPjrtClientTest, BufferDelete) {
-  auto client = CreateXdnaPjrtClient();
+TEST_F(XdnaPjrtClientTest, BufferDelete) {
   std::vector<float> host_data = {1.0f};
-  auto buffer_or = client->BufferFromHostBuffer(
+  auto buffer_or = client_->BufferFromHostBuffer(
       host_data.data(), PrimitiveType::F32, {1},
       /*byte_strides=*/std::nullopt,
       PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
       /*on_done_with_host_buffer=*/nullptr,
-      client->memory_spaces()[0],
+      client_->memory_spaces()[0],
       /*device_layout=*/nullptr);
   ASSERT_TRUE(buffer_or.ok());
   auto buffer = std::move(*buffer_or);
@@ -149,7 +146,10 @@ TEST(XdnaCApiTest, CanCreateClient) {
   args.kv_get_user_arg = nullptr;
   args.kv_put_user_arg = nullptr;
   PJRT_Error* error = api->PJRT_Client_Create(&args);
-  EXPECT_THAT(error, ::testing::IsNull());
+  // May fail if no hardware is present — that's expected.
+  if (error != nullptr) {
+    GTEST_SKIP() << "No XDNA device available for C API test.";
+  }
   if (args.client != nullptr) {
     PJRT_Client_Destroy_Args destroy_args;
     destroy_args.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;

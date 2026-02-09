@@ -28,8 +28,12 @@ limitations under the License.
 namespace xdna_pjrt {
 
 PJRT_Error* PJRT_XdnaClient_Create(PJRT_Client_Create_Args* args) {
-  std::unique_ptr<xla::PjRtClient> client = xla::CreateXdnaPjrtClient();
-  args->client = pjrt::CreateWrapperClient(std::move(client));
+  absl::StatusOr<std::unique_ptr<xla::PjRtClient>> client_or =
+      xla::CreateXdnaPjrtClient();
+  if (!client_or.ok()) {
+    return new PJRT_Error{client_or.status()};
+  }
+  args->client = pjrt::CreateWrapperClient(std::move(*client_or));
   return nullptr;
 }
 

@@ -44,7 +44,13 @@ constexpr char kXdnaPlatformName[] = "xdna";
 constexpr char kXdnaBackendName[] = "xdna";
 }  // namespace
 
-XdnaPjrtClient::XdnaPjrtClient() {
+XdnaPjrtClient::XdnaPjrtClient(xrt::device device)
+    : xrt_device_(std::move(device)) {
+  std::string device_name =
+      xrt_device_.get_info<xrt::info::device::name>();
+  LOG(INFO) << "XDNA: Opened XRT device: " << device_name;
+  platform_version_ = absl::StrCat("XDNA NPU (", device_name, ")");
+
   // Create one device and one memory space.
   device_ = std::make_unique<XdnaDevice>(this, /*id=*/0, /*process_index=*/0);
   memory_space_ = std::make_unique<XdnaMemorySpace>(this, /*id=*/0);
@@ -56,20 +62,6 @@ XdnaPjrtClient::XdnaPjrtClient() {
   devices_.push_back(device_.get());
   addressable_devices_.push_back(device_.get());
   memory_spaces_.push_back(memory_space_.get());
-
-  // Try to open the XRT device for hardware access.
-  try {
-    xrt_device_.emplace(0);
-    std::string device_name =
-        xrt_device_->get_info<xrt::info::device::name>();
-    LOG(INFO) << "XDNA: Opened XRT device: " << device_name;
-    platform_version_ = absl::StrCat("XDNA NPU (", device_name, ")");
-  } catch (const std::exception& e) {
-    LOG(WARNING) << "XDNA: Could not open XRT device: " << e.what()
-                 << ". Running in host-only mode.";
-    xrt_device_.reset();
-    platform_version_ = "XDNA NPU (no hardware)";
-  }
 }
 
 absl::string_view XdnaPjrtClient::platform_name() const {
@@ -142,10 +134,13 @@ XdnaPjrtClient::BufferFromHostBuffer(
   Shape shape = ShapeUtil::MakeShape(type, dims);
   int64_t byte_size = ShapeUtil::ByteSizeOf(shape);
 
-  // Copy data into a host-side buffer.
-  std::vector<uint8_t> buffer_data(byte_size);
+  // Allocate an XRT buffer object (host-only for now; Step 4 will use
+  // hw_context-based BOs for kernel dispatch).
+  xrt::bo bo(xrt_device_, byte_size, xrt::bo::flags::host_only, /*grp=*/0);
+
+  // Copy host data into the buffer.
   if (data != nullptr && byte_size > 0) {
-    std::memcpy(buffer_data.data(), data, byte_size);
+    bo.write(data, byte_size, /*seek=*/0);
   }
 
   // Notify caller we're done with their host buffer.
@@ -160,12 +155,17 @@ XdnaPjrtClient::BufferFromHostBuffer(
   }
 
   return std::make_unique<XdnaBuffer>(this, device, memory_space,
-                                      std::move(shape),
-                                      std::move(buffer_data));
+                                      std::move(shape), std::move(bo));
 }
 
-std::unique_ptr<PjRtClient> CreateXdnaPjrtClient() {
-  return std::make_unique<XdnaPjrtClient>();
+absl::StatusOr<std::unique_ptr<PjRtClient>> CreateXdnaPjrtClient() {
+  try {
+    xrt::device device(0);
+    return std::make_unique<XdnaPjrtClient>(std::move(device));
+  } catch (const std::exception& e) {
+    return absl::UnavailableError(
+        absl::StrCat("Failed to open XDNA device: ", e.what()));
+  }
 }
 
 }  // namespace xla
