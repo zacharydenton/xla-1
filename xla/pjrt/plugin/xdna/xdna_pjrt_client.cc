@@ -17,14 +17,18 @@ limitations under the License.
 
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/functional/any_invocable.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -53,7 +57,19 @@ XdnaPjrtClient::XdnaPjrtClient() {
   addressable_devices_.push_back(device_.get());
   memory_spaces_.push_back(memory_space_.get());
 
-  platform_version_ = "XDNA NPU Phase 1 (operator dispatch)";
+  // Try to open the XRT device for hardware access.
+  try {
+    xrt_device_.emplace(0);
+    std::string device_name =
+        xrt_device_->get_info<xrt::info::device::name>();
+    LOG(INFO) << "XDNA: Opened XRT device: " << device_name;
+    platform_version_ = absl::StrCat("XDNA NPU (", device_name, ")");
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "XDNA: Could not open XRT device: " << e.what()
+                 << ". Running in host-only mode.";
+    xrt_device_.reset();
+    platform_version_ = "XDNA NPU (no hardware)";
+  }
 }
 
 absl::string_view XdnaPjrtClient::platform_name() const {

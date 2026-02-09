@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "absl/strings/string_view.h"
@@ -28,6 +29,7 @@ limitations under the License.
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_buffer.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_device.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_executable.h"
+#include "xrt/xrt_device.h"
 
 namespace xla {
 
@@ -68,6 +70,7 @@ class XdnaPjrtClient : public PjRtClient {
   std::vector<PjRtDevice*> addressable_devices_;
   std::vector<PjRtMemorySpace*> memory_spaces_;
   std::string platform_version_;
+  std::optional<xrt::device> xrt_device_;
 };
 
 }  // namespace xla

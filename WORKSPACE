@@ -168,3 +168,40 @@ nightly_timestamp_repo(name = "nightly_timestamp")
 load("//build_tools/pjrt_wheels:release_candidate.bzl", "rc_number_repo")
 
 rc_number_repo(name = "rc_number")
+
+# libuuid headers (required by XRT).
+# Only expose uuid/uuid.h without pulling in the full /usr/include.
+new_local_repository(
+    name = "libuuid",
+    build_file_content = """
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+cc_library(
+    name = "uuid",
+    hdrs = ["uuid.h"],
+    include_prefix = "uuid",
+    visibility = ["//visibility:public"],
+)
+""",
+    path = "/usr/include/uuid",
+)
+
+# XRT (Xilinx Runtime) for XDNA NPU support.
+# Requires XRT to be installed at /opt/xilinx/xrt/.
+# Install from: https://github.com/amd/xdna-driver
+new_local_repository(
+    name = "xrt",
+    build_file_content = """
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+cc_library(
+    name = "xrt_coreutil",
+    hdrs = glob(["include/**/*.h"]),
+    srcs = glob(["lib/libxrt_coreutil.so*"]),
+    includes = ["include"],
+    deps = ["@libuuid//:uuid"],
+    visibility = ["//visibility:public"],
+)
+""",
+    path = "/opt/xilinx/xrt",
+)

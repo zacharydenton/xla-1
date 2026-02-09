@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -37,6 +38,9 @@ TEST(XdnaPjrtClientTest, PlatformName) {
 TEST(XdnaPjrtClientTest, PlatformVersion) {
   auto client = CreateXdnaPjrtClient();
   EXPECT_FALSE(client->platform_version().empty());
+  // Should contain "XDNA NPU" regardless of whether hardware is present.
+  EXPECT_THAT(std::string(client->platform_version()),
+              ::testing::HasSubstr("XDNA NPU"));
 }
 
 TEST(XdnaPjrtClientTest, DeviceCount) {
