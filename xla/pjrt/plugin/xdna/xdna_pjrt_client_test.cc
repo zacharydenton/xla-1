@@ -24,6 +24,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "xla/literal_util.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/plugin/xdna/xdna_c_pjrt.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 
@@ -125,6 +126,19 @@ TEST_F(XdnaPjrtClientTest, BufferDelete) {
   EXPECT_FALSE(buffer->IsDeleted());
   buffer->Delete();
   EXPECT_TRUE(buffer->IsDeleted());
+}
+
+TEST_F(XdnaPjrtClientTest, LoadSerializedExecutableEmpty) {
+  auto result = client_->LoadSerializedExecutable(
+      "", /*options=*/std::nullopt, LoadOptions{});
+  EXPECT_FALSE(result.ok());
+}
+
+TEST_F(XdnaPjrtClientTest, LoadSerializedExecutableInvalidData) {
+  std::string garbage = "this is not a valid ELF";
+  auto result = client_->LoadSerializedExecutable(
+      garbage, /*options=*/std::nullopt, LoadOptions{});
+  EXPECT_FALSE(result.ok());
 }
 
 // C API tests.

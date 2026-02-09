@@ -28,17 +28,27 @@ limitations under the License.
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/pjrt_future.h"
 #include "xla/service/computation_placer.h"
+#include "xrt/experimental/xrt_elf.h"
+#include "xrt/experimental/xrt_hw_context.h"
+#include "xrt/xrt_kernel.h"
 
 namespace xla {
 
-// A minimal PjRtLoadedExecutable for XDNA NPU.
-// Phase 1: returns Unimplemented for compilation. Users provide pre-compiled
-// XCLBINs and execute them through LoadXclbin().
+// PjRtLoadedExecutable for XDNA NPU that dispatches pre-compiled ELF kernels.
+//
+// Phase 1: No compiler integration. Users provide pre-compiled ELF binaries
+// via LoadSerializedExecutable(). Execute() binds user-provided buffers to
+// kernel arguments and runs the kernel on the NPU.
+//
+// All argument_handles passed to Execute are bound as kernel global arguments
+// in order. The kernel modifies buffers in-place; Execute returns empty output.
 class XdnaExecutable : public PjRtLoadedExecutable {
  public:
+  // Construct an executable from XRT objects loaded from an ELF.
   XdnaExecutable(PjRtClient* client,
                  absl::Span<PjRtDevice* const> addressable_devices,
-                 absl::string_view name);
+                 xrt::elf elf, xrt::hw_context hw_context,
+                 xrt::kernel kernel, absl::string_view name);
 
   ~XdnaExecutable() override = default;
 
@@ -79,6 +89,10 @@ class XdnaExecutable : public PjRtLoadedExecutable {
   std::vector<PjRtDevice*> addressable_devices_;
   std::string name_;
   bool is_deleted_ = false;
+
+  xrt::elf elf_;
+  xrt::hw_context hw_context_;
+  xrt::kernel kernel_;
 };
 
 }  // namespace xla

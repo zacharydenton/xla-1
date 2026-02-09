@@ -34,6 +34,7 @@ limitations under the License.
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_buffer.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_device.h"
+#include "xla/pjrt/plugin/xdna/xdna_pjrt_executable.h"
 #include "xla/shape_util.h"
 #include "tsl/platform/fingerprint.h"
 
@@ -134,13 +135,11 @@ XdnaPjrtClient::BufferFromHostBuffer(
   Shape shape = ShapeUtil::MakeShape(type, dims);
   int64_t byte_size = ShapeUtil::ByteSizeOf(shape);
 
-  // Allocate an XRT buffer object (host-only for now; Step 4 will use
-  // hw_context-based BOs for kernel dispatch).
-  xrt::bo bo(xrt_device_, byte_size, xrt::bo::flags::host_only, /*grp=*/0);
-
-  // Copy host data into the buffer.
+  // Copy host data into a raw byte buffer. Device-accessible BOs are allocated
+  // at execution time through the hw_context.
+  std::vector<uint8_t> buffer_data(byte_size, 0);
   if (data != nullptr && byte_size > 0) {
-    bo.write(data, byte_size, /*seek=*/0);
+    std::memcpy(buffer_data.data(), data, byte_size);
   }
 
   // Notify caller we're done with their host buffer.
@@ -148,14 +147,48 @@ XdnaPjrtClient::BufferFromHostBuffer(
     std::move(on_done_with_host_buffer)();
   }
 
-  // Determine which device and memory space to use.
   PjRtDevice* device = device_.get();
   if (memory_space == nullptr) {
     memory_space = memory_space_.get();
   }
 
   return std::make_unique<XdnaBuffer>(this, device, memory_space,
-                                      std::move(shape), std::move(bo));
+                                      std::move(shape),
+                                      std::move(buffer_data));
+}
+
+absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>>
+XdnaPjrtClient::LoadSerializedExecutable(
+    absl::string_view serialized, std::optional<CompileOptions> options,
+    const LoadOptions& load_options) {
+  if (serialized.empty()) {
+    return absl::InvalidArgumentError("Serialized executable is empty.");
+  }
+
+  try {
+    // Parse the raw ELF bytes.
+    xrt::elf elf(serialized.data(), serialized.size());
+
+    // Create a hardware context from the ELF.
+    xrt::hw_context hw_ctx(xrt_device_, elf);
+
+    // Extract kernel name from the ELF.
+    auto kernels = elf.get_kernels();
+    if (kernels.empty()) {
+      return absl::InvalidArgumentError("ELF contains no kernels.");
+    }
+    std::string kernel_name = kernels[0].get_name();
+
+    // Create a kernel handle.
+    xrt::kernel kernel(hw_ctx, kernel_name);
+
+    return std::make_unique<XdnaExecutable>(
+        this, addressable_devices_, std::move(elf), std::move(hw_ctx),
+        std::move(kernel), kernel_name);
+  } catch (const std::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("Failed to load ELF executable: ", e.what()));
+  }
 }
 
 absl::StatusOr<std::unique_ptr<PjRtClient>> CreateXdnaPjrtClient() {

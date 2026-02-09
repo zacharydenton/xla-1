@@ -64,6 +64,11 @@ class XdnaPjrtClient : public PjRtClient {
       absl::AnyInvocable<void() &&> on_done_with_host_buffer,
       PjRtMemorySpace* memory_space, const Layout* device_layout) override;
 
+  absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>>
+  LoadSerializedExecutable(absl::string_view serialized,
+                           std::optional<CompileOptions> options,
+                           const LoadOptions& load_options) override;
+
  private:
   std::unique_ptr<XdnaDevice> device_;
   std::unique_ptr<XdnaMemorySpace> memory_space_;

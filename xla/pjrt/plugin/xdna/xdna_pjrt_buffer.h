@@ -20,6 +20,7 @@ limitations under the License.
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "absl/functional/any_invocable.h"
 #include "absl/status/statusor.h"
@@ -28,15 +29,21 @@ limitations under the License.
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_future.h"
 #include "xla/shape.h"
-#include "xrt/xrt_bo.h"
 
 namespace xla {
 
+// Host-resident buffer for the XDNA NPU.
+//
+// Stores raw bytes in host memory. The XDNA NPU shares system memory with the
+// CPU, so there is no separate "device memory" to manage. Device-accessible
+// buffer objects (xrt::bo) are allocated at execution time through the
+// hw_context, with data copied once from this host staging area into the
+// DMA-mapped BO.
 class XdnaBuffer : public PjRtBuffer {
  public:
   XdnaBuffer(PjRtClient* client, PjRtDevice* device,
              PjRtMemorySpace* memory_space, Shape on_device_shape,
-             xrt::bo bo);
+             std::vector<uint8_t> data);
 
   ~XdnaBuffer() override = default;
 
@@ -71,12 +78,16 @@ class XdnaBuffer : public PjRtBuffer {
   Future<> GetReadyFuture() override;
   bool IsOnCpu() const override;
 
+  // Access the raw host data for kernel dispatch.
+  absl::Span<const uint8_t> raw_data() const { return data_; }
+  absl::Span<uint8_t> mutable_raw_data() { return absl::MakeSpan(data_); }
+
  private:
   PjRtClient* client_;
   PjRtDevice* device_;
   PjRtMemorySpace* memory_space_;
   Shape on_device_shape_;
-  xrt::bo xrt_bo_;
+  std::vector<uint8_t> data_;
   bool is_deleted_ = false;
 };
 

@@ -35,7 +35,6 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
-        "@xrt//:xrt_coreutil",
     ],
 )
 
@@ -44,14 +43,18 @@ cc_library(
     srcs = ["xdna_pjrt_executable.cc"],
     hdrs = ["xdna_pjrt_executable.h"],
     deps = [
+        ":xdna_pjrt_buffer",
         "//xla/pjrt:pjrt_client",
         "//xla/pjrt:pjrt_executable",
         "//xla/pjrt:pjrt_future",
         "//xla/service:computation_placer",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
+        "@xrt//:xrt_coreutil",
     ],
 )
 
@@ -111,6 +114,7 @@ xla_cc_test(
         ":xdna_pjrt_client",
         "//xla:literal_util",
         "//xla/pjrt:pjrt_client",
+        "//xla/pjrt:pjrt_executable",
         "//xla/pjrt/c:pjrt_c_api_hdrs",
         "//xla/tests:xla_internal_test_main",
         "@com_google_googletest//:gtest",
