@@ -111,6 +111,24 @@ class XdnaExecutable : public PjRtLoadedExecutable {
 
   absl::string_view name() const override;
 
+  absl::StatusOr<std::string> FingerprintExecutable() const override;
+  absl::StatusOr<std::string> SerializeExecutable() const override;
+  absl::StatusOr<struct CompileOptions> GetCompileOptions() const override;
+  absl::StatusOr<std::vector<std::shared_ptr<HloModule>>>
+  GetHloModules() const override;
+  absl::StatusOr<std::vector<Shape>> GetOutputShapes() const override;
+  absl::StatusOr<std::vector<std::vector<PrimitiveType>>>
+  GetOutputElementTypes() const override;
+  absl::StatusOr<std::vector<std::vector<DimensionVector>>>
+  GetOutputDimensions() const override;
+  absl::StatusOr<std::vector<std::vector<absl::string_view>>>
+  GetOutputMemoryKinds() const override;
+  absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
+  GetParameterLayouts() const override;
+  absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
+  GetOutputLayouts() const override;
+  absl::StatusOr<CompiledMemoryStats> GetCompiledMemoryStats() const override;
+
  private:
   PjRtClient* client_;
   DeviceAssignment device_assignment_;

@@ -234,8 +234,12 @@ xla_cc_test(
 
 xla_cc_binary(
     name = "pjrt_c_api_xdna_plugin.so",
+    linkopts = [
+        "-Wl,--version-script,$(location :exported_symbols.lds)",
+    ],
     linkshared = True,
     deps = [
         ":xdna_c_pjrt",
+        ":exported_symbols.lds",
     ],
 )

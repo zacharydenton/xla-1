@@ -15,11 +15,13 @@ limitations under the License.
 
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_executable.h"
 
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -34,6 +36,22 @@ limitations under the License.
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_buffer.h"
 #include "xla/service/computation_placer.h"
 #include "xla/shape_util.h"
+
+// Debug trace that bypasses libc buffering (hermetic toolchain may have
+// different stderr buffering behavior in dlopen'd libraries).
+#define XDNA_TRACE(msg) \
+  do { \
+    char buf[256]; \
+    int n = snprintf(buf, sizeof(buf), "%s\n", msg); \
+    (void)write(STDERR_FILENO, buf, n); \
+  } while (0)
+
+#define XDNA_TRACEF(fmt, ...) \
+  do { \
+    char buf[512]; \
+    int n = snprintf(buf, sizeof(buf), fmt "\n", ##__VA_ARGS__); \
+    (void)write(STDERR_FILENO, buf, n); \
+  } while (0)
 
 namespace xla {
 
@@ -87,20 +105,24 @@ XdnaExecutable::XdnaExecutable(
         addressable_devices_.front()->global_device_id().value();
   }
   LOG(INFO) << "XDNA: Loaded executable '" << name_ << "' (xclbin)";
+  XDNA_TRACEF("XDNA: XdnaExecutable xclbin ctor done ('%s')", name_.c_str());
 }
 
 PjRtClient* XdnaExecutable::client() const { return client_; }
 
 const DeviceAssignment& XdnaExecutable::device_assignment() const {
+  XDNA_TRACE("XDNA: device_assignment() called");
   return device_assignment_;
 }
 
 absl::Span<const PjRtLoadedExecutable::LogicalDeviceIds>
 XdnaExecutable::addressable_device_logical_ids() const {
+  XDNA_TRACE("XDNA: addressable_device_logical_ids() called");
   return addressable_device_logical_ids_;
 }
 
 absl::Span<PjRtDevice* const> XdnaExecutable::addressable_devices() const {
+  XDNA_TRACE("XDNA: addressable_devices() called");
   return addressable_devices_;
 }
 
@@ -117,6 +139,10 @@ XdnaExecutable::Execute(
         "XDNA supports single-device execution only, got ",
         argument_handles.size(), " device argument sets."));
   }
+
+  XDNA_TRACEF("XDNA: Execute called with %zu args, returned_futures=%d",
+              argument_handles[0].size(),
+              static_cast<int>(returned_futures.has_value()));
 
   std::optional<Future<>> returned_future;
   auto result = ExecuteSharded(argument_handles[0],
@@ -151,6 +177,13 @@ XdnaExecutable::ExecuteSharded(
   bool has_outputs = (convention_ == XdnaKernelConvention::kDpu &&
                       !output_shapes_.empty());
 
+  XDNA_TRACEF("XDNA: ExecuteSharded '%s' with %zu args, convention=%s, "
+              "has_outputs=%d, num_output_shapes=%zu, instr_words=%zu",
+              name_.c_str(), argument_handles.size(),
+              (convention_ == XdnaKernelConvention::kDpu ? "kDpu" : "kDirect"),
+              static_cast<int>(has_outputs), output_shapes_.size(),
+              instr_words_.size());
+
   try {
     xrt::run run(kernel_);
     std::vector<xrt::bo> input_bos;
@@ -161,6 +194,8 @@ XdnaExecutable::ExecuteSharded(
     if (convention_ == XdnaKernelConvention::kDpu && !instr_words_.empty()) {
       size_t instr_size = instr_words_.size() * sizeof(uint32_t);
       int instr_grp = kernel_.group_id(1);
+      XDNA_TRACEF("XDNA: Setting up instruction BO, size=%zu words=%zu grp=%d",
+                  instr_size, instr_words_.size(), instr_grp);
       instr_bo = xrt::bo(hw_context_, instr_size,
                          xrt::bo::flags::cacheable, instr_grp);
       std::memcpy(instr_bo.map<void*>(), instr_words_.data(), instr_size);
@@ -169,6 +204,7 @@ XdnaExecutable::ExecuteSharded(
       run.set_arg(0, static_cast<uint64_t>(3));  // opcode: DPU dispatch
       run.set_arg(1, instr_bo);
       run.set_arg(2, static_cast<uint32_t>(instr_words_.size()));
+      XDNA_TRACE("XDNA: Instruction BO set up.");
     }
 
     // Bind input buffers.
@@ -193,6 +229,8 @@ XdnaExecutable::ExecuteSharded(
       auto bo_flags = (convention_ == XdnaKernelConvention::kDpu)
                           ? xrt::bo::flags::host_only
                           : xrt::bo::flags::normal;
+      XDNA_TRACEF("XDNA: Input BO %d: size=%zu kernel_arg_idx=%d grp=%d",
+                  i, raw.size(), kernel_arg_idx, grp);
       xrt::bo dev_bo(hw_context_, raw.size(), bo_flags, grp);
 
       std::memcpy(dev_bo.map<void*>(), raw.data(), raw.size());
@@ -210,6 +248,8 @@ XdnaExecutable::ExecuteSharded(
         int64_t byte_size = ShapeUtil::ByteSizeOf(output_shapes_[i]);
         int kernel_arg_idx = num_inputs + i + 3;  // after DPU prefix + inputs
         int grp = kernel_.group_id(kernel_arg_idx);
+        XDNA_TRACEF("XDNA: Output BO %d: size=%ld kernel_arg_idx=%d grp=%d",
+                    i, byte_size, kernel_arg_idx, grp);
         xrt::bo dev_bo(hw_context_, byte_size, xrt::bo::flags::host_only, grp);
 
         // Zero-initialize output buffer.
@@ -221,8 +261,11 @@ XdnaExecutable::ExecuteSharded(
       }
     }
 
+    XDNA_TRACE("XDNA: Starting kernel run...");
     run.start();
+    XDNA_TRACE("XDNA: Kernel started, waiting for completion...");
     run.wait2();
+    XDNA_TRACE("XDNA: Kernel completed.");
 
     // Build output buffers from device results.
     std::vector<std::unique_ptr<PjRtBuffer>> results;
@@ -279,5 +322,80 @@ void XdnaExecutable::Delete() { is_deleted_ = true; }
 bool XdnaExecutable::IsDeleted() const { return is_deleted_; }
 
 absl::string_view XdnaExecutable::name() const { return name_; }
+
+absl::StatusOr<std::string> XdnaExecutable::FingerprintExecutable() const {
+  XDNA_TRACE("XDNA: FingerprintExecutable() called");
+  return name_;
+}
+
+absl::StatusOr<std::string> XdnaExecutable::SerializeExecutable() const {
+  XDNA_TRACE("XDNA: SerializeExecutable() called");
+  return absl::UnimplementedError(
+      "XdnaExecutable::SerializeExecutable is not implemented.");
+}
+
+absl::StatusOr<struct CompileOptions>
+XdnaExecutable::GetCompileOptions() const {
+  XDNA_TRACE("XDNA: GetCompileOptions() called");
+  CompileOptions options;
+  options.executable_build_options.set_num_replicas(1);
+  options.executable_build_options.set_num_partitions(1);
+  return options;
+}
+
+absl::StatusOr<std::vector<std::shared_ptr<HloModule>>>
+XdnaExecutable::GetHloModules() const {
+  XDNA_TRACE("XDNA: GetHloModules() called");
+  return absl::UnimplementedError(
+      "XdnaExecutable::GetHloModules is not implemented.");
+}
+
+absl::StatusOr<std::vector<Shape>> XdnaExecutable::GetOutputShapes() const {
+  XDNA_TRACE("XDNA: GetOutputShapes() called");
+  return absl::UnimplementedError(
+      "XdnaExecutable::GetOutputShapes is not implemented.");
+}
+
+absl::StatusOr<std::vector<std::vector<PrimitiveType>>>
+XdnaExecutable::GetOutputElementTypes() const {
+  XDNA_TRACE("XDNA: GetOutputElementTypes() called");
+  return absl::UnimplementedError(
+      "XdnaExecutable::GetOutputElementTypes is not implemented.");
+}
+
+absl::StatusOr<std::vector<std::vector<DimensionVector>>>
+XdnaExecutable::GetOutputDimensions() const {
+  XDNA_TRACE("XDNA: GetOutputDimensions() called");
+  return absl::UnimplementedError(
+      "XdnaExecutable::GetOutputDimensions is not implemented.");
+}
+
+absl::StatusOr<std::vector<std::vector<absl::string_view>>>
+XdnaExecutable::GetOutputMemoryKinds() const {
+  XDNA_TRACE("XDNA: GetOutputMemoryKinds() called");
+  return absl::UnimplementedError(
+      "XdnaExecutable::GetOutputMemoryKinds is not implemented.");
+}
+
+absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
+XdnaExecutable::GetParameterLayouts() const {
+  XDNA_TRACE("XDNA: GetParameterLayouts() called");
+  return absl::UnimplementedError(
+      "XdnaExecutable::GetParameterLayouts is not implemented.");
+}
+
+absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
+XdnaExecutable::GetOutputLayouts() const {
+  XDNA_TRACE("XDNA: GetOutputLayouts() called");
+  return absl::UnimplementedError(
+      "XdnaExecutable::GetOutputLayouts is not implemented.");
+}
+
+absl::StatusOr<CompiledMemoryStats>
+XdnaExecutable::GetCompiledMemoryStats() const {
+  XDNA_TRACE("XDNA: GetCompiledMemoryStats() called");
+  return absl::UnimplementedError(
+      "XdnaExecutable::GetCompiledMemoryStats is not implemented.");
+}
 
 }  // namespace xla

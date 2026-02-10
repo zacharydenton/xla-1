@@ -341,7 +341,7 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " --aie-lower-broadcast-packet"
       " --aie-lower-multicast"
       " --aie-assign-tile-controller-ids"
-      " \"--aie-generate-column-control-overlay=route-shim-to-tile-ctrl=true\""
+      " \"--aie-generate-column-control-overlay=route-shim-to-tile-ctrl=false\""
       " --aie-create-pathfinder-flows"
       " --aie-assign-buffer-addresses"
       " --convert-scf-to-cf"

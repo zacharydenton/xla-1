@@ -16,7 +16,9 @@ limitations under the License.
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_client.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <unistd.h>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -53,6 +55,20 @@ limitations under the License.
 #include "xla/tsl/platform/statusor.h"
 #include "xla/xla.pb.h"
 #include "tsl/platform/fingerprint.h"
+
+#define XDNA_TRACE(msg) \
+  do { \
+    char buf_[256]; \
+    int n_ = snprintf(buf_, sizeof(buf_), "%s\n", msg); \
+    (void)write(STDERR_FILENO, buf_, n_); \
+  } while (0)
+
+#define XDNA_TRACEF(fmt, ...) \
+  do { \
+    char buf_[512]; \
+    int n_ = snprintf(buf_, sizeof(buf_), fmt "\n", ##__VA_ARGS__); \
+    (void)write(STDERR_FILENO, buf_, n_); \
+  } while (0)
 
 namespace xla {
 
@@ -150,6 +166,8 @@ XdnaPjrtClient::BufferFromHostBuffer(
     PjRtMemorySpace* memory_space, const Layout* device_layout) {
   Shape shape = ShapeUtil::MakeShape(type, dims);
   int64_t byte_size = ShapeUtil::ByteSizeOf(shape);
+  XDNA_TRACEF("XDNA: BufferFromHostBuffer type=%d byte_size=%ld",
+              static_cast<int>(type), byte_size);
 
   // Copy host data into a raw byte buffer. Device-accessible BOs are allocated
   // at execution time through the hw_context.
@@ -168,6 +186,7 @@ XdnaPjrtClient::BufferFromHostBuffer(
     memory_space = memory_space_.get();
   }
 
+  XDNA_TRACE("XDNA: BufferFromHostBuffer done.");
   return std::make_unique<XdnaBuffer>(this, device, memory_space,
                                       std::move(shape),
                                       std::move(buffer_data));
@@ -268,20 +287,26 @@ XdnaPjrtClient::CompileInternal(
   TF_ASSIGN_OR_RETURN(XdnaCodegenResult codegen_result,
                       XdnaCompiler::Compile(std::move(hlo_module)));
 
-  LOG(INFO) << "XDNA: Loading xclbin (" << codegen_result.xclbin_bytes.size()
-            << " bytes), kernel='" << codegen_result.kernel_name << "'";
+  XDNA_TRACEF("XDNA: Loading xclbin (%zu bytes), kernel='%s'",
+              codegen_result.xclbin_bytes.size(),
+              codegen_result.kernel_name.c_str());
 
   // Load the xclbin and create an executable with kDpu convention.
   try {
     // Construct xrt::xclbin from raw bytes.
     std::vector<char> xclbin_data(codegen_result.xclbin_bytes.begin(),
                                   codegen_result.xclbin_bytes.end());
+    XDNA_TRACE("XDNA: Constructing xrt::xclbin...");
     xrt::xclbin xclbin(xclbin_data);
 
     // Register xclbin with device and create hw_context from UUID.
+    XDNA_TRACE("XDNA: Registering xclbin with device...");
     auto uuid = xrt_device_.register_xclbin(xclbin);
+    XDNA_TRACE("XDNA: Creating hw_context...");
     xrt::hw_context hw_ctx(xrt_device_, uuid);
+    XDNA_TRACE("XDNA: Creating kernel...");
     xrt::kernel kernel(hw_ctx, codegen_result.kernel_name);
+    XDNA_TRACE("XDNA: Compile complete, creating executable.");
 
     return std::make_unique<XdnaExecutable>(
         this, addressable_devices_, std::move(xclbin), std::move(hw_ctx),
