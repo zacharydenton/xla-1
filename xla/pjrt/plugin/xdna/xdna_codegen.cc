@@ -15,11 +15,14 @@ limitations under the License.
 
 #include "xla/pjrt/plugin/xdna/xdna_codegen.h"
 
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <sys/wait.h>
 #include <vector>
 
 #include "absl/log/log.h"
@@ -75,13 +78,62 @@ std::string GetXclbinutilPath() {
 // File I/O helpers.
 // ---------------------------------------------------------------------------
 
-absl::Status RunCommand(const std::string& cmd) {
-  LOG(INFO) << "XDNA codegen: running: " << cmd;
-  int ret = std::system(cmd.c_str());
-  if (ret != 0) {
+int GetCompileTimeout() {
+  const char* env = std::getenv("XDNA_COMPILE_TIMEOUT");
+  return env ? std::atoi(env) : 120;
+}
+
+absl::Status RunCommand(const std::string& cmd,
+                        const std::string& step_label = "") {
+  int timeout_secs = GetCompileTimeout();
+  auto start = std::chrono::steady_clock::now();
+
+  LOG(INFO) << "XDNA codegen: " << step_label << ": " << cmd;
+
+  // Use popen to capture stdout+stderr, with timeout command for safety.
+  std::string timed_cmd = absl::StrCat(
+      "timeout ", timeout_secs, " ", cmd, " 2>&1");
+
+  FILE* pipe = popen(timed_cmd.c_str(), "r");
+  if (!pipe) {
     return absl::InternalError(
-        absl::StrCat("Command failed with exit code ", ret, ": ", cmd));
+        absl::StrCat("Failed to execute: ", step_label));
   }
+
+  std::string output;
+  char buffer[4096];
+  while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+    output.append(buffer);
+  }
+  int status = pclose(pipe);
+
+  auto elapsed = std::chrono::steady_clock::now() - start;
+  double secs = std::chrono::duration<double>(elapsed).count();
+
+  LOG(INFO) << absl::StrFormat("XDNA codegen: %s completed in %.1fs",
+                               step_label, secs);
+
+  if (status != 0) {
+    int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+
+    // Truncate output if too long.
+    if (output.size() > 2000) {
+      output = "...(truncated)\n" + output.substr(output.size() - 2000);
+    }
+
+    if (exit_code == 124) {
+      return absl::DeadlineExceededError(absl::StrFormat(
+          "%s timed out after %ds.\nOutput:\n%s",
+          step_label, timeout_secs,
+          output.empty() ? "(no output)" : output));
+    }
+
+    return absl::InternalError(absl::StrFormat(
+        "%s failed (exit code %d).\nCommand: %s\nOutput:\n%s",
+        step_label, exit_code, cmd,
+        output.empty() ? "(no output)" : output));
+  }
+
   return absl::OkStatus();
 }
 
@@ -348,7 +400,8 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " --aie-create-pathfinder-flows"
       " --aie-assign-buffer-addresses"
       " --convert-scf-to-cf"
-      " ", input_mlir, " -o ", lowered_mlir)));
+      " ", input_mlir, " -o ", lowered_mlir),
+      "Step 1/13: AIE lowering passes"));
 
   // -----------------------------------------------------------------------
   // Step 3: Per-core code compilation with Peano.
@@ -363,7 +416,8 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " --aie-normalize-address-spaces"
       " \"--aie-standard-lowering=tilecol=0 tilerow=2\""
       " --aiex-standard-lowering"
-      " ", lowered_mlir, " -o ", core_mlir)));
+      " ", lowered_mlir, " -o ", core_mlir),
+      "Step 2/13: Core code extraction"));
 
   // 3b: Lower to LLVM dialect (matches aiecc.py LOWER_TO_LLVM_PIPELINE).
   std::string core_opt_mlir = workdir + "/core_0_2.opt.mlir";
@@ -375,12 +429,14 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " --arith-expand --convert-arith-to-llvm --finalize-memref-to-llvm"
       " \"--convert-func-to-llvm=use-bare-ptr-memref-call-conv\""
       " --convert-cf-to-llvm --canonicalize --cse"
-      " ", core_mlir, " -o ", core_opt_mlir)));
+      " ", core_mlir, " -o ", core_opt_mlir),
+      "Step 3/13: LLVM dialect lowering"));
 
   // 3c: Translate to LLVM IR.
   std::string core_ll = workdir + "/core_0_2.ll";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
-      aie_translate, " --mlir-to-llvmir ", core_opt_mlir, " -o ", core_ll)));
+      aie_translate, " --mlir-to-llvmir ", core_opt_mlir, " -o ", core_ll),
+      "Step 4/13: LLVM IR translation"));
 
   // 3d: Fix intrinsic names (llvm.aie2.* → llvm.aie2p.* for aie2p target).
   {
@@ -415,26 +471,30 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " -vectorize-slp=false"
       " -vectorize-loops=false"
       " -S ",
-      core_ll, " -o ", core_opt_ll)));
+      core_ll, " -o ", core_opt_ll),
+      "Step 5/13: Peano optimization"));
 
   std::string core_obj = workdir + "/core_0_2.o";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       peano_llc, " ", core_opt_ll,
       " -O2 --march=aie2p --function-sections --filetype=obj"
-      " -o ", core_obj)));
+      " -o ", core_obj),
+      "Step 6/13: Peano codegen"));
 
   std::string core_ldscript = workdir + "/core_0_2.ld.script";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       aie_translate,
       " --aie-generate-ldscript --tilecol=0 --tilerow=2 ",
-      lowered_mlir, " -o ", core_ldscript)));
+      lowered_mlir, " -o ", core_ldscript),
+      "Step 7/13: Linker script generation"));
 
   std::string core_elf = workdir + "/core_0_2.elf";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       peano_clang,
       " -O2 --target=aie2p-none-elf -nostdlib"
       " -Wl,--gc-sections -Wl,--entry=core_0_2 ",
-      core_obj, " -Wl,-T,", core_ldscript, " -o ", core_elf)));
+      core_obj, " -Wl,-T,", core_ldscript, " -o ", core_elf),
+      "Step 8/13: Peano linking"));
 
   // -----------------------------------------------------------------------
   // Step 4: CDO generation.
@@ -444,7 +504,8 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       aie_translate,
       " --aie-generate-cdo"
       " --work-dir-path=", workdir,
-      " ", lowered_mlir)));
+      " ", lowered_mlir),
+      "Step 9/13: CDO generation"));
 
   // -----------------------------------------------------------------------
   // Step 4b: Generate NPU instruction stream (DMA_TO_NPU pipeline).
@@ -464,13 +525,15 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " --aie-assign-runtime-sequence-bd-ids"
       " --aie-dma-tasks-to-npu"
       " --aie-dma-to-npu"
-      " ", lowered_mlir, " -o ", npu_insts_mlir)));
+      " ", lowered_mlir, " -o ", npu_insts_mlir),
+      "Step 10/13: NPU DMA lowering"));
 
   std::string insts_txt = workdir + "/insts.txt";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       aie_translate,
       " --aie-npu-instgen ",
-      npu_insts_mlir, " -o ", insts_txt)));
+      npu_insts_mlir, " -o ", insts_txt),
+      "Step 11/13: NPU instruction generation"));
 
   auto instr_words_or = ReadInstrFile(insts_txt);
   if (!instr_words_or.ok()) {
@@ -489,7 +552,8 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       bootgen,
       " -arch versal -image ", design_bif,
-      " -o ", design_pdi, " -w")));
+      " -o ", design_pdi, " -w"),
+      "Step 12/13: PDI packaging"));
 
   // -----------------------------------------------------------------------
   // Step 6: xclbinutil — assemble the xclbin.
@@ -515,7 +579,8 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " --add-kernel ", kernels_json,
       " --add-replace-section AIE_PARTITION:JSON:", aie_partition_json,
       " --force --quiet"
-      " --output ", final_xclbin)));
+      " --output ", final_xclbin),
+      "Step 13/13: xclbin assembly"));
 
   // -----------------------------------------------------------------------
   // Read the final xclbin and clean up.

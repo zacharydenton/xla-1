@@ -153,6 +153,38 @@ def test_bf16_multiply():
     np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
 
 
+def test_cache_hit():
+    """Test 8: Second compilation of same HLO hits XDNA cache.
+
+    test_add already compiled f32[4] add and cached the result.
+    A new jax.jit instance with the same computation triggers a fresh
+    compilation request from JAX, but should hit our XDNA in-memory cache.
+    We redirect C-level stderr to verify the cache hit trace message.
+    """
+    # Redirect C-level stderr (fd 2) to a pipe so we can capture XDNA_TRACE output.
+    read_fd, write_fd = os.pipe()
+    saved_stderr = os.dup(2)
+    os.dup2(write_fd, 2)
+
+    a = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    b = np.array([5.0, 6.0, 7.0, 8.0], dtype=np.float32)
+    result = jax.jit(lambda x, y: x + y)(a, b)
+
+    # Restore stderr and read captured output.
+    os.dup2(saved_stderr, 2)
+    os.close(saved_stderr)
+    os.close(write_fd)
+    captured = os.read(read_fd, 65536).decode('utf-8', errors='replace')
+    os.close(read_fd)
+
+    expected = np.array([6.0, 8.0, 10.0, 12.0], dtype=np.float32)
+    np.testing.assert_allclose(np.array(result), expected, rtol=1e-5)
+
+    assert "Compilation cache hit" in captured, \
+        f"Expected 'Compilation cache hit' in stderr. Got:\n{captured}"
+    print("         Cache hit confirmed via stderr trace.", flush=True)
+
+
 def main():
     tests = [
         ("Device discovery", test_device_discovery),
@@ -162,6 +194,7 @@ def main():
         ("jit(x - y)", test_subtract),
         ("jit(x + y) bf16", test_bf16_add),
         ("jit(x * y) bf16", test_bf16_multiply),
+        ("cache hit", test_cache_hit),
     ]
 
     print(f"XDNA JAX Integration Tests", flush=True)

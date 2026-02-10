@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/pjrt/plugin/xdna/xdna_aie_lowering.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,8 @@ struct LinalgOpInfo {
 };
 
 // Analyzes the linalg module to extract operation info.
+// Returns an error if no supported op is found, or if multiple ops are found
+// (multi-op programs are not yet supported).
 absl::StatusOr<LinalgOpInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
   LinalgOpInfo info;
 
@@ -96,14 +99,15 @@ absl::StatusOr<LinalgOpInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
         "No function found in linalg module.");
   }
 
+  // Count all supported linalg ops to detect multi-op programs.
+  int op_count = 0;
+
   // Walk the function body to find linalg named ops.
-  bool found = false;
   entry_func.walk([&](mlir::Operation* op) {
-    if (found) return;
     llvm::StringRef name = op->getName().getStringRef();
     if (!name.starts_with("linalg.")) return;
 
-    // Skip linalg.generic for now — only handle named ops.
+    // Skip linalg.generic — handled separately below.
     if (name == "linalg.generic") return;
 
     int num_inputs = GetNumInputs(name);
@@ -118,6 +122,7 @@ absl::StatusOr<LinalgOpInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
         op->getResult(0).getType());
     if (!result_type) return;
 
+    op_count++;
     info.op_name = name.str();
     info.num_inputs = num_inputs;
     info.element_type = GetElementTypeStr(result_type.getElementType());
@@ -128,71 +133,77 @@ absl::StatusOr<LinalgOpInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
     for (int64_t dim : result_type.getShape()) {
       info.num_elements *= dim;
     }
-
-    found = true;
   });
 
-  if (!found) {
-    // Try linalg.generic — look at the body operations.
-    entry_func.walk([&](mlir::linalg::GenericOp generic) {
-      if (found) return;
+  // Also walk linalg.generic ops.
+  entry_func.walk([&](mlir::linalg::GenericOp generic) {
+    // Check that all iterator types are parallel (element-wise).
+    auto iter_types = generic.getIteratorTypesArray();
+    for (auto it : iter_types) {
+      if (it != mlir::utils::IteratorType::parallel) return;
+    }
 
-      // Check that all iterator types are parallel (element-wise).
-      auto iter_types = generic.getIteratorTypesArray();
-      for (auto it : iter_types) {
-        if (it != mlir::utils::IteratorType::parallel) return;
+    // Look at the body to determine the operation.
+    mlir::Block& body = generic.getRegion().front();
+    LinalgOpInfo generic_info;
+    bool found_in_body = false;
+    for (mlir::Operation& body_op : body.without_terminator()) {
+      llvm::StringRef body_op_name = body_op.getName().getStringRef();
+      if (body_op_name == "arith.addf" || body_op_name == "arith.addi") {
+        generic_info.kernel_op = body_op_name.str();
+        generic_info.op_name = "linalg.generic(add)";
+        generic_info.num_inputs = 2;
+      } else if (body_op_name == "arith.subf" ||
+                 body_op_name == "arith.subi") {
+        generic_info.kernel_op = body_op_name.str();
+        generic_info.op_name = "linalg.generic(sub)";
+        generic_info.num_inputs = 2;
+      } else if (body_op_name == "arith.mulf" ||
+                 body_op_name == "arith.muli") {
+        generic_info.kernel_op = body_op_name.str();
+        generic_info.op_name = "linalg.generic(mul)";
+        generic_info.num_inputs = 2;
+      } else if (body_op_name == "arith.negf") {
+        generic_info.kernel_op = body_op_name.str();
+        generic_info.op_name = "linalg.generic(neg)";
+        generic_info.num_inputs = 1;
+      } else if (body_op_name == "math.exp") {
+        generic_info.kernel_op = body_op_name.str();
+        generic_info.op_name = "linalg.generic(exp)";
+        generic_info.num_inputs = 1;
+      } else {
+        continue;
       }
+      found_in_body = true;
+      break;
+    }
 
-      // Look at the body to determine the operation.
-      mlir::Block& body = generic.getRegion().front();
-      for (mlir::Operation& body_op : body.without_terminator()) {
-        llvm::StringRef body_op_name = body_op.getName().getStringRef();
-        if (body_op_name == "arith.addf" || body_op_name == "arith.addi") {
-          info.kernel_op = body_op_name.str();
-          info.op_name = "linalg.generic(add)";
-          info.num_inputs = 2;
-        } else if (body_op_name == "arith.subf" ||
-                   body_op_name == "arith.subi") {
-          info.kernel_op = body_op_name.str();
-          info.op_name = "linalg.generic(sub)";
-          info.num_inputs = 2;
-        } else if (body_op_name == "arith.mulf" ||
-                   body_op_name == "arith.muli") {
-          info.kernel_op = body_op_name.str();
-          info.op_name = "linalg.generic(mul)";
-          info.num_inputs = 2;
-        } else if (body_op_name == "arith.negf") {
-          info.kernel_op = body_op_name.str();
-          info.op_name = "linalg.generic(neg)";
-          info.num_inputs = 1;
-        } else if (body_op_name == "math.exp") {
-          info.kernel_op = body_op_name.str();
-          info.op_name = "linalg.generic(exp)";
-          info.num_inputs = 1;
-        } else {
-          continue;
-        }
-        found = true;
-        break;
-      }
+    if (!found_in_body) return;
 
-      if (!found) return;
+    // Get shape from first input.
+    if (generic.getInputs().empty()) return;
+    auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic.getInputs().front().getType());
+    if (!input_type) return;
 
-      // Get shape from first input.
-      if (generic.getInputs().empty()) return;
-      auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
-          generic.getInputs().front().getType());
-      if (!input_type) return;
+    generic_info.element_type = GetElementTypeStr(input_type.getElementType());
+    generic_info.num_elements = 1;
+    for (int64_t dim : input_type.getShape()) {
+      generic_info.num_elements *= dim;
+    }
 
-      info.element_type = GetElementTypeStr(input_type.getElementType());
-      info.num_elements = 1;
-      for (int64_t dim : input_type.getShape()) {
-        info.num_elements *= dim;
-      }
-    });
+    op_count++;
+    info = generic_info;
+  });
+
+  if (op_count > 1) {
+    return absl::UnimplementedError(absl::StrFormat(
+        "XDNA plugin currently supports single-op programs only. Found %d "
+        "linalg operations. Consider decomposing your computation.",
+        op_count));
   }
 
-  if (!found) {
+  if (op_count == 0) {
     // Print the module for debugging.
     std::string module_str;
     llvm::raw_string_ostream os(module_str);
@@ -356,12 +367,43 @@ std::string GenerateNpuSequence(const LinalgOpInfo& info,
 
 }  // namespace
 
+// Returns the byte size of a single element for the given type string.
+int GetElementBytes(const std::string& element_type) {
+  if (element_type == "f32" || element_type == "i32") return 4;
+  if (element_type == "f16" || element_type == "bf16" || element_type == "i16")
+    return 2;
+  if (element_type == "i8") return 1;
+  return 4;  // default
+}
+
 absl::StatusOr<std::string> LowerLinalgToAie(
     mlir::ModuleOp linalg_module, const AieLoweringConfig& config) {
   // Step 1: Analyze the linalg module.
   auto info_result = AnalyzeLinalgModule(linalg_module);
   if (!info_result.ok()) return info_result.status();
   LinalgOpInfo info = std::move(*info_result);
+
+  // Step 1b: Validate L1 memory usage.
+  // Each ObjectFIFO buffer uses ping-pong depth of 2, so total L1 is:
+  //   num_buffers * num_elements * element_bytes * 2 (ping-pong)
+  int element_bytes = GetElementBytes(info.element_type);
+  int num_buffers = info.num_inputs + 1;  // inputs + output
+  int64_t total_l1_bytes = num_buffers * info.num_elements * element_bytes * 2;
+
+  int64_t l1_limit = 48 * 1024;  // 48KB default (leaves headroom for stack/code)
+  const char* limit_env = std::getenv("XDNA_L1_LIMIT_BYTES");
+  if (limit_env) l1_limit = std::atol(limit_env);
+
+  if (total_l1_bytes > l1_limit) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Tensor buffers (%d bytes) exceed AIE L1 memory limit (%d bytes). "
+        "The operation requires %d buffers of %d elements x %d bytes x 2 "
+        "(ping-pong). Consider using smaller tensors (max ~%d elements for "
+        "%s). Override limit with XDNA_L1_LIMIT_BYTES env var.",
+        total_l1_bytes, l1_limit, num_buffers, info.num_elements,
+        element_bytes, l1_limit / (num_buffers * element_bytes * 2),
+        info.element_type));
+  }
 
   // For single-core execution, the chunk size is the full tensor.
   int64_t chunk_size = info.num_elements;

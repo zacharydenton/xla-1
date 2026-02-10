@@ -22,6 +22,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
@@ -32,6 +33,7 @@ limitations under the License.
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_buffer.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_device.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_executable.h"
+#include "xla/shape.h"
 #include "xrt/xrt_device.h"
 
 namespace xla {
@@ -83,6 +85,16 @@ class XdnaPjrtClient : public PjRtClient {
       const std::vector<const Shape*>& argument_shapes,
       CompileOptions options);
 
+  // Cached compilation result for xclbin reuse.
+  struct CachedCompilation {
+    std::vector<uint8_t> xclbin_bytes;
+    std::string kernel_name;
+    std::vector<uint32_t> instr_words;
+    std::vector<Shape> output_shapes;
+    int num_inputs;
+    std::shared_ptr<const HloModule> hlo_module;
+  };
+
   std::unique_ptr<XdnaDevice> device_;
   std::unique_ptr<XdnaMemorySpace> memory_space_;
   std::vector<PjRtDevice*> devices_;
@@ -90,6 +102,10 @@ class XdnaPjrtClient : public PjRtClient {
   std::vector<PjRtMemorySpace*> memory_spaces_;
   std::string platform_version_;
   xrt::device xrt_device_;
+
+  // In-memory compilation cache: maps HLO fingerprint to compiled xclbin.
+  // Disable with XDNA_NO_CACHE=1 environment variable.
+  absl::flat_hash_map<uint64_t, CachedCompilation> compilation_cache_;
 };
 
 }  // namespace xla

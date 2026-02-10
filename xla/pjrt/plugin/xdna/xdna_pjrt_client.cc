@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 #include <exception>
@@ -269,6 +270,43 @@ XdnaPjrtClient::CompileInternal(
     TF_ASSIGN_OR_RETURN(hlo_module, RunXdnaHloPasses(std::move(hlo_module)));
   }
 
+  // Check compilation cache.
+  bool use_cache = !std::getenv("XDNA_NO_CACHE");
+  uint64_t cache_key = 0;
+  if (use_cache) {
+    // Use the entry computation's text representation as cache key.
+    // This is stable across compilations of the same HLO (unlike ToProto()
+    // which includes varying module IDs).
+    cache_key = tsl::Fingerprint64(
+        hlo_module->entry_computation()->ToString());
+
+    auto it = compilation_cache_.find(cache_key);
+    if (it != compilation_cache_.end()) {
+      XDNA_TRACE("XDNA: Compilation cache hit — skipping codegen.");
+      const auto& cached = it->second;
+      try {
+        std::vector<char> xclbin_data(cached.xclbin_bytes.begin(),
+                                       cached.xclbin_bytes.end());
+        xrt::xclbin xclbin(xclbin_data);
+        auto uuid = xrt_device_.register_xclbin(xclbin);
+        xrt::hw_context hw_ctx(xrt_device_, uuid);
+        xrt::kernel kernel(hw_ctx, cached.kernel_name);
+
+        return std::make_unique<XdnaExecutable>(
+            this, addressable_devices_, std::move(xclbin), std::move(hw_ctx),
+            std::move(kernel), cached.kernel_name,
+            XdnaKernelConvention::kDpu, cached.num_inputs,
+            std::vector<Shape>(cached.output_shapes),
+            std::vector<uint32_t>(cached.instr_words),
+            cached.hlo_module->Clone());
+      } catch (const std::exception& e) {
+        LOG(WARNING) << "XDNA: Cache hit but xclbin load failed: " << e.what()
+                     << ". Recompiling.";
+        // Fall through to full compilation.
+      }
+    }
+  }
+
   // Extract output shapes before compilation consumes the module.
   const Shape& result_shape = hlo_module->result_shape();
   std::vector<Shape> output_shapes;
@@ -293,6 +331,20 @@ XdnaPjrtClient::CompileInternal(
   XDNA_TRACEF("XDNA: Loading xclbin (%zu bytes), kernel='%s'",
               codegen_result.xclbin_bytes.size(),
               codegen_result.kernel_name.c_str());
+
+  // Store in cache before moving data into the executable.
+  if (use_cache) {
+    compilation_cache_[cache_key] = CachedCompilation{
+        .xclbin_bytes = codegen_result.xclbin_bytes,
+        .kernel_name = codegen_result.kernel_name,
+        .instr_words = codegen_result.instr_words,
+        .output_shapes = output_shapes,
+        .num_inputs = num_inputs,
+        .hlo_module = std::shared_ptr<const HloModule>(
+            hlo_module_copy->Clone()),
+    };
+    XDNA_TRACE("XDNA: Compilation result cached.");
+  }
 
   // Load the xclbin and create an executable with kDpu convention.
   try {
