@@ -2,7 +2,13 @@
 """JAX integration test for the XDNA NPU PJRT plugin.
 
 Runs progressive tests from device discovery through element-wise ops.
-All tests use f32[4] arrays to match what the XDNA lowering supports.
+
+Note: The XDNA lowering supports multi-op linalg.generic bodies (via
+GenerateMultiOpScalarLoop), but XLA/StableHLO-to-linalg produces separate
+linalg ops for each StableHLO op. The only case that produces a multi-op
+generic body is f16 ops (extf->addf->truncf), which is blocked by a Peano
+bug (fpext half<->float uses bf16 conversion instructions). Multi-op tests
+will be added when Peano fixes f16 support.
 
 Usage:
   # Build the plugin first:
@@ -26,7 +32,7 @@ import threading
 faulthandler.enable()
 
 # Dump all thread stacks after 45 seconds if we're still alive (hang detection).
-faulthandler.dump_traceback_later(45, exit=True)
+faulthandler.dump_traceback_later(310, exit=True)
 
 # Register SIGUSR1 to dump all threads on demand: kill -USR1 <pid>
 faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
@@ -44,7 +50,7 @@ def _alarm_handler(signum, frame):
 
 
 signal.signal(signal.SIGALRM, _alarm_handler)
-signal.alarm(40)  # 40 seconds before alarm fires
+signal.alarm(300)  # 5 minutes before alarm fires
 
 print("[test] Starting XDNA JAX integration test", flush=True)
 print(f"[test] PID: {os.getpid()}", flush=True)
@@ -231,6 +237,50 @@ def test_i8_add_256():
     np.testing.assert_array_equal(np.array(result), (a + b).astype(np.int8))
 
 
+def _make_op_test(op_fn, a, b, expected, rtol):
+    """Create a test closure for a single (op, dtype, size) combo."""
+    def test():
+        if b is not None:
+            result = jax.jit(op_fn)(a, b)
+        else:
+            result = jax.jit(op_fn)(a)
+        np.testing.assert_allclose(
+            np.array(result, dtype=np.float32), expected,
+            rtol=rtol, atol=1e-5)
+    return test
+
+
+def _make_tiling_tests():
+    """Generate tiling tests for N=1024,4096,65536 × f32/bf16 × add/sub/mul/neg."""
+    import ml_dtypes
+    tests = []
+    for n in [1024, 4096, 65536]:
+        for dtype, dname, rtol in [
+            (np.float32, "f32", 1e-5),
+            (ml_dtypes.bfloat16, "bf16", 1e-2),
+        ]:
+            rng = np.random.RandomState(42 + n)
+            a = rng.randn(n).astype(dtype)
+            b = rng.randn(n).astype(dtype)
+            a32, b32 = a.astype(np.float32), b.astype(np.float32)
+            # f32 mul uses bf16 workaround → relaxed tolerance.
+            # Random data with large values causes ~2% relative error
+            # due to bf16 truncation of mantissa bits.
+            mul_rtol = 2e-2
+            ops = [
+                ("add", lambda x, y: x + y, b, a32 + b32, rtol),
+                ("sub", lambda x, y: x - y, b, a32 - b32, rtol),
+                ("mul", lambda x, y: x * y, b, a32 * b32, mul_rtol),
+                ("neg", lambda x: -x, None, -a32, rtol),
+            ]
+            for op_name, op_fn, b_arg, expected, op_rtol in ops:
+                tests.append((
+                    f"jit({op_name}) {dname}[{n}]",
+                    _make_op_test(op_fn, a, b_arg, expected, op_rtol),
+                ))
+    return tests
+
+
 def test_cache_hit():
     """Test 8: Second compilation of same HLO hits XDNA cache.
 
@@ -281,6 +331,7 @@ def main():
         ("jit(x + y) i32[256]", test_i32_add_256),
         ("jit(x + y) i16[256]", test_i16_add_256),
         ("jit(x + y) i8[256]", test_i8_add_256),
+    ] + _make_tiling_tests() + [
         ("cache hit", test_cache_hit),
     ]
 
