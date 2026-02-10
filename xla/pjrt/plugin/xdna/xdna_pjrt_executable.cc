@@ -321,7 +321,10 @@ void XdnaExecutable::Delete() { is_deleted_ = true; }
 
 bool XdnaExecutable::IsDeleted() const { return is_deleted_; }
 
-absl::string_view XdnaExecutable::name() const { return name_; }
+absl::string_view XdnaExecutable::name() const {
+  XDNA_TRACEF("XDNA: name() called -> '%s'", name_.c_str());
+  return name_;
+}
 
 absl::StatusOr<std::string> XdnaExecutable::FingerprintExecutable() const {
   XDNA_TRACE("XDNA: FingerprintExecutable() called");

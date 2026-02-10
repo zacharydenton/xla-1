@@ -16,14 +16,17 @@ limitations under the License.
 #include "xla/python/pjrt_ifrt/pjrt_compiler.h"
 
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "absl/functional/bind_front.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "llvm/Support/Casting.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -93,7 +96,7 @@ PjRtCompiler::PjRtCompiler(PjRtClient* client, int num_threads)
     : client_(client) {
   if (num_threads > 0) {
     tsl::ThreadOptions thread_options;
-    thread_options.stack_size = 512 * 1024;
+    thread_options.stack_size = 8 * 1024 * 1024;  // 8MB (was 512KB)
     thread_pool_.emplace(tsl::Env::Default(), thread_options,
                          "PjRtCompilerThreadPool", num_threads);
   }
@@ -117,13 +120,31 @@ tsl::Future<LoadedExecutableRef> PjRtCompiler::CompileAndLoad(
       TranslateDeviceIds(client_, xla_compile_options->compile_options));
   auto compile = [client = client_, program = std::move(program), xla_program,
                   xla_compile_options = std::move(xla_compile_options),
-                  user_context = UserContextScope::current()]() mutable {
+                  user_context = UserContextScope::current()]() mutable
+      -> absl::StatusOr<LoadedExecutableRef> {
     UserContextScope scope(std::move(user_context));
-    return PjRtLoadedExecutable::Create(
-        client, xla_program->mlir_module(),
-        std::move(xla_compile_options->compile_options),
-        std::move(xla_compile_options->loaded_host_callbacks),
-        std::move(xla_compile_options->devices));
+    try {
+      auto result = PjRtLoadedExecutable::Create(
+          client, xla_program->mlir_module(),
+          std::move(xla_compile_options->compile_options),
+          std::move(xla_compile_options->loaded_host_callbacks),
+          std::move(xla_compile_options->devices));
+      if (!result.ok()) {
+        LOG(ERROR) << "IFRT compile lambda: PjRtLoadedExecutable::Create "
+                   << "failed: " << result.status();
+      } else {
+        LOG(INFO) << "IFRT compile lambda: PjRtLoadedExecutable::Create "
+                  << "succeeded";
+      }
+      return result;
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "IFRT compile lambda: caught exception: " << e.what();
+      return absl::InternalError(
+          absl::StrCat("Exception in compile lambda: ", e.what()));
+    } catch (...) {
+      LOG(ERROR) << "IFRT compile lambda: caught unknown exception";
+      return absl::InternalError("Unknown exception in compile lambda");
+    }
   };
   if (thread_pool_.has_value()) {
     return tsl::MakeFutureOn(*thread_pool_->AsExecutor(), std::move(compile));
