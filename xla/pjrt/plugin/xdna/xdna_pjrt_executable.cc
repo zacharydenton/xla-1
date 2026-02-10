@@ -39,13 +39,14 @@ namespace xla {
 XdnaExecutable::XdnaExecutable(
     PjRtClient* client, absl::Span<PjRtDevice* const> addressable_devices,
     xrt::elf elf, xrt::hw_context hw_context, xrt::kernel kernel,
-    absl::string_view name)
+    absl::string_view name, XdnaKernelConvention convention)
     : client_(client),
       device_assignment_(1, 1),
       name_(name),
       elf_(std::move(elf)),
       hw_context_(std::move(hw_context)),
-      kernel_(std::move(kernel)) {
+      kernel_(std::move(kernel)),
+      convention_(convention) {
   addressable_devices_.assign(addressable_devices.begin(),
                               addressable_devices.end());
   addressable_device_logical_ids_.push_back(
@@ -133,7 +134,11 @@ XdnaExecutable::ExecuteSharded(
 
       // Allocate a device-mapped BO with proper IOMMU mapping.
       auto raw = xdna_buf->raw_data();
-      int grp = kernel_.group_id(i);
+      // For DPU convention, data args start at index 3 (after opcode, instr
+      // BO, instr count). For direct convention, args start at index 0.
+      int kernel_arg_idx =
+          (convention_ == XdnaKernelConvention::kDpu) ? i + 3 : i;
+      int grp = kernel_.group_id(kernel_arg_idx);
       xrt::bo dev_bo(hw_context_, raw.size(), xrt::bo::flags::normal, grp);
 
       // Copy host data into the mapped region (one memcpy, same physical
@@ -141,8 +146,15 @@ XdnaExecutable::ExecuteSharded(
       std::memcpy(dev_bo.map<void*>(), raw.data(), raw.size());
       dev_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-      run.set_arg(i, dev_bo);
+      run.set_arg(kernel_arg_idx, dev_bo);
       device_bos.push_back(std::move(dev_bo));
+    }
+
+    // Set DPU convention prefix args: opcode=3, instr_bo=0, instr_count=0.
+    if (convention_ == XdnaKernelConvention::kDpu) {
+      run.set_arg(0, static_cast<uint64_t>(3));  // opcode: DPU dispatch
+      run.set_arg(1, static_cast<uint64_t>(0));  // instruction BO (ELF flow)
+      run.set_arg(2, static_cast<uint64_t>(0));  // instruction count
     }
 
     run.start();

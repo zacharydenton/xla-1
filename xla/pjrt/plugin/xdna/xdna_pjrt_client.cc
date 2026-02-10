@@ -31,11 +31,26 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "xla/client/executable_build_options.h"
+#include "xla/hlo/builder/xla_computation.h"
+#include "xla/hlo/ir/hlo_module.h"
+#include "xla/layout_util.h"
+#include "xla/pjrt/mlir_to_hlo.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "xla/pjrt/plugin/xdna/xdna_compiler.h"
+#include "xla/pjrt/plugin/xdna/xdna_hlo_passes.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_buffer.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_device.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_executable.h"
+#include "xla/pjrt/utils.h"
+#include "xla/service/hlo_module_config.h"
+#include "xla/service/hlo_module_util.h"
+#include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
+#include "xla/xla.pb.h"
 #include "tsl/platform/fingerprint.h"
 
 namespace xla {
@@ -155,6 +170,93 @@ XdnaPjrtClient::BufferFromHostBuffer(
   return std::make_unique<XdnaBuffer>(this, device, memory_space,
                                       std::move(shape),
                                       std::move(buffer_data));
+}
+
+namespace {
+absl::StatusOr<Shape> ChooseCompactLayoutForShape(Shape shape) {
+  LayoutUtil::SetToDefaultLayout(&shape);
+  return shape;
+}
+}  // namespace
+
+absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>>
+XdnaPjrtClient::CompileAndLoad(const XlaComputation& computation,
+                                CompileOptions options) {
+  std::vector<const Shape*> argument_layout_pointers;
+  const ExecutableBuildOptions& build_options =
+      options.executable_build_options;
+  const bool allow_auto_layout =
+      build_options.has_debug_options() &&
+      build_options.debug_options().xla_pjrt_allow_auto_layout_in_hlo();
+  TF_RETURN_IF_ERROR(DetermineArgumentLayoutsFromCompileOptions(
+      computation,
+      [allow_auto_layout](Shape shape) -> absl::StatusOr<Shape> {
+        if (allow_auto_layout && !shape.has_layout()) {
+          return shape;
+        }
+        return ChooseCompactLayoutForShape(shape);
+      },
+      options.argument_layouts, &options.executable_build_options,
+      &argument_layout_pointers));
+  return CompileInternal(computation, argument_layout_pointers, options);
+}
+
+absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>>
+XdnaPjrtClient::CompileAndLoad(mlir::ModuleOp module,
+                                CompileOptions options) {
+  XlaComputation xla_computation;
+  ExecutableBuildOptions& exec_build_options = options.executable_build_options;
+  TF_RETURN_IF_ERROR(MlirToXlaComputation(
+      module, xla_computation,
+      /*use_tuple_args=*/options.parameter_is_tupled_arguments,
+      /*return_tuple=*/false, &exec_build_options));
+  return CompileAndLoad(xla_computation, options);
+}
+
+absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>>
+XdnaPjrtClient::CompileInternal(
+    const XlaComputation& computation,
+    const std::vector<const Shape*>& argument_shapes,
+    CompileOptions options) {
+  TF_RETURN_IF_ERROR(options.ApplyAllOptionOverrides());
+
+  TF_ASSIGN_OR_RETURN(ProgramShape program_shape,
+                      computation.GetProgramShape());
+
+  const ExecutableBuildOptions& build_options =
+      options.executable_build_options;
+  ExecutionOptions execution_options =
+      CreateExecutionOptions(build_options, &program_shape);
+
+  TF_ASSIGN_OR_RETURN(
+      std::unique_ptr<HloModuleConfig> hlo_module_config,
+      CreateModuleConfig(program_shape, argument_shapes, &execution_options,
+                         execution_options.num_replicas(),
+                         /*num_threads=*/std::nullopt,
+                         /*aot_options=*/nullptr));
+
+  TF_ASSIGN_OR_RETURN(
+      std::unique_ptr<HloModule> hlo_module,
+      HloModule::CreateFromProto(computation.proto(), *hlo_module_config));
+
+  if (build_options.num_partitions() != 1) {
+    return absl::UnimplementedError(
+        "XDNA only supports num_partitions=1.");
+  }
+
+  // Run HLO optimization passes.
+  if (!build_options.run_backend_only()) {
+    TF_ASSIGN_OR_RETURN(hlo_module, RunXdnaHloPasses(std::move(hlo_module)));
+  }
+
+  // Compile HLO to ELF.
+  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> elf_bytes,
+                      XdnaCompiler::Compile(std::move(hlo_module)));
+
+  // Load the compiled ELF through our existing LoadSerializedExecutable path.
+  absl::string_view elf_view(reinterpret_cast<const char*>(elf_bytes.data()),
+                             elf_bytes.size());
+  return LoadSerializedExecutable(elf_view, std::nullopt, LoadOptions());
 }
 
 absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>>

@@ -34,6 +34,18 @@ limitations under the License.
 
 namespace xla {
 
+// Calling convention for kernel argument binding.
+enum class XdnaKernelConvention {
+  // Phase 1 / legacy: data BOs start at arg 0.
+  kDirect,
+  // Standard DPU convention used by mlir-aie compiled kernels:
+  //   arg 0: opcode (uint64, value 3 for DPU dispatch)
+  //   arg 1: instruction BO (or 0 in ELF flow)
+  //   arg 2: instruction count (or 0 in ELF flow)
+  //   args 3+: data buffer objects
+  kDpu,
+};
+
 // PjRtLoadedExecutable for XDNA NPU that dispatches pre-compiled ELF kernels.
 //
 // Phase 1: No compiler integration. Users provide pre-compiled ELF binaries
@@ -45,10 +57,12 @@ namespace xla {
 class XdnaExecutable : public PjRtLoadedExecutable {
  public:
   // Construct an executable from XRT objects loaded from an ELF.
+  // Uses kDirect convention by default (Phase 1 behavior).
   XdnaExecutable(PjRtClient* client,
                  absl::Span<PjRtDevice* const> addressable_devices,
                  xrt::elf elf, xrt::hw_context hw_context,
-                 xrt::kernel kernel, absl::string_view name);
+                 xrt::kernel kernel, absl::string_view name,
+                 XdnaKernelConvention convention = XdnaKernelConvention::kDirect);
 
   ~XdnaExecutable() override = default;
 
@@ -93,6 +107,7 @@ class XdnaExecutable : public PjRtLoadedExecutable {
   xrt::elf elf_;
   xrt::hw_context hw_context_;
   xrt::kernel kernel_;
+  XdnaKernelConvention convention_;
 };
 
 }  // namespace xla

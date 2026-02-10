@@ -59,16 +59,86 @@ cc_library(
 )
 
 cc_library(
+    name = "xdna_aie_lowering",
+    srcs = ["xdna_aie_lowering.cc"],
+    hdrs = ["xdna_aie_lowering.h"],
+    deps = [
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
+    name = "xdna_codegen",
+    srcs = ["xdna_codegen.cc"],
+    hdrs = ["xdna_codegen.h"],
+    deps = [
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
+    name = "xdna_hlo_passes",
+    srcs = ["xdna_hlo_passes.cc"],
+    hdrs = ["xdna_hlo_passes.h"],
+    deps = [
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/pass:hlo_pass_pipeline",
+        "//xla/hlo/transforms/expanders:cholesky_expander",
+        "//xla/hlo/transforms/expanders:convolution_type_canonicalizer",
+        "//xla/hlo/transforms/expanders:dynamic_index_splitter",
+        "//xla/hlo/transforms/expanders:eigh_expander",
+        "//xla/hlo/transforms/expanders:qr_expander",
+        "//xla/service:batchnorm_expander",
+        "//xla/service:layout_assignment",
+        "//xla/service:topk_rewriter",
+        "//xla/service:triangular_solve_expander",
+        "@com_google_absl//absl/status:statusor",
+        "@tsl//tsl/platform:errors",
+    ],
+)
+
+cc_library(
+    name = "xdna_compiler",
+    srcs = ["xdna_compiler.cc"],
+    hdrs = ["xdna_compiler.h"],
+    deps = [
+        ":xdna_aie_lowering",
+        ":xdna_codegen",
+        "//xla/hlo/ir:hlo",
+        "//xla/hlo/translate/hlo_to_mhlo:hlo_to_mlir_hlo",
+        "//xla/pjrt:mlir_to_hlo",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//mlir:IR",
+        "@tsl//tsl/platform:errors",
+    ],
+)
+
+cc_library(
     name = "xdna_pjrt_client",
     srcs = ["xdna_pjrt_client.cc"],
     hdrs = ["xdna_pjrt_client.h"],
     deps = [
+        ":xdna_compiler",
+        ":xdna_hlo_passes",
         ":xdna_pjrt_buffer",
         ":xdna_pjrt_device",
         ":xdna_pjrt_executable",
         "//xla:shape_util",
+        "//xla:xla_proto_cc",
+        "//xla/client:executable_build_options",
+        "//xla/hlo/builder:xla_computation",
+        "//xla/hlo/ir:hlo",
+        "//xla/pjrt:mlir_to_hlo",
         "//xla/pjrt:pjrt_client",
         "//xla/pjrt:pjrt_compiler",
+        "//xla/pjrt:utils",
+        "//xla/service:hlo_module_config",
+        "//xla/service:hlo_module_util",
+        "//xla/tsl/platform:errors",
+        "//xla/tsl/platform:statusor",
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
@@ -76,6 +146,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
+        "@llvm-project//mlir:IR",
         "@tsl//tsl/platform:fingerprint",
         "@xrt//:xrt_coreutil",
     ],
@@ -117,6 +188,25 @@ xla_cc_test(
         "//xla/pjrt:pjrt_executable",
         "//xla/pjrt/c:pjrt_c_api_hdrs",
         "//xla/tests:xla_internal_test_main",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+xla_cc_test(
+    name = "xdna_compiler_test",
+    srcs = ["xdna_compiler_test.cc"],
+    deps = [
+        ":xdna_compiler",
+        ":xdna_hlo_passes",
+        ":xdna_pjrt_client",
+        "//xla:literal_util",
+        "//xla:shape_util",
+        "//xla/hlo/builder:xla_builder",
+        "//xla/hlo/builder:xla_computation",
+        "//xla/hlo/ir:hlo",
+        "//xla/pjrt:pjrt_client",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_googletest//:gtest",
     ],
 )
