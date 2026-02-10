@@ -29,14 +29,14 @@ namespace xla {
 //
 // Pipeline:
 //   HloModule
-//     → MHLO dialect (via ConvertHloToMlirHlo)
-//     → linalg-on-tensors (via mhlo-to-linalg pass)
-//     → AIE dialect (via LowerLinalgToAie — requires mlir-aie)
-//     → ELF binary (via GenerateElfFromAie — requires Peano + mlir-aie)
+//     → StableHLO dialect (via ConvertHloToMlirHlo with emit_stablehlo=true)
+//     → linalg-on-tensors (via StableHLO legalize-to-linalg pass)
+//     → AIE dialect MLIR text (via LowerLinalgToAie — template-based generation)
+//     → ELF binary (via GenerateElfFromAie — subprocess: aie-opt + Peano + aiebu)
 //
-// Currently only the HLO → MHLO → linalg path is implemented. The AIE
-// lowering and codegen steps return Unimplemented until the toolchain
-// (Peano + mlir-aie) is built and linked.
+// The AIE lowering and codegen use external tools (aie-opt, aie-translate,
+// Peano clang) via subprocess invocation to avoid LLVM ABI conflicts between
+// OpenXLA's LLVM (Jan 2026) and Peano/mlir-aie's LLVM (Jan 2025).
 class XdnaCompiler {
  public:
   // Compiles an optimized HloModule to ELF bytes.

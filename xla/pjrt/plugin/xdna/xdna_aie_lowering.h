@@ -19,6 +19,7 @@ limitations under the License.
 #include <string>
 
 #include "absl/status/statusor.h"
+#include "mlir/IR/BuiltinOps.h"
 
 namespace xla {
 
@@ -34,21 +35,23 @@ struct AieLoweringConfig {
   int l2_tile_bytes = 524288;
 };
 
-// Lowers linalg-on-tensors MLIR to AIE dialect IR.
+// Lowers a linalg-on-tensors MLIR module to AIE dialect MLIR text.
 //
-// Takes MLIR in the linalg dialect (output of mhlo-to-linalg conversion) and
-// produces MLIR in the AIE dialect with:
+// Analyzes the linalg operations in the module and generates AIE dialect
+// MLIR text for the XDNA NPU, including:
 // - Physical tile placement (aie.tile)
 // - ObjectFIFO data movement (aie.objectfifo)
 // - Per-core computation (aie.core)
-// - DMA and lock configuration
+// - NPU DMA instruction sequence
 //
-// Currently returns Unimplemented — requires mlir-aie library linkage.
+// The output text is suitable for processing by aie-opt and aie-translate.
 //
-// `linalg_mlir` is serialized MLIR bytecode in the linalg dialect.
-// Returns serialized MLIR bytecode in the AIE dialect.
+// Currently supports:
+// - Element-wise ops (add, subtract, multiply) on single core
+//
+// Returns AIE dialect MLIR text string.
 absl::StatusOr<std::string> LowerLinalgToAie(
-    const std::string& linalg_mlir, const AieLoweringConfig& config);
+    mlir::ModuleOp linalg_module, const AieLoweringConfig& config);
 
 }  // namespace xla
 

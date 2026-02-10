@@ -63,7 +63,16 @@ cc_library(
     srcs = ["xdna_aie_lowering.cc"],
     hdrs = ["xdna_aie_lowering.h"],
     deps = [
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LinalgDialect",
+        "@tsl//tsl/platform:errors",
     ],
 )
 
@@ -72,7 +81,11 @@ cc_library(
     srcs = ["xdna_codegen.cc"],
     hdrs = ["xdna_codegen.h"],
     deps = [
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@tsl//tsl/platform:errors",
     ],
 )
 
@@ -111,7 +124,10 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
         "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Pass",
+        "@stablehlo//:linalg_passes",
         "@tsl//tsl/platform:errors",
     ],
 )

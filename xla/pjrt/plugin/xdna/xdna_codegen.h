@@ -24,21 +24,19 @@ limitations under the License.
 
 namespace xla {
 
-// Generates an ELF binary from AIE dialect MLIR.
+// Generates an ELF binary from AIE dialect MLIR text.
 //
-// The full pipeline:
-// 1. Per-core code generation: extract each core's computation, lower to
-//    LLVM IR, compile with Peano (llc --march=aie2p) to per-core object files.
-// 2. CDO generation: AIETranslateToCDODirect() generates configuration data
-//    for DMA, locks, and routing.
-// 3. PDI packaging: bootgen or direct CDO packing into a PDI.
-// 4. ELF assembly: aiebu-asm packages PDI + NPU instructions into a
-//    self-contained ELF loadable by XRT.
+// Uses external tools via subprocess invocation:
+// 1. aie-opt: Run AIE optimization/lowering passes
+// 2. aie-translate: Generate CDO and NPU instruction binaries
+// 3. Peano (clang): Compile per-core code to AIE object files
+// 4. aiebu-asm: Package everything into a self-contained ELF
 //
-// Currently returns Unimplemented — requires Peano and mlir-aie library
-// linkage.
+// Tool paths (searched in order):
+// - /opt/mlir-aie/bin/aie-opt, /opt/mlir-aie/bin/aie-translate
+// - /opt/peano/bin/clang
+// - /opt/xilinx/xrt/bin/aiebu-asm
 //
-// `aie_mlir` is serialized MLIR bytecode in the AIE dialect.
 // Returns raw ELF bytes suitable for LoadSerializedExecutable().
 absl::StatusOr<std::vector<uint8_t>> GenerateElfFromAie(
     const std::string& aie_mlir);

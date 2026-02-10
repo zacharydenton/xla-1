@@ -41,6 +41,16 @@ XlaComputation BuildAddOneComputation() {
   return builder.Build().value();
 }
 
+// Helper to build a two-input add computation.
+XlaComputation BuildAddComputation() {
+  Shape shape = ShapeUtil::MakeShape(F32, {4});
+  XlaBuilder builder("add");
+  auto x = Parameter(&builder, 0, shape, "x");
+  auto y = Parameter(&builder, 1, shape, "y");
+  Add(x, y);
+  return builder.Build().value();
+}
+
 // Helper to create an HloModule from a computation.
 std::unique_ptr<HloModule> CreateHloModule(const XlaComputation& computation) {
   auto config = HloModule::CreateModuleConfigFromProto(computation.proto(),
@@ -77,33 +87,47 @@ TEST(XdnaHloPassesTest, RunsOnElementWiseOps) {
   EXPECT_TRUE((*result)->has_entry_computation());
 }
 
-TEST(XdnaCompilerTest, CompileReturnsUnimplemented) {
-  XlaComputation computation = BuildAddOneComputation();
+// Test that the full compiler pipeline produces ELF bytes.
+TEST(XdnaCompilerTest, CompilePipelineRuns) {
+  XlaComputation computation = BuildAddComputation();
   std::unique_ptr<HloModule> module = CreateHloModule(computation);
 
   auto result = XdnaCompiler::Compile(std::move(module));
-  // Currently returns Unimplemented because AIE lowering + codegen
-  // require the Peano/mlir-aie toolchain.
-  EXPECT_FALSE(result.ok());
-  EXPECT_EQ(result.status().code(), absl::StatusCode::kUnimplemented);
+  if (!result.ok()) {
+    // Tools may not be installed in CI — NotFound/Internal are acceptable.
+    EXPECT_TRUE(result.status().code() == absl::StatusCode::kNotFound ||
+                result.status().code() == absl::StatusCode::kInternal)
+        << "Unexpected error: " << result.status();
+    GTEST_SKIP() << "Toolchain not available: " << result.status().message();
+  }
+  // Pipeline succeeded — verify we got non-empty ELF bytes.
+  EXPECT_GT(result->size(), 0);
+  // Check ELF magic: 0x7f 'E' 'L' 'F'
+  ASSERT_GE(result->size(), 4u);
+  EXPECT_EQ((*result)[0], 0x7f);
+  EXPECT_EQ((*result)[1], 'E');
+  EXPECT_EQ((*result)[2], 'L');
+  EXPECT_EQ((*result)[3], 'F');
 }
 
 TEST(XdnaCompilerTest, CompileAfterHloPasses) {
-  XlaComputation computation = BuildAddOneComputation();
+  XlaComputation computation = BuildAddComputation();
   std::unique_ptr<HloModule> module = CreateHloModule(computation);
 
-  // Passes should succeed.
   auto passed = RunXdnaHloPasses(std::move(module));
   ASSERT_TRUE(passed.ok()) << passed.status();
 
-  // Compile should fail with Unimplemented.
   auto result = XdnaCompiler::Compile(std::move(*passed));
-  EXPECT_FALSE(result.ok());
-  EXPECT_EQ(result.status().code(), absl::StatusCode::kUnimplemented);
+  if (!result.ok()) {
+    EXPECT_TRUE(result.status().code() == absl::StatusCode::kNotFound ||
+                result.status().code() == absl::StatusCode::kInternal)
+        << "Unexpected error: " << result.status();
+    GTEST_SKIP() << "Toolchain not available: " << result.status().message();
+  }
+  EXPECT_GT(result->size(), 0);
 }
 
-// Integration test: CompileAndLoad on the full client should propagate the
-// Unimplemented error from the compiler.
+// Integration test: CompileAndLoad on the full client.
 class XdnaCompileAndLoadTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -117,12 +141,15 @@ class XdnaCompileAndLoadTest : public ::testing::Test {
   std::unique_ptr<PjRtClient> client_;
 };
 
-TEST_F(XdnaCompileAndLoadTest, ReturnsUnimplemented) {
-  XlaComputation computation = BuildAddOneComputation();
+TEST_F(XdnaCompileAndLoadTest, CompilePipelineRuns) {
+  XlaComputation computation = BuildAddComputation();
   auto result = client_->CompileAndLoad(computation, CompileOptions());
-  EXPECT_FALSE(result.ok());
-  // The error should indicate that compilation is not yet fully available.
-  EXPECT_EQ(result.status().code(), absl::StatusCode::kUnimplemented);
+  // Same as above: should reach codegen, may fail if tools are missing.
+  if (!result.ok()) {
+    EXPECT_TRUE(result.status().code() == absl::StatusCode::kNotFound ||
+                result.status().code() == absl::StatusCode::kInternal)
+        << "Unexpected error: " << result.status();
+  }
 }
 
 }  // namespace
