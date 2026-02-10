@@ -133,6 +133,26 @@ def test_subtract():
     np.testing.assert_allclose(np.array(result), expected, rtol=1e-5)
 
 
+def test_bf16_add():
+    """Test 6: bf16 add — native AIE2p type."""
+    import ml_dtypes
+    a = np.array([1.0, 2.0, 3.0, 4.0], dtype=ml_dtypes.bfloat16)
+    b = np.array([10.0, 20.0, 30.0, 40.0], dtype=ml_dtypes.bfloat16)
+    result = jax.jit(lambda x, y: x + y)(a, b)
+    expected = np.array([11.0, 22.0, 33.0, 44.0], dtype=np.float32)
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
+
+
+def test_bf16_multiply():
+    """Test 7: bf16 multiply — native vmul.f hardware path."""
+    import ml_dtypes
+    a = np.array([1.0, 2.0, 3.0, 4.0], dtype=ml_dtypes.bfloat16)
+    b = np.array([10.0, 20.0, 30.0, 40.0], dtype=ml_dtypes.bfloat16)
+    result = jax.jit(lambda x, y: x * y)(a, b)
+    expected = np.array([10.0, 40.0, 90.0, 160.0], dtype=np.float32)
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
+
+
 def main():
     tests = [
         ("Device discovery", test_device_discovery),
@@ -140,6 +160,8 @@ def main():
         ("jit(x * y)", test_multiply),
         ("jit(-x)", test_negate),
         ("jit(x - y)", test_subtract),
+        ("jit(x + y) bf16", test_bf16_add),
+        ("jit(x * y) bf16", test_bf16_multiply),
     ]
 
     print(f"XDNA JAX Integration Tests", flush=True)

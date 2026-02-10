@@ -405,8 +405,16 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
 
   // 3e: Peano opt → llc → clang link.
   std::string core_opt_ll = workdir + "/core_0_2.opt.ll";
+  // Disable SLP/loop vectorization: Peano's O2 creates small vectors
+  // (e.g. <2 x bf16>) that are illegal on AIE2p — legal vector widths
+  // are 32/64 elements. Scalar code is fine: Peano's legalizer
+  // widens scalars to legal vector ops where needed.
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
-      peano_opt, " '--passes=default<O2>,strip' -S ",
+      peano_opt,
+      " '--passes=default<O2>,strip'"
+      " -vectorize-slp=false"
+      " -vectorize-loops=false"
+      " -S ",
       core_ll, " -o ", core_opt_ll)));
 
   std::string core_obj = workdir + "/core_0_2.o";
