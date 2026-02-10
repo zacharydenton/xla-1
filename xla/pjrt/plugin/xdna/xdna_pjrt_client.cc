@@ -42,6 +42,7 @@ limitations under the License.
 #include "xla/pjrt/plugin/xdna/xdna_hlo_passes.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_buffer.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_device.h"
+#include "xla/pjrt/plugin/xdna/xdna_codegen.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_executable.h"
 #include "xla/pjrt/utils.h"
 #include "xla/service/hlo_module_config.h"
@@ -249,14 +250,48 @@ XdnaPjrtClient::CompileInternal(
     TF_ASSIGN_OR_RETURN(hlo_module, RunXdnaHloPasses(std::move(hlo_module)));
   }
 
-  // Compile HLO to ELF.
-  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> elf_bytes,
+  // Extract output shapes before compilation consumes the module.
+  const Shape& result_shape = hlo_module->result_shape();
+  std::vector<Shape> output_shapes;
+  if (result_shape.IsTuple()) {
+    for (const Shape& elem : result_shape.tuple_shapes()) {
+      output_shapes.push_back(elem);
+    }
+  } else {
+    output_shapes.push_back(result_shape);
+  }
+
+  int num_inputs = hlo_module->entry_computation()
+                       ->num_parameters();
+
+  // Compile HLO to xclbin.
+  TF_ASSIGN_OR_RETURN(XdnaCodegenResult codegen_result,
                       XdnaCompiler::Compile(std::move(hlo_module)));
 
-  // Load the compiled ELF through our existing LoadSerializedExecutable path.
-  absl::string_view elf_view(reinterpret_cast<const char*>(elf_bytes.data()),
-                             elf_bytes.size());
-  return LoadSerializedExecutable(elf_view, std::nullopt, LoadOptions());
+  LOG(INFO) << "XDNA: Loading xclbin (" << codegen_result.xclbin_bytes.size()
+            << " bytes), kernel='" << codegen_result.kernel_name << "'";
+
+  // Load the xclbin and create an executable with kDpu convention.
+  try {
+    // Construct xrt::xclbin from raw bytes.
+    std::vector<char> xclbin_data(codegen_result.xclbin_bytes.begin(),
+                                  codegen_result.xclbin_bytes.end());
+    xrt::xclbin xclbin(xclbin_data);
+
+    // Register xclbin with device and create hw_context from UUID.
+    auto uuid = xrt_device_.register_xclbin(xclbin);
+    xrt::hw_context hw_ctx(xrt_device_, uuid);
+    xrt::kernel kernel(hw_ctx, codegen_result.kernel_name);
+
+    return std::make_unique<XdnaExecutable>(
+        this, addressable_devices_, std::move(xclbin), std::move(hw_ctx),
+        std::move(kernel), codegen_result.kernel_name,
+        XdnaKernelConvention::kDpu, num_inputs, std::move(output_shapes),
+        std::move(codegen_result.instr_words));
+  } catch (const std::exception& e) {
+    return absl::InternalError(
+        absl::StrCat("Failed to load compiled xclbin: ", e.what()));
+  }
 }
 
 absl::StatusOr<std::unique_ptr<PjRtLoadedExecutable>>

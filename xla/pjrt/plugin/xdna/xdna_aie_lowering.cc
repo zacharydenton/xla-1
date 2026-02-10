@@ -281,6 +281,10 @@ std::string GenerateCoreBody(const LinalgOpInfo& info, int64_t chunk_size) {
 }
 
 // Generates the NPU instruction sequence for DMA setup.
+// Follows the pattern from mlir-aie examples (e.g., add_314_using_dma_op):
+//   1. Set up input DMA transfers
+//   2. Set up output DMA with issue_token=true (enables completion tracking)
+//   3. dma_wait on the output ObjectFIFO
 std::string GenerateNpuSequence(const LinalgOpInfo& info,
                                 int64_t chunk_size) {
   const std::string& ty = info.element_type;
@@ -288,18 +292,20 @@ std::string GenerateNpuSequence(const LinalgOpInfo& info,
 
   std::string seq;
 
-  // Function signature: inputs + output.
+  // Runtime sequence: inputs + output.
+  // Uses aiex.runtime_sequence (not func.func @sequence) so that
+  // aie-dma-to-npu can lower the DMA ops to NPU instructions.
   if (info.num_inputs == 2) {
     absl::StrAppend(&seq, absl::StrFormat(
-        "    func.func @sequence(%%arg0: %s, %%arg1: %s, %%arg2: %s) {\n",
+        "    aiex.runtime_sequence(%%arg0: %s, %%arg1: %s, %%arg2: %s) {\n",
         memref_ty, memref_ty, memref_ty));
   } else {
     absl::StrAppend(&seq, absl::StrFormat(
-        "    func.func @sequence(%%arg0: %s, %%arg1: %s) {\n",
+        "    aiex.runtime_sequence(%%arg0: %s, %%arg1: %s) {\n",
         memref_ty, memref_ty));
   }
 
-  // DMA transfers: inputs.
+  // DMA transfers: inputs first.
   absl::StrAppend(&seq, absl::StrFormat(
       "      aiex.npu.dma_memcpy_nd(0, 0, %%arg0[0, 0, 0, 0]"
       "[1, 1, 1, %d][0, 0, 0, 1]) "
@@ -314,24 +320,20 @@ std::string GenerateNpuSequence(const LinalgOpInfo& info,
         chunk_size, memref_ty));
   }
 
-  // DMA transfer: output.
+  // DMA transfer: output with issue_token for completion tracking.
   int out_arg = info.num_inputs;
   int out_id = info.num_inputs;
   absl::StrAppend(&seq, absl::StrFormat(
       "      aiex.npu.dma_memcpy_nd(0, 0, %%arg%d[0, 0, 0, 0]"
       "[1, 1, 1, %d][0, 0, 0, 1]) "
-      "{id = %d : i64, metadata = @out0} : %s\n",
+      "{id = %d : i64, metadata = @out0, issue_token = true} : %s\n",
       out_arg, chunk_size, out_id, memref_ty));
 
-  // Sync.
+  // Wait for output DMA completion (lowered to npu.sync by aie-dma-to-npu).
   absl::StrAppend(&seq,
-      "      aiex.npu.sync {channel = 0 : i32, column = 0 : i32, "
-      "column_num = 1 : i32, direction = 0 : i32, "
-      "row = 0 : i32, row_num = 1 : i32}\n");
+      "      aiex.npu.dma_wait { symbol = @out0 }\n");
 
-  absl::StrAppend(&seq,
-      "      return\n"
-      "    }\n");
+  absl::StrAppend(&seq, "    }\n");
 
   return seq;
 }

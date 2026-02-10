@@ -16,6 +16,7 @@ limitations under the License.
 #ifndef XLA_PJRT_PLUGIN_XDNA_XDNA_PJRT_EXECUTABLE_H_
 #define XLA_PJRT_PLUGIN_XDNA_XDNA_PJRT_EXECUTABLE_H_
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,8 +29,10 @@ limitations under the License.
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/pjrt_future.h"
 #include "xla/service/computation_placer.h"
+#include "xla/shape.h"
 #include "xrt/experimental/xrt_elf.h"
 #include "xrt/experimental/xrt_hw_context.h"
+#include "xrt/experimental/xrt_xclbin.h"
 #include "xrt/xrt_kernel.h"
 
 namespace xla {
@@ -48,21 +51,33 @@ enum class XdnaKernelConvention {
 
 // PjRtLoadedExecutable for XDNA NPU that dispatches pre-compiled ELF kernels.
 //
-// Phase 1: No compiler integration. Users provide pre-compiled ELF binaries
-// via LoadSerializedExecutable(). Execute() binds user-provided buffers to
-// kernel arguments and runs the kernel on the NPU.
-//
-// All argument_handles passed to Execute are bound as kernel global arguments
-// in order. The kernel modifies buffers in-place; Execute returns empty output.
+// Two modes:
+// - kDirect: Phase 1 legacy. All argument_handles are bound as kernel args
+//   starting at arg 0. Buffers are modified in-place; returns empty output.
+// - kDpu: Compiled kernels. Args 0-2 are opcode/instr/count. Input buffers
+//   bound at args 3+, output buffers allocated and bound after inputs.
+//   Returns newly allocated output buffers.
 class XdnaExecutable : public PjRtLoadedExecutable {
  public:
-  // Construct an executable from XRT objects loaded from an ELF.
-  // Uses kDirect convention by default (Phase 1 behavior).
+  // Construct from ELF (Phase 1 / LoadSerializedExecutable).
+  // Uses kDirect convention by default.
   XdnaExecutable(PjRtClient* client,
                  absl::Span<PjRtDevice* const> addressable_devices,
                  xrt::elf elf, xrt::hw_context hw_context,
                  xrt::kernel kernel, absl::string_view name,
-                 XdnaKernelConvention convention = XdnaKernelConvention::kDirect);
+                 XdnaKernelConvention convention = XdnaKernelConvention::kDirect,
+                 int num_inputs = -1,
+                 std::vector<Shape> output_shapes = {});
+
+  // Construct from xclbin (compiled kernels).
+  XdnaExecutable(PjRtClient* client,
+                 absl::Span<PjRtDevice* const> addressable_devices,
+                 xrt::xclbin xclbin, xrt::hw_context hw_context,
+                 xrt::kernel kernel, absl::string_view name,
+                 XdnaKernelConvention convention,
+                 int num_inputs,
+                 std::vector<Shape> output_shapes,
+                 std::vector<uint32_t> instr_words);
 
   ~XdnaExecutable() override = default;
 
@@ -104,10 +119,21 @@ class XdnaExecutable : public PjRtLoadedExecutable {
   std::string name_;
   bool is_deleted_ = false;
 
-  xrt::elf elf_;
+  // Backing object: ELF for Phase 1, xclbin for compiled kernels.
+  std::optional<xrt::elf> elf_;
+  std::optional<xrt::xclbin> xclbin_;
   xrt::hw_context hw_context_;
   xrt::kernel kernel_;
   XdnaKernelConvention convention_;
+
+  // For kDpu convention: number of input args and output shapes.
+  // When num_inputs_ >= 0, ExecuteSharded will allocate output buffers.
+  int num_inputs_ = -1;
+  std::vector<Shape> output_shapes_;
+
+  // NPU instruction stream for xclbin-based executables.
+  // Loaded as a cacheable BO and passed as kernel arg 1.
+  std::vector<uint32_t> instr_words_;
 };
 
 }  // namespace xla

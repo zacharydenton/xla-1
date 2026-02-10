@@ -44,6 +44,7 @@ cc_library(
     hdrs = ["xdna_pjrt_executable.h"],
     deps = [
         ":xdna_pjrt_buffer",
+        "//xla:shape_util",
         "//xla/pjrt:pjrt_client",
         "//xla/pjrt:pjrt_executable",
         "//xla/pjrt:pjrt_future",
@@ -85,6 +86,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
         "@tsl//tsl/platform:errors",
     ],
 )
@@ -117,6 +119,7 @@ cc_library(
     deps = [
         ":xdna_aie_lowering",
         ":xdna_codegen",
+        "//xla:shape_util",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/translate/hlo_to_mhlo:hlo_to_mlir_hlo",
         "//xla/pjrt:mlir_to_hlo",
@@ -137,6 +140,7 @@ cc_library(
     srcs = ["xdna_pjrt_client.cc"],
     hdrs = ["xdna_pjrt_client.h"],
     deps = [
+        ":xdna_codegen",
         ":xdna_compiler",
         ":xdna_hlo_passes",
         ":xdna_pjrt_buffer",
@@ -221,6 +225,7 @@ xla_cc_test(
         "//xla/hlo/builder:xla_computation",
         "//xla/hlo/ir:hlo",
         "//xla/pjrt:pjrt_client",
+        "//xla/pjrt:pjrt_future",
         "//xla/tests:xla_internal_test_main",
         "@com_google_absl//absl/status:statusor",
         "@com_google_googletest//:gtest",

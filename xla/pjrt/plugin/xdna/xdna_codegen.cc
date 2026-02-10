@@ -26,14 +26,16 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "xla/tsl/platform/errors.h"
 
 namespace xla {
 namespace {
 
-// Tool paths. These are compile-time defaults; override via environment
-// variables XDNA_AIE_OPT, XDNA_AIE_TRANSLATE, XDNA_PEANO_CLANG,
-// XDNA_AIEBU_ASM if installed elsewhere.
+// ---------------------------------------------------------------------------
+// Tool path helpers. Override via environment variables.
+// ---------------------------------------------------------------------------
+
 std::string GetAieOptPath() {
   const char* env = std::getenv("XDNA_AIE_OPT");
   return env ? env : "/opt/mlir-aie/bin/aie-opt";
@@ -59,12 +61,20 @@ std::string GetPeanoLlcPath() {
   return env ? env : "/opt/peano/bin/llc";
 }
 
-std::string GetAiebuAsmPath() {
-  const char* env = std::getenv("XDNA_AIEBU_ASM");
-  return env ? env : "/opt/xilinx/xrt/bin/aiebu-asm";
+std::string GetBootgenPath() {
+  const char* env = std::getenv("XDNA_BOOTGEN");
+  return env ? env : "bootgen";
 }
 
-// Runs a shell command and returns an error if it fails.
+std::string GetXclbinutilPath() {
+  const char* env = std::getenv("XDNA_XCLBINUTIL");
+  return env ? env : "/opt/xilinx/xrt/bin/xclbinutil";
+}
+
+// ---------------------------------------------------------------------------
+// File I/O helpers.
+// ---------------------------------------------------------------------------
+
 absl::Status RunCommand(const std::string& cmd) {
   LOG(INFO) << "XDNA codegen: running: " << cmd;
   int ret = std::system(cmd.c_str());
@@ -75,12 +85,10 @@ absl::Status RunCommand(const std::string& cmd) {
   return absl::OkStatus();
 }
 
-// Reads a binary file into a byte vector.
 absl::StatusOr<std::vector<uint8_t>> ReadBinaryFile(const std::string& path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   if (!file.is_open()) {
-    return absl::NotFoundError(
-        absl::StrCat("Cannot open file: ", path));
+    return absl::NotFoundError(absl::StrCat("Cannot open file: ", path));
   }
   auto size = file.tellg();
   file.seekg(0, std::ios::beg);
@@ -89,21 +97,199 @@ absl::StatusOr<std::vector<uint8_t>> ReadBinaryFile(const std::string& path) {
   return data;
 }
 
-// Writes a string to a file.
+// Parse a hex instruction text file (one uint32 per line) into a vector.
+absl::StatusOr<std::vector<uint32_t>> ReadInstrFile(const std::string& path) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    return absl::NotFoundError(
+        absl::StrCat("Cannot open instruction file: ", path));
+  }
+  std::vector<uint32_t> words;
+  std::string line;
+  while (std::getline(file, line)) {
+    // Skip empty lines and comments.
+    if (line.empty() || line[0] == '#' || line[0] == '/') continue;
+    uint32_t word = std::stoul(line, nullptr, 16);
+    words.push_back(word);
+  }
+  return words;
+}
+
 absl::Status WriteFile(const std::string& path, const std::string& content) {
   std::ofstream file(path);
   if (!file.is_open()) {
-    return absl::InternalError(
-        absl::StrCat("Cannot write file: ", path));
+    return absl::InternalError(absl::StrCat("Cannot write file: ", path));
   }
   file << content;
   return absl::OkStatus();
 }
 
+// ---------------------------------------------------------------------------
+// xclbin metadata generation (matches aiecc.py's output).
+// ---------------------------------------------------------------------------
+
+std::string GenerateMemTopologyJson() {
+  return R"({
+  "mem_topology": {
+    "m_count": "2",
+    "m_mem_data": [
+      {
+        "m_type": "MEM_DRAM",
+        "m_used": "1",
+        "m_sizeKB": "0x10000",
+        "m_tag": "HOST",
+        "m_base_address": "0x4000000"
+      },
+      {
+        "m_type": "MEM_DRAM",
+        "m_used": "1",
+        "m_sizeKB": "0xc000",
+        "m_tag": "SRAM",
+        "m_base_address": "0x4000000"
+      }
+    ]
+  }
+})";
+}
+
+std::string GenerateKernelsJson(const std::string& kernel_name,
+                                int num_data_args) {
+  // DPU kernel signature: opcode (scalar) + instr (global/SRAM) +
+  // ninstr (scalar) + N data buffer args (global/HOST).
+  std::string args = R"(
+          {"name": "opcode", "address-qualifier": "SCALAR", "type": "uint64_t", "offset": "0x00"},
+          {"name": "instr", "memory-connection": "SRAM", "address-qualifier": "GLOBAL", "type": "char *", "offset": "0x08"},
+          {"name": "ninstr", "address-qualifier": "SCALAR", "type": "uint32_t", "offset": "0x10"})";
+
+  int offset = 0x14;
+  for (int i = 0; i < num_data_args; ++i) {
+    absl::StrAppend(&args, absl::StrFormat(
+        ",\n          {\"name\": \"bo%d\", \"memory-connection\": \"HOST\", "
+        "\"address-qualifier\": \"GLOBAL\", \"type\": \"void*\", "
+        "\"offset\": \"%s\"}",
+        i, absl::StrFormat("0x%02x", offset)));
+    offset += 0x08;
+  }
+
+  return absl::StrFormat(R"({
+  "ps-kernels": {
+    "kernels": [
+      {
+        "name": "%s",
+        "type": "dpu",
+        "extended-data": {
+          "subtype": "DPU",
+          "functional": "0",
+          "dpu_kernel_id": "0x901"
+        },
+        "arguments": [%s
+        ],
+        "instances": [{"name": "%sInst"}]
+      }
+    ]
+  }
+})", kernel_name, args, kernel_name);
+}
+
+std::string GenerateAiePartitionJson(const std::string& pdi_path) {
+  // npu2 uses 8 columns starting at column 0.
+  return absl::StrFormat(R"({
+  "aie_partition": {
+    "name": "QoS",
+    "operations_per_cycle": "2048",
+    "inference_fingerprint": "23423",
+    "pre_post_fingerprint": "12345",
+    "partition": {
+      "column_width": 8,
+      "start_columns": [0]
+    },
+    "PDIs": [
+      {
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "file_name": "%s",
+        "cdo_groups": [
+          {
+            "name": "DPU",
+            "type": "PRIMARY",
+            "pdi_id": "0x01",
+            "dpu_kernel_ids": ["0x901"],
+            "pre_cdo_groups": ["0xC1"]
+          }
+        ]
+      }
+    ]
+  }
+})", pdi_path);
+}
+
+std::string GenerateDesignBif(const std::string& workdir) {
+  return absl::StrFormat(R"(all:
+{
+  id_code = 0x14ca8093
+  extended_id_code = 0x01
+  id = 0x2
+  image
+  {
+    name=aie_image, id=0x1c000000
+    partition
+    {
+      id=0x01
+      type=cdo
+      file=%s/aie_cdo_elfs.bin
+      file=%s/aie_cdo_init.bin
+      file=%s/aie_cdo_enable.bin
+    }
+  }
+})", workdir, workdir, workdir);
+}
+
+// ---------------------------------------------------------------------------
+// Check that all required tools exist.
+// ---------------------------------------------------------------------------
+
+absl::Status CheckTools(const std::string& aie_opt,
+                        const std::string& aie_translate,
+                        const std::string& peano_clang,
+                        const std::string& bootgen,
+                        const std::string& xclbinutil) {
+  auto check = [](const std::string& tool, const std::string& name,
+                   const std::string& env_var,
+                   const std::string& install_hint) -> absl::Status {
+    // For tools found via PATH (like bootgen), use `which` check.
+    if (tool.find('/') == std::string::npos) {
+      std::string cmd = absl::StrCat("which ", tool, " > /dev/null 2>&1");
+      if (std::system(cmd.c_str()) != 0) {
+        return absl::NotFoundError(absl::StrCat(
+            name, " not found in PATH. Set ", env_var, " or ", install_hint));
+      }
+      return absl::OkStatus();
+    }
+    if (!std::filesystem::exists(tool)) {
+      return absl::NotFoundError(absl::StrCat(
+          name, " not found at ", tool, ". Set ", env_var, " or ",
+          install_hint));
+    }
+    return absl::OkStatus();
+  };
+
+  TF_RETURN_IF_ERROR(check(aie_opt, "aie-opt", "XDNA_AIE_OPT",
+                           "install mlir-aie to /opt/mlir-aie"));
+  TF_RETURN_IF_ERROR(check(aie_translate, "aie-translate",
+                           "XDNA_AIE_TRANSLATE",
+                           "install mlir-aie to /opt/mlir-aie"));
+  TF_RETURN_IF_ERROR(check(peano_clang, "Peano clang", "XDNA_PEANO_CLANG",
+                           "install Peano to /opt/peano"));
+  TF_RETURN_IF_ERROR(check(bootgen, "bootgen", "XDNA_BOOTGEN",
+                           "build from https://github.com/Xilinx/bootgen"));
+  TF_RETURN_IF_ERROR(check(xclbinutil, "xclbinutil", "XDNA_XCLBINUTIL",
+                           "install XRT to /opt/xilinx/xrt"));
+  return absl::OkStatus();
+}
+
 }  // namespace
 
-absl::StatusOr<std::vector<uint8_t>> GenerateElfFromAie(
-    const std::string& aie_mlir) {
+absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
+    const std::string& aie_mlir, int num_data_args) {
   // Create a temporary working directory.
   auto tmpdir = std::filesystem::temp_directory_path() / "xdna_codegen_XXXXXX";
   std::string tmpdir_str = tmpdir.string();
@@ -114,113 +300,86 @@ absl::StatusOr<std::vector<uint8_t>> GenerateElfFromAie(
   std::string workdir(tmpdir_cstr);
   LOG(INFO) << "XDNA codegen: working directory: " << workdir;
 
-  // Check that required tools exist.
+  // Resolve tool paths.
   std::string aie_opt = GetAieOptPath();
   std::string aie_translate = GetAieTranslatePath();
   std::string peano_clang = GetPeanoClangPath();
+  std::string peano_opt = GetPeanoOptPath();
+  std::string peano_llc = GetPeanoLlcPath();
+  std::string bootgen = GetBootgenPath();
+  std::string xclbinutil = GetXclbinutilPath();
 
-  if (!std::filesystem::exists(aie_opt)) {
-    return absl::NotFoundError(absl::StrCat(
-        "aie-opt not found at ", aie_opt,
-        ". Set XDNA_AIE_OPT or install mlir-aie to /opt/mlir-aie."));
-  }
-  if (!std::filesystem::exists(aie_translate)) {
-    return absl::NotFoundError(absl::StrCat(
-        "aie-translate not found at ", aie_translate,
-        ". Set XDNA_AIE_TRANSLATE or install mlir-aie to /opt/mlir-aie."));
-  }
-  if (!std::filesystem::exists(peano_clang)) {
-    return absl::NotFoundError(absl::StrCat(
-        "Peano clang not found at ", peano_clang,
-        ". Set XDNA_PEANO_CLANG or install Peano to /opt/peano."));
-  }
+  TF_RETURN_IF_ERROR(
+      CheckTools(aie_opt, aie_translate, peano_clang, bootgen, xclbinutil));
 
+  // -----------------------------------------------------------------------
   // Step 1: Write AIE MLIR to file.
+  // -----------------------------------------------------------------------
   std::string input_mlir = workdir + "/input.mlir";
-  auto status = WriteFile(input_mlir, aie_mlir);
-  if (!status.ok()) return status;
+  TF_RETURN_IF_ERROR(WriteFile(input_mlir, aie_mlir));
 
-  // Step 2: Run aie-opt passes.
-  // These passes lower ObjectFIFOs, route flows, assign resources.
+  // -----------------------------------------------------------------------
+  // Step 2: aie-opt lowering passes (INPUT_WITH_ADDRESSES_PIPELINE).
+  // Matches aiecc.py's pipeline order. Key passes:
+  //   - objectFifo-stateful-transform: lowers ObjectFIFOs to buffers + DMAs
+  //   - assign-bd-ids: assigns buffer descriptor IDs (must be AFTER objFIFO)
+  //   - generate-column-control-overlay: sets up tile controller routing
+  //     (needed for CDO commands to reach compute tiles on NPU)
+  //   - create-pathfinder-flows: routes logical flows through physical switches
+  //   - assign-buffer-addresses: allocates memory in tile local stores
+  // -----------------------------------------------------------------------
   std::string lowered_mlir = workdir + "/lowered.mlir";
-  std::string aie_opt_cmd = absl::StrCat(
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       aie_opt,
       " --lower-affine"
       " --aie-canonicalize-device"
       " --aie-assign-lock-ids"
+      " --aie-register-objectFifos"
       " --aie-objectFifo-stateful-transform"
       " --aie-assign-bd-ids"
       " --aie-lower-cascade-flows"
+      " --aie-lower-broadcast-packet"
+      " --aie-lower-multicast"
+      " --aie-assign-tile-controller-ids"
+      " \"--aie-generate-column-control-overlay=route-shim-to-tile-ctrl=true\""
       " --aie-create-pathfinder-flows"
       " --aie-assign-buffer-addresses"
       " --convert-scf-to-cf"
-      " ", input_mlir, " -o ", lowered_mlir);
-  TF_RETURN_IF_ERROR(RunCommand(aie_opt_cmd));
+      " ", input_mlir, " -o ", lowered_mlir)));
 
-  // Step 3: Convert DMA tasks to NPU instructions and generate binary.
-  // This matches aiecc.py's DMA_TO_NPU pipeline.
-  std::string npu_ready_mlir = workdir + "/npu_ready.mlir";
-  std::string dma_to_npu_cmd = absl::StrCat(
-      aie_opt,
-      " --aie-dma-tasks-to-npu"
-      " --aie-assign-runtime-sequence-bd-ids"
-      " ", lowered_mlir, " -o ", npu_ready_mlir);
-  TF_RETURN_IF_ERROR(RunCommand(dma_to_npu_cmd));
+  // -----------------------------------------------------------------------
+  // Step 3: Per-core code compilation with Peano.
+  // Extract core(0,2) code → lower to LLVM → compile to ELF.
+  // -----------------------------------------------------------------------
 
-  std::string npu_insts = workdir + "/npu_insts.bin";
-  std::string npu_cmd = absl::StrCat(
-      aie_translate,
-      " --aie-npu-instgen"
-      " --aie-output-binary"
-      " ", npu_ready_mlir, " -o ", npu_insts);
-  TF_RETURN_IF_ERROR(RunCommand(npu_cmd));
-
-  // Step 4a: Extract core(0,2) code with AIE-specific lowering.
-  // This converts aie.core regions to standalone functions and lowers
-  // AIE/AIEX ops to standard LLVM intrinsic calls.
+  // 3a: Extract core code with AIE-specific lowering.
   std::string core_mlir = workdir + "/core_0_2.mlir";
-  std::string core_extract_cmd = absl::StrCat(
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       aie_opt,
       " --aie-localize-locks"
       " --aie-normalize-address-spaces"
       " \"--aie-standard-lowering=tilecol=0 tilerow=2\""
       " --aiex-standard-lowering"
-      " ", lowered_mlir, " -o ", core_mlir);
-  TF_RETURN_IF_ERROR(RunCommand(core_extract_cmd));
+      " ", lowered_mlir, " -o ", core_mlir)));
 
-  // Step 4b: Lower to LLVM dialect.
-  // Matches aiecc.py's LOWER_TO_LLVM_PIPELINE.
+  // 3b: Lower to LLVM dialect (matches aiecc.py LOWER_TO_LLVM_PIPELINE).
   std::string core_opt_mlir = workdir + "/core_0_2.opt.mlir";
-  std::string core_llvm_cmd = absl::StrCat(
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       aie_opt,
-      " --canonicalize"
-      " --cse"
-      " --convert-vector-to-llvm"
-      " --expand-strided-metadata"
-      " --lower-affine"
-      " --convert-math-to-llvm"
-      " --convert-index-to-llvm"
-      " --arith-expand"
-      " --convert-arith-to-llvm"
-      " --finalize-memref-to-llvm"
+      " --canonicalize --cse"
+      " --convert-vector-to-llvm --expand-strided-metadata"
+      " --lower-affine --convert-math-to-llvm --convert-index-to-llvm"
+      " --arith-expand --convert-arith-to-llvm --finalize-memref-to-llvm"
       " \"--convert-func-to-llvm=use-bare-ptr-memref-call-conv\""
-      " --convert-cf-to-llvm"
-      " --canonicalize"
-      " --cse"
-      " ", core_mlir, " -o ", core_opt_mlir);
-  TF_RETURN_IF_ERROR(RunCommand(core_llvm_cmd));
+      " --convert-cf-to-llvm --canonicalize --cse"
+      " ", core_mlir, " -o ", core_opt_mlir)));
 
-  // Step 4c: Translate to LLVM IR.
+  // 3c: Translate to LLVM IR.
   std::string core_ll = workdir + "/core_0_2.ll";
-  std::string translate_cmd = absl::StrCat(
-      aie_translate,
-      " --mlir-to-llvmir"
-      " ", core_opt_mlir, " -o ", core_ll);
-  TF_RETURN_IF_ERROR(RunCommand(translate_cmd));
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+      aie_translate, " --mlir-to-llvmir ", core_opt_mlir, " -o ", core_ll)));
 
-  // Step 4d: Fix intrinsic names for aie2p target.
-  // mlir-aie generates llvm.aie2.* intrinsics but Peano's aie2p target
-  // expects llvm.aie2p.* intrinsics.
+  // 3d: Fix intrinsic names (llvm.aie2.* → llvm.aie2p.* for aie2p target).
   {
     std::ifstream ll_in(core_ll);
     if (!ll_in.is_open()) {
@@ -231,8 +390,6 @@ absl::StatusOr<std::vector<uint8_t>> GenerateElfFromAie(
                            std::istreambuf_iterator<char>());
     ll_in.close();
 
-    // Replace all llvm.aie2. with llvm.aie2p. — the dot after "aie2" means
-    // existing "llvm.aie2p." won't be matched.
     std::string from = "llvm.aie2.";
     std::string to = "llvm.aie2p.";
     size_t pos = 0;
@@ -240,103 +397,138 @@ absl::StatusOr<std::vector<uint8_t>> GenerateElfFromAie(
       ll_content.replace(pos, from.size(), to);
       pos += to.size();
     }
-
     TF_RETURN_IF_ERROR(WriteFile(core_ll, ll_content));
   }
 
-  // Step 4e: Optimize LLVM IR with Peano opt.
-  std::string peano_opt = GetPeanoOptPath();
-  std::string peano_llc = GetPeanoLlcPath();
+  // 3e: Peano opt → llc → clang link.
   std::string core_opt_ll = workdir + "/core_0_2.opt.ll";
-  std::string opt_cmd = absl::StrCat(
-      peano_opt,
-      " '--passes=default<O2>,strip'"
-      " -S ", core_ll, " -o ", core_opt_ll);
-  TF_RETURN_IF_ERROR(RunCommand(opt_cmd));
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+      peano_opt, " '--passes=default<O2>,strip' -S ",
+      core_ll, " -o ", core_opt_ll)));
 
-  // Step 4e: Compile to object file with Peano llc.
   std::string core_obj = workdir + "/core_0_2.o";
-  std::string llc_cmd = absl::StrCat(
-      peano_llc,
-      " ", core_opt_ll,
-      " -O2"
-      " --march=aie2p"
-      " --function-sections"
-      " --filetype=obj"
-      " -o ", core_obj);
-  TF_RETURN_IF_ERROR(RunCommand(llc_cmd));
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+      peano_llc, " ", core_opt_ll,
+      " -O2 --march=aie2p --function-sections --filetype=obj"
+      " -o ", core_obj)));
 
-  // Step 4f: Generate linker script for this core.
   std::string core_ldscript = workdir + "/core_0_2.ld.script";
-  std::string ldscript_cmd = absl::StrCat(
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       aie_translate,
-      " --aie-generate-ldscript"
-      " --tilecol=0 --tilerow=2"
-      " ", lowered_mlir, " -o ", core_ldscript);
-  TF_RETURN_IF_ERROR(RunCommand(ldscript_cmd));
+      " --aie-generate-ldscript --tilecol=0 --tilerow=2 ",
+      lowered_mlir, " -o ", core_ldscript)));
 
-  // Step 4g: Link to ELF with linker script.
   std::string core_elf = workdir + "/core_0_2.elf";
-  std::string link_cmd = absl::StrCat(
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       peano_clang,
-      " -O2 --target=aie2p-none-elf"
-      " -nostdlib"
-      " -Wl,--gc-sections"
-      " ", core_obj,
-      " -Wl,-T,", core_ldscript,
-      " -o ", core_elf);
-  TF_RETURN_IF_ERROR(RunCommand(link_cmd));
+      " -O2 --target=aie2p-none-elf -nostdlib"
+      " -Wl,--gc-sections -Wl,--entry=core_0_2 ",
+      core_obj, " -Wl,-T,", core_ldscript, " -o ", core_elf)));
 
-  // Step 5: Generate transaction binary.
-  // The transaction flow converts AIE device config (DMAs, locks, routes)
-  // + core ELFs into a single transaction binary. This replaces CDO.
-  std::string txn_mlir = workdir + "/txn.mlir";
-  std::string txn_pass = absl::StrCat(
-      "\"--pass-pipeline=builtin.module(aie.device(convert-aie-to-transaction"
-      "{elf-dir=", workdir, "}))\"");
-  std::string txn_cmd = absl::StrCat(
-      aie_opt, " ", txn_pass, " ", lowered_mlir, " -o ", txn_mlir);
-  TF_RETURN_IF_ERROR(RunCommand(txn_cmd));
-
-  // Serialize transaction to binary.
-  std::string txn_bin = workdir + "/txn.bin";
-  std::string txn_serialize_cmd = absl::StrCat(
+  // -----------------------------------------------------------------------
+  // Step 4: CDO generation.
+  // Generate Configuration Data Objects from the lowered MLIR + core ELFs.
+  // -----------------------------------------------------------------------
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       aie_translate,
-      " --aie-npu-instgen"
-      " --aie-output-binary"
-      " ", txn_mlir, " -o ", txn_bin);
-  TF_RETURN_IF_ERROR(RunCommand(txn_serialize_cmd));
+      " --aie-generate-cdo"
+      " --work-dir-path=", workdir,
+      " ", lowered_mlir)));
 
-  // Step 6: Package into final ELF with aiebu-asm.
-  std::string final_elf = workdir + "/final.elf";
-  std::string aiebu_asm = GetAiebuAsmPath();
+  // -----------------------------------------------------------------------
+  // Step 4b: Generate NPU instruction stream (DMA_TO_NPU pipeline).
+  // Matches aiecc.py's DMA_TO_NPU pipeline:
+  //   - materialize-bd-chains: materializes BD chain descriptors
+  //   - substitute-shim-dma-allocations: resolves ObjectFIFO → DMA channel
+  //   - assign-runtime-sequence-bd-ids: assigns BD IDs for runtime sequence
+  //   - dma-tasks-to-npu: converts DMA task ops to NPU operations
+  //   - dma-to-npu: final lowering to NPU write/sync operations
+  // Then aie-npu-instgen translates to a binary instruction stream.
+  // -----------------------------------------------------------------------
+  std::string npu_insts_mlir = workdir + "/npu_insts.mlir";
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+      aie_opt,
+      " --aie-materialize-bd-chains"
+      " --aie-substitute-shim-dma-allocations"
+      " --aie-assign-runtime-sequence-bd-ids"
+      " --aie-dma-tasks-to-npu"
+      " --aie-dma-to-npu"
+      " ", lowered_mlir, " -o ", npu_insts_mlir)));
 
-  if (std::filesystem::exists(aiebu_asm)) {
-    std::string aiebu_cmd = absl::StrCat(
-        aiebu_asm,
-        " -t aie2txn"
-        " -c ", txn_bin,
-        " -o ", final_elf);
-    TF_RETURN_IF_ERROR(RunCommand(aiebu_cmd));
-  } else {
-    LOG(WARNING) << "aiebu-asm not found at " << aiebu_asm
-                 << ". Returning core ELF without packaging.";
-    final_elf = core_elf;
+  std::string insts_txt = workdir + "/insts.txt";
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+      aie_translate,
+      " --aie-npu-instgen ",
+      npu_insts_mlir, " -o ", insts_txt)));
+
+  auto instr_words_or = ReadInstrFile(insts_txt);
+  if (!instr_words_or.ok()) {
+    return instr_words_or.status();
+  }
+  LOG(INFO) << "XDNA codegen: NPU instruction stream generated, "
+            << instr_words_or->size() << " words.";
+
+  // -----------------------------------------------------------------------
+  // Step 5: bootgen — package CDOs into a PDI.
+  // -----------------------------------------------------------------------
+  std::string design_bif = workdir + "/design.bif";
+  TF_RETURN_IF_ERROR(WriteFile(design_bif, GenerateDesignBif(workdir)));
+
+  std::string design_pdi = workdir + "/design.pdi";
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+      bootgen,
+      " -arch versal -image ", design_bif,
+      " -o ", design_pdi, " -w")));
+
+  // -----------------------------------------------------------------------
+  // Step 6: xclbinutil — assemble the xclbin.
+  // -----------------------------------------------------------------------
+  std::string kernel_name = "MLIR_AIE";
+  int total_args = 3 + num_data_args;  // opcode + instr + ninstr + data args
+
+  std::string mem_topology_json = workdir + "/mem_topology.json";
+  std::string kernels_json = workdir + "/kernels.json";
+  std::string aie_partition_json = workdir + "/aie_partition.json";
+
+  TF_RETURN_IF_ERROR(WriteFile(mem_topology_json, GenerateMemTopologyJson()));
+  TF_RETURN_IF_ERROR(
+      WriteFile(kernels_json, GenerateKernelsJson(kernel_name, num_data_args)));
+  TF_RETURN_IF_ERROR(WriteFile(
+      aie_partition_json,
+      GenerateAiePartitionJson("./design.pdi")));
+
+  std::string final_xclbin = workdir + "/final.xclbin";
+  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+      xclbinutil,
+      " --add-replace-section MEM_TOPOLOGY:JSON:", mem_topology_json,
+      " --add-kernel ", kernels_json,
+      " --add-replace-section AIE_PARTITION:JSON:", aie_partition_json,
+      " --force --quiet"
+      " --output ", final_xclbin)));
+
+  // -----------------------------------------------------------------------
+  // Read the final xclbin and clean up.
+  // -----------------------------------------------------------------------
+  auto xclbin_bytes_or = ReadBinaryFile(final_xclbin);
+  if (!xclbin_bytes_or.ok()) {
+    return xclbin_bytes_or.status();
   }
 
-  // Read the final ELF.
-  auto elf_result = ReadBinaryFile(final_elf);
-  if (!elf_result.ok()) return elf_result.status();
-  std::vector<uint8_t> elf_bytes = std::move(*elf_result);
-
-  // Cleanup temp directory (keep for debugging if XDNA_KEEP_TEMP is set).
   if (!std::getenv("XDNA_KEEP_TEMP")) {
     std::filesystem::remove_all(workdir);
   } else {
     LOG(INFO) << "XDNA codegen: keeping temp directory: " << workdir;
   }
 
-  return elf_bytes;
+  LOG(INFO) << "XDNA codegen: xclbin generated, "
+            << xclbin_bytes_or->size() << " bytes.";
+
+  return XdnaCodegenResult{
+      .xclbin_bytes = std::move(*xclbin_bytes_or),
+      .kernel_name = kernel_name,
+      .num_kernel_args = total_args,
+      .instr_words = std::move(*instr_words_or),
+  };
 }
 
 }  // namespace xla

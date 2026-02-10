@@ -33,20 +33,24 @@ limitations under the License.
 #include "xla/pjrt/pjrt_future.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_buffer.h"
 #include "xla/service/computation_placer.h"
+#include "xla/shape_util.h"
 
 namespace xla {
 
 XdnaExecutable::XdnaExecutable(
     PjRtClient* client, absl::Span<PjRtDevice* const> addressable_devices,
     xrt::elf elf, xrt::hw_context hw_context, xrt::kernel kernel,
-    absl::string_view name, XdnaKernelConvention convention)
+    absl::string_view name, XdnaKernelConvention convention,
+    int num_inputs, std::vector<Shape> output_shapes)
     : client_(client),
       device_assignment_(1, 1),
       name_(name),
       elf_(std::move(elf)),
       hw_context_(std::move(hw_context)),
       kernel_(std::move(kernel)),
-      convention_(convention) {
+      convention_(convention),
+      num_inputs_(num_inputs),
+      output_shapes_(std::move(output_shapes)) {
   addressable_devices_.assign(addressable_devices.begin(),
                               addressable_devices.end());
   addressable_device_logical_ids_.push_back(
@@ -55,7 +59,34 @@ XdnaExecutable::XdnaExecutable(
     device_assignment_(0, 0) =
         addressable_devices_.front()->global_device_id().value();
   }
-  LOG(INFO) << "XDNA: Loaded executable '" << name_ << "'";
+  LOG(INFO) << "XDNA: Loaded executable '" << name_ << "' (ELF)";
+}
+
+XdnaExecutable::XdnaExecutable(
+    PjRtClient* client, absl::Span<PjRtDevice* const> addressable_devices,
+    xrt::xclbin xclbin, xrt::hw_context hw_context, xrt::kernel kernel,
+    absl::string_view name, XdnaKernelConvention convention,
+    int num_inputs, std::vector<Shape> output_shapes,
+    std::vector<uint32_t> instr_words)
+    : client_(client),
+      device_assignment_(1, 1),
+      name_(name),
+      xclbin_(std::move(xclbin)),
+      hw_context_(std::move(hw_context)),
+      kernel_(std::move(kernel)),
+      convention_(convention),
+      num_inputs_(num_inputs),
+      output_shapes_(std::move(output_shapes)),
+      instr_words_(std::move(instr_words)) {
+  addressable_devices_.assign(addressable_devices.begin(),
+                              addressable_devices.end());
+  addressable_device_logical_ids_.push_back(
+      LogicalDeviceIds{/*replica=*/0, /*partition=*/0});
+  if (!addressable_devices_.empty()) {
+    device_assignment_(0, 0) =
+        addressable_devices_.front()->global_device_id().value();
+  }
+  LOG(INFO) << "XDNA: Loaded executable '" << name_ << "' (xclbin)";
 }
 
 PjRtClient* XdnaExecutable::client() const { return client_; }
@@ -115,12 +146,33 @@ XdnaExecutable::ExecuteSharded(
     return absl::InternalError("Executable has been deleted.");
   }
 
+  // For kDpu convention with output shapes: inputs are argument_handles,
+  // outputs are allocated fresh. For kDirect: all args are in-place.
+  bool has_outputs = (convention_ == XdnaKernelConvention::kDpu &&
+                      !output_shapes_.empty());
+
   try {
     xrt::run run(kernel_);
+    std::vector<xrt::bo> input_bos;
+    std::vector<xrt::bo> output_bos;
+    xrt::bo instr_bo;
 
-    // Allocate device-mapped BOs through the hw_context and copy data in.
-    std::vector<xrt::bo> device_bos;
-    device_bos.reserve(argument_handles.size());
+    // For kDpu: set up instruction BO first, then data BOs.
+    if (convention_ == XdnaKernelConvention::kDpu && !instr_words_.empty()) {
+      size_t instr_size = instr_words_.size() * sizeof(uint32_t);
+      int instr_grp = kernel_.group_id(1);
+      instr_bo = xrt::bo(hw_context_, instr_size,
+                         xrt::bo::flags::cacheable, instr_grp);
+      std::memcpy(instr_bo.map<void*>(), instr_words_.data(), instr_size);
+      instr_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+      run.set_arg(0, static_cast<uint64_t>(3));  // opcode: DPU dispatch
+      run.set_arg(1, instr_bo);
+      run.set_arg(2, static_cast<uint32_t>(instr_words_.size()));
+    }
+
+    // Bind input buffers.
+    input_bos.reserve(argument_handles.size());
     for (int i = 0; i < static_cast<int>(argument_handles.size()); ++i) {
       auto* xdna_buf = dynamic_cast<XdnaBuffer*>(argument_handles[i]);
       if (xdna_buf == nullptr) {
@@ -132,43 +184,78 @@ XdnaExecutable::ExecuteSharded(
             absl::StrCat("Argument ", i, " has been deleted."));
       }
 
-      // Allocate a device-mapped BO with proper IOMMU mapping.
       auto raw = xdna_buf->raw_data();
-      // For DPU convention, data args start at index 3 (after opcode, instr
-      // BO, instr count). For direct convention, args start at index 0.
       int kernel_arg_idx =
           (convention_ == XdnaKernelConvention::kDpu) ? i + 3 : i;
       int grp = kernel_.group_id(kernel_arg_idx);
-      xrt::bo dev_bo(hw_context_, raw.size(), xrt::bo::flags::normal, grp);
+      // xclbin-based kernels (kDpu) need host_only BOs; NPU accesses host
+      // DDR via DMA. ELF-based kernels (kDirect) use normal BOs.
+      auto bo_flags = (convention_ == XdnaKernelConvention::kDpu)
+                          ? xrt::bo::flags::host_only
+                          : xrt::bo::flags::normal;
+      xrt::bo dev_bo(hw_context_, raw.size(), bo_flags, grp);
 
-      // Copy host data into the mapped region (one memcpy, same physical
-      // memory — sync is just a cache flush).
       std::memcpy(dev_bo.map<void*>(), raw.data(), raw.size());
       dev_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
       run.set_arg(kernel_arg_idx, dev_bo);
-      device_bos.push_back(std::move(dev_bo));
+      input_bos.push_back(std::move(dev_bo));
     }
 
-    // Set DPU convention prefix args: opcode=3, instr_bo=0, instr_count=0.
-    if (convention_ == XdnaKernelConvention::kDpu) {
-      run.set_arg(0, static_cast<uint64_t>(3));  // opcode: DPU dispatch
-      run.set_arg(1, static_cast<uint64_t>(0));  // instruction BO (ELF flow)
-      run.set_arg(2, static_cast<uint64_t>(0));  // instruction count
+    // Allocate and bind output buffers.
+    if (has_outputs) {
+      int num_inputs = static_cast<int>(argument_handles.size());
+      output_bos.reserve(output_shapes_.size());
+      for (int i = 0; i < static_cast<int>(output_shapes_.size()); ++i) {
+        int64_t byte_size = ShapeUtil::ByteSizeOf(output_shapes_[i]);
+        int kernel_arg_idx = num_inputs + i + 3;  // after DPU prefix + inputs
+        int grp = kernel_.group_id(kernel_arg_idx);
+        xrt::bo dev_bo(hw_context_, byte_size, xrt::bo::flags::host_only, grp);
+
+        // Zero-initialize output buffer.
+        std::memset(dev_bo.map<void*>(), 0, byte_size);
+        dev_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        run.set_arg(kernel_arg_idx, dev_bo);
+        output_bos.push_back(std::move(dev_bo));
+      }
     }
 
     run.start();
     run.wait2();
 
-    // Copy results back: cache invalidate, then read from mapped pointer.
-    for (int i = 0; i < static_cast<int>(argument_handles.size()); ++i) {
-      auto* xdna_buf = dynamic_cast<XdnaBuffer*>(argument_handles[i]);
-      device_bos[i].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-      auto dst = xdna_buf->mutable_raw_data();
-      std::memcpy(dst.data(), device_bos[i].map<const void*>(), dst.size());
+    // Build output buffers from device results.
+    std::vector<std::unique_ptr<PjRtBuffer>> results;
+    if (has_outputs) {
+      for (int i = 0; i < static_cast<int>(output_shapes_.size()); ++i) {
+        output_bos[i].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        int64_t byte_size = ShapeUtil::ByteSizeOf(output_shapes_[i]);
+        std::vector<uint8_t> result_data(byte_size);
+        std::memcpy(result_data.data(), output_bos[i].map<const void*>(),
+                    byte_size);
+
+        PjRtMemorySpace* mem_space = device->default_memory_space().value();
+        results.push_back(std::make_unique<XdnaBuffer>(
+            client_, device, mem_space, output_shapes_[i],
+            std::move(result_data)));
+      }
+    } else {
+      // kDirect: copy results back to input buffers in-place.
+      for (int i = 0; i < static_cast<int>(argument_handles.size()); ++i) {
+        auto* xdna_buf = dynamic_cast<XdnaBuffer*>(argument_handles[i]);
+        input_bos[i].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        auto dst = xdna_buf->mutable_raw_data();
+        std::memcpy(dst.data(), input_bos[i].map<const void*>(), dst.size());
+      }
     }
 
     LOG(INFO) << "XDNA: Kernel '" << name_ << "' execution completed.";
+
+    if (fill_future) {
+      returned_future = Future<>(absl::OkStatus());
+    }
+
+    return results;
   } catch (const xrt::run::command_error& e) {
     return absl::InternalError(
         absl::StrCat("XDNA kernel execution failed: ", e.what()));
@@ -176,13 +263,6 @@ XdnaExecutable::ExecuteSharded(
     return absl::InternalError(
         absl::StrCat("XDNA kernel execution failed: ", e.what()));
   }
-
-  if (fill_future) {
-    returned_future = Future<>(absl::OkStatus());
-  }
-
-  // Buffers updated in-place via copy-back above.
-  return std::vector<std::unique_ptr<PjRtBuffer>>{};
 }
 
 absl::StatusOr<std::vector<std::unique_ptr<PjRtBuffer>>>

@@ -16,32 +16,30 @@ limitations under the License.
 #ifndef XLA_PJRT_PLUGIN_XDNA_XDNA_COMPILER_H_
 #define XLA_PJRT_PLUGIN_XDNA_XDNA_COMPILER_H_
 
-#include <cstdint>
 #include <memory>
-#include <vector>
 
 #include "absl/status/statusor.h"
 #include "xla/hlo/ir/hlo_module.h"
+#include "xla/pjrt/plugin/xdna/xdna_codegen.h"
 
 namespace xla {
 
-// Compiles an HloModule into an ELF binary for the XDNA NPU.
+// Compiles an HloModule into an xclbin for the XDNA NPU.
 //
 // Pipeline:
 //   HloModule
-//     → StableHLO dialect (via ConvertHloToMlirHlo with emit_stablehlo=true)
-//     → linalg-on-tensors (via StableHLO legalize-to-linalg pass)
-//     → AIE dialect MLIR text (via LowerLinalgToAie — template-based generation)
-//     → ELF binary (via GenerateElfFromAie — subprocess: aie-opt + Peano + aiebu)
+//     → StableHLO dialect (via ConvertHloToMlirHlo)
+//     → linalg-on-tensors (via stablehlo-legalize-to-linalg)
+//     → AIE dialect MLIR text (via LowerLinalgToAie)
+//     → xclbin (via GenerateXclbinFromAie: aie-opt + Peano + bootgen + xclbinutil)
 //
-// The AIE lowering and codegen use external tools (aie-opt, aie-translate,
-// Peano clang) via subprocess invocation to avoid LLVM ABI conflicts between
-// OpenXLA's LLVM (Jan 2026) and Peano/mlir-aie's LLVM (Jan 2025).
+// External tools are invoked via subprocess to avoid LLVM ABI conflicts
+// between OpenXLA's LLVM and Peano/mlir-aie's LLVM.
 class XdnaCompiler {
  public:
-  // Compiles an optimized HloModule to ELF bytes.
-  // The module should have already been through RunHloPasses().
-  static absl::StatusOr<std::vector<uint8_t>> Compile(
+  // Compiles an optimized HloModule to an xclbin.
+  // The module should have already been through RunXdnaHloPasses().
+  static absl::StatusOr<XdnaCodegenResult> Compile(
       std::unique_ptr<HloModule> hlo_module);
 };
 

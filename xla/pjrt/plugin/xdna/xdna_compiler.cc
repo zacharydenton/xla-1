@@ -32,6 +32,7 @@ limitations under the License.
 #include "stablehlo/conversions/linalg/transforms/Passes.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/translate/hlo_to_mhlo/hlo_to_mlir_hlo.h"
+#include "xla/shape.h"
 #include "xla/pjrt/mlir_to_hlo.h"
 #include "xla/pjrt/plugin/xdna/xdna_aie_lowering.h"
 #include "xla/pjrt/plugin/xdna/xdna_codegen.h"
@@ -39,7 +40,7 @@ limitations under the License.
 
 namespace xla {
 
-absl::StatusOr<std::vector<uint8_t>> XdnaCompiler::Compile(
+absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
     std::unique_ptr<HloModule> hlo_module) {
   LOG(INFO) << "XDNA compiler: compiling HLO module '"
             << hlo_module->name() << "'";
@@ -82,14 +83,22 @@ absl::StatusOr<std::vector<uint8_t>> XdnaCompiler::Compile(
 
   LOG(INFO) << "XDNA compiler: linalg → AIE lowering succeeded.";
 
-  // Step 4: AIE → ELF codegen (subprocess: aie-opt + Peano + aiebu).
-  TF_ASSIGN_OR_RETURN(std::vector<uint8_t> elf_bytes,
-                      GenerateElfFromAie(aie_mlir));
+  // Compute number of data buffer args: inputs + outputs.
+  int num_inputs = hlo_module->entry_computation()->num_parameters();
+  const Shape& result_shape = hlo_module->result_shape();
+  int num_outputs = result_shape.IsTuple()
+                        ? result_shape.tuple_shapes_size()
+                        : 1;
+  int num_data_args = num_inputs + num_outputs;
 
-  LOG(INFO) << "XDNA compiler: AIE → ELF codegen succeeded. ELF size: "
-            << elf_bytes.size() << " bytes.";
+  // Step 4: AIE → xclbin codegen (aie-opt + Peano + bootgen + xclbinutil).
+  TF_ASSIGN_OR_RETURN(XdnaCodegenResult result,
+                      GenerateXclbinFromAie(aie_mlir, num_data_args));
 
-  return elf_bytes;
+  LOG(INFO) << "XDNA compiler: xclbin generated, "
+            << result.xclbin_bytes.size() << " bytes.";
+
+  return result;
 }
 
 }  // namespace xla

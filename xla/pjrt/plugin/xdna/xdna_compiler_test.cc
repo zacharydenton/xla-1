@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include "absl/status/statusor.h"
@@ -27,6 +29,7 @@ limitations under the License.
 #include "xla/pjrt/plugin/xdna/xdna_hlo_passes.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_client.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "xla/pjrt/pjrt_future.h"
 #include "xla/shape_util.h"
 
 namespace xla {
@@ -87,7 +90,7 @@ TEST(XdnaHloPassesTest, RunsOnElementWiseOps) {
   EXPECT_TRUE((*result)->has_entry_computation());
 }
 
-// Test that the full compiler pipeline produces ELF bytes.
+// Test that the full compiler pipeline produces an xclbin.
 TEST(XdnaCompilerTest, CompilePipelineRuns) {
   XlaComputation computation = BuildAddComputation();
   std::unique_ptr<HloModule> module = CreateHloModule(computation);
@@ -100,14 +103,19 @@ TEST(XdnaCompilerTest, CompilePipelineRuns) {
         << "Unexpected error: " << result.status();
     GTEST_SKIP() << "Toolchain not available: " << result.status().message();
   }
-  // Pipeline succeeded — verify we got non-empty ELF bytes.
-  EXPECT_GT(result->size(), 0);
-  // Check ELF magic: 0x7f 'E' 'L' 'F'
-  ASSERT_GE(result->size(), 4u);
-  EXPECT_EQ((*result)[0], 0x7f);
-  EXPECT_EQ((*result)[1], 'E');
-  EXPECT_EQ((*result)[2], 'L');
-  EXPECT_EQ((*result)[3], 'F');
+  // Pipeline succeeded — verify we got non-empty xclbin bytes.
+  EXPECT_GT(result->xclbin_bytes.size(), 0);
+  // Check xclbin magic: "xclbin2" at offset 0.
+  ASSERT_GE(result->xclbin_bytes.size(), 7u);
+  EXPECT_EQ(result->xclbin_bytes[0], 'x');
+  EXPECT_EQ(result->xclbin_bytes[1], 'c');
+  EXPECT_EQ(result->xclbin_bytes[2], 'l');
+  EXPECT_EQ(result->xclbin_bytes[3], 'b');
+  EXPECT_EQ(result->xclbin_bytes[4], 'i');
+  EXPECT_EQ(result->xclbin_bytes[5], 'n');
+  EXPECT_EQ(result->xclbin_bytes[6], '2');
+  // Kernel name should be set.
+  EXPECT_FALSE(result->kernel_name.empty());
 }
 
 TEST(XdnaCompilerTest, CompileAfterHloPasses) {
@@ -124,7 +132,7 @@ TEST(XdnaCompilerTest, CompileAfterHloPasses) {
         << "Unexpected error: " << result.status();
     GTEST_SKIP() << "Toolchain not available: " << result.status().message();
   }
-  EXPECT_GT(result->size(), 0);
+  EXPECT_GT(result->xclbin_bytes.size(), 0);
 }
 
 // Integration test: CompileAndLoad on the full client.
@@ -144,12 +152,59 @@ class XdnaCompileAndLoadTest : public ::testing::Test {
 TEST_F(XdnaCompileAndLoadTest, CompilePipelineRuns) {
   XlaComputation computation = BuildAddComputation();
   auto result = client_->CompileAndLoad(computation, CompileOptions());
-  // Same as above: should reach codegen, may fail if tools are missing.
+  // Should reach codegen, may fail if tools are missing.
   if (!result.ok()) {
     EXPECT_TRUE(result.status().code() == absl::StatusCode::kNotFound ||
                 result.status().code() == absl::StatusCode::kInternal)
         << "Unexpected error: " << result.status();
   }
+}
+
+TEST_F(XdnaCompileAndLoadTest, CompileAndExecuteAdd) {
+  XlaComputation computation = BuildAddComputation();
+  auto exe_or = client_->CompileAndLoad(computation, CompileOptions());
+  if (!exe_or.ok()) {
+    GTEST_SKIP() << "Compile failed: " << exe_or.status().message();
+  }
+  auto& exe = *exe_or;
+
+  // Create input buffers: x = [1, 2, 3, 4], y = [10, 20, 30, 40]
+  std::vector<float> x_data = {1.0f, 2.0f, 3.0f, 4.0f};
+  std::vector<float> y_data = {10.0f, 20.0f, 30.0f, 40.0f};
+
+  PjRtDevice* device = client_->addressable_devices()[0];
+  auto mem_space = device->default_memory_space().value();
+
+  auto buf_x = client_->BufferFromHostBuffer(
+      x_data.data(), F32, {4}, /*byte_strides=*/std::nullopt,
+      PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
+      /*on_done_with_host_buffer=*/nullptr, mem_space,
+      /*device_layout=*/nullptr);
+  ASSERT_TRUE(buf_x.ok()) << buf_x.status();
+  auto buf_y = client_->BufferFromHostBuffer(
+      y_data.data(), F32, {4}, /*byte_strides=*/std::nullopt,
+      PjRtClient::HostBufferSemantics::kImmutableOnlyDuringCall,
+      /*on_done_with_host_buffer=*/nullptr, mem_space,
+      /*device_layout=*/nullptr);
+  ASSERT_TRUE(buf_y.ok()) << buf_y.status();
+
+  // Execute.
+  std::vector<PjRtBuffer*> args = {buf_x->get(), buf_y->get()};
+  std::optional<Future<>> returned_future;
+  auto result = exe->ExecuteSharded(args, device, ExecuteOptions(),
+                                    returned_future, /*fill_future=*/false);
+  ASSERT_TRUE(result.ok()) << result.status();
+
+  // Should return one output buffer.
+  ASSERT_EQ(result->size(), 1);
+
+  // Read back the result.
+  auto literal_result = (*result)[0]->ToLiteralSync();
+  ASSERT_TRUE(literal_result.ok()) << literal_result.status();
+
+  // Expected: [11, 22, 33, 44]
+  auto expected = LiteralUtil::CreateR1<float>({11.0f, 22.0f, 33.0f, 44.0f});
+  EXPECT_EQ(**literal_result, expected);
 }
 
 }  // namespace

@@ -24,22 +24,32 @@ limitations under the License.
 
 namespace xla {
 
-// Generates an ELF binary from AIE dialect MLIR text.
+// Result of AIE codegen: xclbin + NPU instructions + kernel metadata.
+struct XdnaCodegenResult {
+  std::vector<uint8_t> xclbin_bytes;
+  std::string kernel_name;
+  int num_kernel_args;  // Total args including opcode/instr/ninstr prefix.
+  // NPU instruction stream (uint32 words). Loaded as a cacheable BO and
+  // passed as kernel arg 1 at execution time.
+  std::vector<uint32_t> instr_words;
+};
+
+// Generates an xclbin from AIE dialect MLIR text.
 //
-// Uses external tools via subprocess invocation:
-// 1. aie-opt: Run AIE optimization/lowering passes
-// 2. aie-translate: Generate CDO and NPU instruction binaries
-// 3. Peano (clang): Compile per-core code to AIE object files
-// 4. aiebu-asm: Package everything into a self-contained ELF
+// Full pipeline via external tools:
+// 1. aie-opt: Lower ObjectFIFOs, route flows, assign resources
+// 2. Peano (opt/llc/clang): Compile per-core code to AIE ELFs
+// 3. aie-translate --aie-generate-cdo: Generate CDO binaries
+// 4. bootgen: Package CDOs into a PDI (Programmable Device Image)
+// 5. xclbinutil: Assemble xclbin with PDI + kernel metadata
 //
-// Tool paths (searched in order):
-// - /opt/mlir-aie/bin/aie-opt, /opt/mlir-aie/bin/aie-translate
-// - /opt/peano/bin/clang
-// - /opt/xilinx/xrt/bin/aiebu-asm
+// Tool paths default to /opt/{mlir-aie,peano,xilinx/xrt}/bin/;
+// override via XDNA_AIE_OPT, XDNA_PEANO_CLANG, etc.
 //
-// Returns raw ELF bytes suitable for LoadSerializedExecutable().
-absl::StatusOr<std::vector<uint8_t>> GenerateElfFromAie(
-    const std::string& aie_mlir);
+// `num_data_args` is the number of data buffer arguments (inputs + outputs)
+// in the kernel. Used to generate kernel metadata in the xclbin.
+absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
+    const std::string& aie_mlir, int num_data_args);
 
 }  // namespace xla
 
