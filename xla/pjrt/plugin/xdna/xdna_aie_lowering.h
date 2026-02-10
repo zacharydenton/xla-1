@@ -20,6 +20,7 @@ limitations under the License.
 
 #include "absl/status/statusor.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "xla/pjrt/plugin/xdna/xdna_target_caps.h"
 
 namespace xla {
 
@@ -51,7 +52,8 @@ struct AieLoweringConfig {
 //
 // Returns AIE dialect MLIR text string.
 absl::StatusOr<std::string> LowerLinalgToAie(
-    mlir::ModuleOp linalg_module, const AieLoweringConfig& config);
+    mlir::ModuleOp linalg_module, const AieLoweringConfig& config,
+    const TargetCaps& caps);
 
 }  // namespace xla
 

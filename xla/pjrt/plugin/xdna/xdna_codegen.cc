@@ -246,8 +246,8 @@ std::string GenerateKernelsJson(const std::string& kernel_name,
 })", kernel_name, args, kernel_name);
 }
 
-std::string GenerateAiePartitionJson(const std::string& pdi_path) {
-  // npu2 uses 8 columns starting at column 0.
+std::string GenerateAiePartitionJson(const std::string& pdi_path,
+                                     const TargetCaps& caps) {
   return absl::StrFormat(R"({
   "aie_partition": {
     "name": "QoS",
@@ -255,8 +255,8 @@ std::string GenerateAiePartitionJson(const std::string& pdi_path) {
     "inference_fingerprint": "23423",
     "pre_post_fingerprint": "12345",
     "partition": {
-      "column_width": 8,
-      "start_columns": [0]
+      "column_width": %d,
+      "start_columns": [%d]
     },
     "PDIs": [
       {
@@ -274,7 +274,7 @@ std::string GenerateAiePartitionJson(const std::string& pdi_path) {
       }
     ]
   }
-})", pdi_path);
+})", caps.partition_column_width, caps.partition_start_column, pdi_path);
 }
 
 std::string GenerateDesignBif(const std::string& workdir) {
@@ -344,7 +344,7 @@ absl::Status CheckTools(const std::string& aie_opt,
 }  // namespace
 
 absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
-    const std::string& aie_mlir, int num_data_args) {
+    const std::string& aie_mlir, int num_data_args, const TargetCaps& caps) {
   // Create a temporary working directory.
   auto tmpdir = std::filesystem::temp_directory_path() / "xdna_codegen_XXXXXX";
   std::string tmpdir_str = tmpdir.string();
@@ -438,7 +438,8 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       aie_translate, " --mlir-to-llvmir ", core_opt_mlir, " -o ", core_ll),
       "Step 4/13: LLVM IR translation"));
 
-  // 3d: Fix intrinsic names (llvm.aie2.* → llvm.aie2p.* for aie2p target).
+  // 3d: Fix intrinsic names (llvm.aie2.* → llvm.<isa_target>.* for target).
+  // mlir-aie generates llvm.aie2.* intrinsics; Peano expects llvm.<target>.*.
   {
     std::ifstream ll_in(core_ll);
     if (!ll_in.is_open()) {
@@ -450,7 +451,7 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     ll_in.close();
 
     std::string from = "llvm.aie2.";
-    std::string to = "llvm.aie2p.";
+    std::string to = absl::StrCat("llvm.", caps.isa_target, ".");
     size_t pos = 0;
     while ((pos = ll_content.find(from, pos)) != std::string::npos) {
       ll_content.replace(pos, from.size(), to);
@@ -477,7 +478,8 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
   std::string core_obj = workdir + "/core_0_2.o";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       peano_llc, " ", core_opt_ll,
-      " -O2 --march=aie2p --function-sections --filetype=obj"
+      " -O2 --march=", caps.isa_target,
+      " --function-sections --filetype=obj"
       " -o ", core_obj),
       "Step 6/13: Peano codegen"));
 
@@ -491,7 +493,7 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
   std::string core_elf = workdir + "/core_0_2.elf";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       peano_clang,
-      " -O2 --target=aie2p-none-elf -nostdlib"
+      " -O2 --target=", caps.isa_target, "-none-elf -nostdlib"
       " -Wl,--gc-sections -Wl,--entry=core_0_2 ",
       core_obj, " -Wl,-T,", core_ldscript, " -o ", core_elf),
       "Step 8/13: Peano linking"));
@@ -570,7 +572,7 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       WriteFile(kernels_json, GenerateKernelsJson(kernel_name, num_data_args)));
   TF_RETURN_IF_ERROR(WriteFile(
       aie_partition_json,
-      GenerateAiePartitionJson(design_pdi)));
+      GenerateAiePartitionJson(design_pdi, caps)));
 
   std::string final_xclbin = workdir + "/final.xclbin";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(

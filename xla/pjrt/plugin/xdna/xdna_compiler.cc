@@ -36,6 +36,7 @@ limitations under the License.
 #include "xla/pjrt/mlir_to_hlo.h"
 #include "xla/pjrt/plugin/xdna/xdna_aie_lowering.h"
 #include "xla/pjrt/plugin/xdna/xdna_codegen.h"
+#include "xla/pjrt/plugin/xdna/xdna_target_caps.h"
 #include "xla/tsl/platform/errors.h"
 
 namespace xla {
@@ -77,9 +78,14 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
   LOG(INFO) << "XDNA compiler: linalg IR:\n" << linalg_ir;
 
   // Step 3: linalg → AIE dialect MLIR (template-based generation).
+  TargetCaps caps = StrixPointTargetCaps();
   AieLoweringConfig config;
+  LOG(INFO) << "XDNA compiler: target=" << caps.device_name
+            << " isa=" << caps.isa_target
+            << " l1_usable=" << caps.l1_usable_bytes << "B"
+            << " columns=" << caps.num_columns;
   TF_ASSIGN_OR_RETURN(std::string aie_mlir,
-                      LowerLinalgToAie(*mlir_module, config));
+                      LowerLinalgToAie(*mlir_module, config, caps));
 
   LOG(INFO) << "XDNA compiler: linalg → AIE lowering succeeded.";
 
@@ -93,7 +99,7 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
 
   // Step 4: AIE → xclbin codegen (aie-opt + Peano + bootgen + xclbinutil).
   TF_ASSIGN_OR_RETURN(XdnaCodegenResult result,
-                      GenerateXclbinFromAie(aie_mlir, num_data_args));
+                      GenerateXclbinFromAie(aie_mlir, num_data_args, caps));
 
   LOG(INFO) << "XDNA compiler: xclbin generated, "
             << result.xclbin_bytes.size() << " bytes.";

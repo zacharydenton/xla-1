@@ -63,10 +63,16 @@ cc_library(
 )
 
 cc_library(
+    name = "xdna_target_caps",
+    hdrs = ["xdna_target_caps.h"],
+)
+
+cc_library(
     name = "xdna_aie_lowering",
     srcs = ["xdna_aie_lowering.cc"],
     hdrs = ["xdna_aie_lowering.h"],
     deps = [
+        ":xdna_target_caps",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -85,6 +91,7 @@ cc_library(
     srcs = ["xdna_codegen.cc"],
     hdrs = ["xdna_codegen.h"],
     deps = [
+        ":xdna_target_caps",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -122,6 +129,7 @@ cc_library(
     deps = [
         ":xdna_aie_lowering",
         ":xdna_codegen",
+        ":xdna_target_caps",
         "//xla:shape_util",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/translate/hlo_to_mhlo:hlo_to_mlir_hlo",
