@@ -45,6 +45,7 @@ cc_library(
     deps = [
         ":xdna_pjrt_buffer",
         "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
         "//xla/pjrt:pjrt_client",
         "//xla/pjrt:pjrt_executable",
         "//xla/pjrt:pjrt_future",

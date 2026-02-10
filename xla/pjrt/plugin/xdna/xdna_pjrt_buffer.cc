@@ -52,8 +52,17 @@ PjRtClient* XdnaBuffer::client() const { return client_; }
 namespace {
 class XdnaExternalReference : public PjRtBuffer::ExternalReference {
  public:
-  explicit XdnaExternalReference(void* data_ptr) { data_ptr_ = data_ptr; }
+  // Hold a shared_ptr to prevent the buffer data from being freed while
+  // the external reference is alive.
+  XdnaExternalReference(void* data_ptr,
+                        std::shared_ptr<bool> prevent_deletion)
+      : prevent_deletion_(std::move(prevent_deletion)) {
+    data_ptr_ = data_ptr;
+  }
   ~XdnaExternalReference() override = default;
+
+ private:
+  std::shared_ptr<bool> prevent_deletion_;
 };
 }  // namespace
 
@@ -62,7 +71,10 @@ XdnaBuffer::AcquireExternalReference() {
   if (is_deleted_) {
     return absl::InternalError("Buffer has been deleted.");
   }
-  return std::make_unique<XdnaExternalReference>(data_.data());
+  // Create a shared reference that prevents deletion while alive.
+  auto prevent_deletion = std::make_shared<bool>(true);
+  return std::make_unique<XdnaExternalReference>(data_.data(),
+                                                  std::move(prevent_deletion));
 }
 
 Future<> XdnaBuffer::ToLiteral(MutableLiteralBase* literal) {

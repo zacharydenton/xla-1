@@ -85,7 +85,8 @@ XdnaExecutable::XdnaExecutable(
     xrt::xclbin xclbin, xrt::hw_context hw_context, xrt::kernel kernel,
     absl::string_view name, XdnaKernelConvention convention,
     int num_inputs, std::vector<Shape> output_shapes,
-    std::vector<uint32_t> instr_words)
+    std::vector<uint32_t> instr_words,
+    std::shared_ptr<HloModule> hlo_module)
     : client_(client),
       device_assignment_(1, 1),
       name_(name),
@@ -95,7 +96,8 @@ XdnaExecutable::XdnaExecutable(
       convention_(convention),
       num_inputs_(num_inputs),
       output_shapes_(std::move(output_shapes)),
-      instr_words_(std::move(instr_words)) {
+      instr_words_(std::move(instr_words)),
+      hlo_module_(std::move(hlo_module)) {
   addressable_devices_.assign(addressable_devices.begin(),
                               addressable_devices.end());
   addressable_device_logical_ids_.push_back(
@@ -109,6 +111,10 @@ XdnaExecutable::XdnaExecutable(
 }
 
 PjRtClient* XdnaExecutable::client() const { return client_; }
+
+int XdnaExecutable::num_replicas() const { return 1; }
+
+int XdnaExecutable::num_partitions() const { return 1; }
 
 const DeviceAssignment& XdnaExecutable::device_assignment() const {
   XDNA_TRACE("XDNA: device_assignment() called");
@@ -283,12 +289,19 @@ XdnaExecutable::ExecuteSharded(
             std::move(result_data)));
       }
     } else {
-      // kDirect: copy results back to input buffers in-place.
+      // kDirect: sync results back from device and return as output buffers.
+      PjRtMemorySpace* mem_space = device->default_memory_space().value();
       for (int i = 0; i < static_cast<int>(argument_handles.size()); ++i) {
         auto* xdna_buf = dynamic_cast<XdnaBuffer*>(argument_handles[i]);
         input_bos[i].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        auto dst = xdna_buf->mutable_raw_data();
-        std::memcpy(dst.data(), input_bos[i].map<const void*>(), dst.size());
+        int64_t byte_size =
+            ShapeUtil::ByteSizeOf(xdna_buf->on_device_shape());
+        std::vector<uint8_t> result_data(byte_size);
+        std::memcpy(result_data.data(), input_bos[i].map<const void*>(),
+                    byte_size);
+        results.push_back(std::make_unique<XdnaBuffer>(
+            client_, device, mem_space, xdna_buf->on_device_shape(),
+            std::move(result_data)));
       }
     }
 
@@ -349,8 +362,12 @@ XdnaExecutable::GetCompileOptions() const {
 absl::StatusOr<std::vector<std::shared_ptr<HloModule>>>
 XdnaExecutable::GetHloModules() const {
   XDNA_TRACE("XDNA: GetHloModules() called");
-  return absl::UnimplementedError(
-      "XdnaExecutable::GetHloModules is not implemented.");
+  if (hlo_module_ == nullptr) {
+    return absl::UnimplementedError(
+        "XdnaExecutable::GetHloModules: no HLO module available "
+        "(ELF/legacy path).");
+  }
+  return std::vector<std::shared_ptr<HloModule>>{hlo_module_};
 }
 
 absl::StatusOr<std::vector<Shape>> XdnaExecutable::GetOutputShapes() const {
@@ -399,6 +416,23 @@ XdnaExecutable::GetCompiledMemoryStats() const {
   XDNA_TRACE("XDNA: GetCompiledMemoryStats() called");
   return absl::UnimplementedError(
       "XdnaExecutable::GetCompiledMemoryStats is not implemented.");
+}
+
+std::optional<std::vector<OpSharding>>
+XdnaExecutable::GetOutputShardings() const {
+  XDNA_TRACE("XDNA: GetOutputShardings() called");
+  return std::nullopt;
+}
+
+std::optional<std::vector<OpSharding>>
+XdnaExecutable::GetParameterShardings() const {
+  XDNA_TRACE("XDNA: GetParameterShardings() called");
+  return std::nullopt;
+}
+
+int64_t XdnaExecutable::SizeOfGeneratedCodeInBytes() const {
+  XDNA_TRACE("XDNA: SizeOfGeneratedCodeInBytes() called");
+  return 0;
 }
 
 }  // namespace xla

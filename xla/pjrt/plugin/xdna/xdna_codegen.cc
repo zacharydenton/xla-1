@@ -161,6 +161,9 @@ std::string GenerateKernelsJson(const std::string& kernel_name,
           {"name": "instr", "memory-connection": "SRAM", "address-qualifier": "GLOBAL", "type": "char *", "offset": "0x08"},
           {"name": "ninstr", "address-qualifier": "SCALAR", "type": "uint32_t", "offset": "0x10"})";
 
+  // Data BO offsets start immediately after ninstr (uint32_t at 0x10).
+  // XRT kernel arg binding uses these offsets; the NPU hardware handles
+  // unaligned pointer args via its own DMA mechanism.
   int offset = 0x14;
   for (int i = 0; i < num_data_args; ++i) {
     absl::StrAppend(&args, absl::StrFormat(
@@ -495,7 +498,7 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       WriteFile(kernels_json, GenerateKernelsJson(kernel_name, num_data_args)));
   TF_RETURN_IF_ERROR(WriteFile(
       aie_partition_json,
-      GenerateAiePartitionJson("./design.pdi")));
+      GenerateAiePartitionJson(design_pdi)));
 
   std::string final_xclbin = workdir + "/final.xclbin";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(

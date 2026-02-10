@@ -283,6 +283,9 @@ XdnaPjrtClient::CompileInternal(
   int num_inputs = hlo_module->entry_computation()
                        ->num_parameters();
 
+  // Keep a copy of the HLO module for GetHloModules() queries.
+  auto hlo_module_copy = hlo_module->Clone();
+
   // Compile HLO to xclbin.
   TF_ASSIGN_OR_RETURN(XdnaCodegenResult codegen_result,
                       XdnaCompiler::Compile(std::move(hlo_module)));
@@ -312,7 +315,8 @@ XdnaPjrtClient::CompileInternal(
         this, addressable_devices_, std::move(xclbin), std::move(hw_ctx),
         std::move(kernel), codegen_result.kernel_name,
         XdnaKernelConvention::kDpu, num_inputs, std::move(output_shapes),
-        std::move(codegen_result.instr_words));
+        std::move(codegen_result.instr_words),
+        std::move(hlo_module_copy));
   } catch (const std::exception& e) {
     return absl::InternalError(
         absl::StrCat("Failed to load compiled xclbin: ", e.what()));

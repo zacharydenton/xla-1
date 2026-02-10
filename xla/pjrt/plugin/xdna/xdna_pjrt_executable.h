@@ -25,6 +25,7 @@ limitations under the License.
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "xla/hlo/ir/hlo_module.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/pjrt_future.h"
@@ -77,11 +78,14 @@ class XdnaExecutable : public PjRtLoadedExecutable {
                  XdnaKernelConvention convention,
                  int num_inputs,
                  std::vector<Shape> output_shapes,
-                 std::vector<uint32_t> instr_words);
+                 std::vector<uint32_t> instr_words,
+                 std::shared_ptr<HloModule> hlo_module = nullptr);
 
   ~XdnaExecutable() override = default;
 
   PjRtClient* client() const override;
+  int num_replicas() const override;
+  int num_partitions() const override;
   const DeviceAssignment& device_assignment() const override;
 
   absl::Span<const LogicalDeviceIds> addressable_device_logical_ids()
@@ -129,6 +133,13 @@ class XdnaExecutable : public PjRtLoadedExecutable {
   GetOutputLayouts() const override;
   absl::StatusOr<CompiledMemoryStats> GetCompiledMemoryStats() const override;
 
+  // Override to avoid default impl calling GetHloModules().
+  std::optional<std::vector<OpSharding>> GetOutputShardings() const override;
+  std::optional<std::vector<OpSharding>> GetParameterShardings() const override;
+
+  // Override to avoid forwarder infinite recursion.
+  int64_t SizeOfGeneratedCodeInBytes() const override;
+
  private:
   PjRtClient* client_;
   DeviceAssignment device_assignment_;
@@ -152,6 +163,9 @@ class XdnaExecutable : public PjRtLoadedExecutable {
   // NPU instruction stream for xclbin-based executables.
   // Loaded as a cacheable BO and passed as kernel arg 1.
   std::vector<uint32_t> instr_words_;
+
+  // The HLO module from compilation, used to satisfy GetHloModules() queries.
+  std::shared_ptr<HloModule> hlo_module_;
 };
 
 }  // namespace xla

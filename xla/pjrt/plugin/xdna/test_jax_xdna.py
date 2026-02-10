@@ -28,6 +28,9 @@ faulthandler.enable()
 # Dump all thread stacks after 45 seconds if we're still alive (hang detection).
 faulthandler.dump_traceback_later(45, exit=True)
 
+# Register SIGUSR1 to dump all threads on demand: kill -USR1 <pid>
+faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
+
 
 def _alarm_handler(signum, frame):
     """On SIGALRM, dump all thread stacks and abort to get a core dump."""
