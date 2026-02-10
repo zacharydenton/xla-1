@@ -31,11 +31,15 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "xla/hlo/ir/hlo_module.h"
 #include "xla/pjrt/pjrt_client.h"
+#include "xla/pjrt/pjrt_executable.h"
 #include "xla/pjrt/pjrt_future.h"
+#include "xla/pjrt/pjrt_layout.h"
 #include "xla/pjrt/plugin/xdna/xdna_pjrt_buffer.h"
 #include "xla/service/computation_placer.h"
 #include "xla/shape_util.h"
+#include "xla/util.h"
 
 // Debug trace that bypasses libc buffering (hermetic toolchain may have
 // different stderr buffering behavior in dlopen'd libraries).
@@ -289,7 +293,10 @@ XdnaExecutable::ExecuteSharded(
             std::move(result_data)));
       }
     } else {
-      // kDirect: sync results back from device and return as output buffers.
+      // kDirect (Phase 1 / legacy ELF): in-place kernels where each input
+      // buffer is also an output. Returns one output per input with the
+      // same shape. Only used by LoadSerializedExecutable; compiled
+      // (xclbin) kernels always use kDpu.
       PjRtMemorySpace* mem_space = device->default_memory_space().value();
       for (int i = 0; i < static_cast<int>(argument_handles.size()); ++i) {
         auto* xdna_buf = dynamic_cast<XdnaBuffer*>(argument_handles[i]);
@@ -372,43 +379,133 @@ XdnaExecutable::GetHloModules() const {
 
 absl::StatusOr<std::vector<Shape>> XdnaExecutable::GetOutputShapes() const {
   XDNA_TRACE("XDNA: GetOutputShapes() called");
+  if (!output_shapes_.empty()) {
+    // Single-device: one entry. Wrap multiple outputs in a tuple.
+    if (output_shapes_.size() == 1) {
+      return std::vector<Shape>{output_shapes_[0]};
+    }
+    return std::vector<Shape>{ShapeUtil::MakeTupleShape(output_shapes_)};
+  }
+  if (hlo_module_ != nullptr) {
+    return std::vector<Shape>{hlo_module_->result_shape()};
+  }
   return absl::UnimplementedError(
-      "XdnaExecutable::GetOutputShapes is not implemented.");
+      "XdnaExecutable::GetOutputShapes: no output info available.");
 }
 
 absl::StatusOr<std::vector<std::vector<PrimitiveType>>>
 XdnaExecutable::GetOutputElementTypes() const {
   XDNA_TRACE("XDNA: GetOutputElementTypes() called");
+  if (!output_shapes_.empty()) {
+    std::vector<PrimitiveType> types;
+    types.reserve(output_shapes_.size());
+    for (const auto& shape : output_shapes_) {
+      types.push_back(shape.element_type());
+    }
+    return std::vector<std::vector<PrimitiveType>>{std::move(types)};
+  }
+  if (hlo_module_ != nullptr) {
+    const Shape& result = hlo_module_->result_shape();
+    std::vector<PrimitiveType> types;
+    if (result.IsTuple()) {
+      for (const auto& sub : result.tuple_shapes()) {
+        types.push_back(sub.element_type());
+      }
+    } else {
+      types.push_back(result.element_type());
+    }
+    return std::vector<std::vector<PrimitiveType>>{std::move(types)};
+  }
   return absl::UnimplementedError(
-      "XdnaExecutable::GetOutputElementTypes is not implemented.");
+      "XdnaExecutable::GetOutputElementTypes: no output info available.");
 }
 
 absl::StatusOr<std::vector<std::vector<DimensionVector>>>
 XdnaExecutable::GetOutputDimensions() const {
   XDNA_TRACE("XDNA: GetOutputDimensions() called");
+  if (!output_shapes_.empty()) {
+    std::vector<DimensionVector> dims;
+    dims.reserve(output_shapes_.size());
+    for (const auto& shape : output_shapes_) {
+      dims.push_back(ShapeUtil::CreateDimensionVectorFromShape(shape));
+    }
+    return std::vector<std::vector<DimensionVector>>{std::move(dims)};
+  }
+  if (hlo_module_ != nullptr) {
+    const Shape& result = hlo_module_->result_shape();
+    std::vector<DimensionVector> dims;
+    if (result.IsTuple()) {
+      for (const auto& sub : result.tuple_shapes()) {
+        dims.push_back(ShapeUtil::CreateDimensionVectorFromShape(sub));
+      }
+    } else {
+      dims.push_back(ShapeUtil::CreateDimensionVectorFromShape(result));
+    }
+    return std::vector<std::vector<DimensionVector>>{std::move(dims)};
+  }
   return absl::UnimplementedError(
-      "XdnaExecutable::GetOutputDimensions is not implemented.");
+      "XdnaExecutable::GetOutputDimensions: no output info available.");
 }
 
 absl::StatusOr<std::vector<std::vector<absl::string_view>>>
 XdnaExecutable::GetOutputMemoryKinds() const {
   XDNA_TRACE("XDNA: GetOutputMemoryKinds() called");
-  return absl::UnimplementedError(
-      "XdnaExecutable::GetOutputMemoryKinds is not implemented.");
+  size_t num_outputs = output_shapes_.size();
+  if (num_outputs == 0 && hlo_module_ != nullptr) {
+    const Shape& result = hlo_module_->result_shape();
+    num_outputs = result.IsTuple() ? result.tuple_shapes_size() : 1;
+  }
+  if (num_outputs == 0) {
+    return absl::UnimplementedError(
+        "XdnaExecutable::GetOutputMemoryKinds: no output info available.");
+  }
+  // All outputs reside in "device" memory (matches XdnaMemorySpace::kind()).
+  return std::vector<std::vector<absl::string_view>>{
+      std::vector<absl::string_view>(num_outputs, "device")};
 }
 
 absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
 XdnaExecutable::GetParameterLayouts() const {
   XDNA_TRACE("XDNA: GetParameterLayouts() called");
+  if (hlo_module_ != nullptr) {
+    auto* comp = hlo_module_->entry_computation();
+    std::vector<std::shared_ptr<const PjRtLayout>> layouts;
+    layouts.reserve(comp->num_parameters());
+    for (int i = 0; i < comp->num_parameters(); ++i) {
+      layouts.push_back(std::make_shared<PjRtLayout>(
+          comp->parameter_instruction(i)->shape().layout()));
+    }
+    return layouts;
+  }
   return absl::UnimplementedError(
-      "XdnaExecutable::GetParameterLayouts is not implemented.");
+      "XdnaExecutable::GetParameterLayouts: no HLO module available.");
 }
 
 absl::StatusOr<std::vector<std::shared_ptr<const PjRtLayout>>>
 XdnaExecutable::GetOutputLayouts() const {
   XDNA_TRACE("XDNA: GetOutputLayouts() called");
+  if (!output_shapes_.empty()) {
+    std::vector<std::shared_ptr<const PjRtLayout>> layouts;
+    layouts.reserve(output_shapes_.size());
+    for (const auto& shape : output_shapes_) {
+      layouts.push_back(std::make_shared<PjRtLayout>(shape.layout()));
+    }
+    return layouts;
+  }
+  if (hlo_module_ != nullptr) {
+    const Shape& result = hlo_module_->result_shape();
+    std::vector<std::shared_ptr<const PjRtLayout>> layouts;
+    if (result.IsTuple()) {
+      for (const auto& sub : result.tuple_shapes()) {
+        layouts.push_back(std::make_shared<PjRtLayout>(sub.layout()));
+      }
+    } else {
+      layouts.push_back(std::make_shared<PjRtLayout>(result.layout()));
+    }
+    return layouts;
+  }
   return absl::UnimplementedError(
-      "XdnaExecutable::GetOutputLayouts is not implemented.");
+      "XdnaExecutable::GetOutputLayouts: no output info available.");
 }
 
 absl::StatusOr<CompiledMemoryStats>

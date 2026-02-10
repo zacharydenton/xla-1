@@ -45,10 +45,12 @@ cc_library(
     deps = [
         ":xdna_pjrt_buffer",
         "//xla:shape_util",
+        "//xla:util",
         "//xla/hlo/ir:hlo",
         "//xla/pjrt:pjrt_client",
         "//xla/pjrt:pjrt_executable",
         "//xla/pjrt:pjrt_future",
+        "//xla/pjrt:pjrt_layout",
         "//xla/service:computation_placer",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",

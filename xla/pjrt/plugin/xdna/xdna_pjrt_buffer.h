@@ -79,15 +79,17 @@ class XdnaBuffer : public PjRtBuffer {
   bool IsOnCpu() const override;
 
   // Access the raw host data for kernel dispatch.
-  absl::Span<const uint8_t> raw_data() const { return data_; }
-  absl::Span<uint8_t> mutable_raw_data() { return absl::MakeSpan(data_); }
+  absl::Span<const uint8_t> raw_data() const { return *data_; }
+  absl::Span<uint8_t> mutable_raw_data() { return absl::MakeSpan(*data_); }
 
  private:
   PjRtClient* client_;
   PjRtDevice* device_;
   PjRtMemorySpace* memory_space_;
   Shape on_device_shape_;
-  std::vector<uint8_t> data_;
+  // Stored via shared_ptr so AcquireExternalReference can keep the data
+  // alive even after Delete() is called on this buffer.
+  std::shared_ptr<std::vector<uint8_t>> data_;
   bool is_deleted_ = false;
 };
 

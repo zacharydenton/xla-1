@@ -39,7 +39,7 @@ XdnaBuffer::XdnaBuffer(PjRtClient* client, PjRtDevice* device,
       device_(device),
       memory_space_(memory_space),
       on_device_shape_(std::move(on_device_shape)),
-      data_(std::move(data)) {}
+      data_(std::make_shared<std::vector<uint8_t>>(std::move(data))) {}
 
 const Shape& XdnaBuffer::on_device_shape() const { return on_device_shape_; }
 
@@ -52,17 +52,17 @@ PjRtClient* XdnaBuffer::client() const { return client_; }
 namespace {
 class XdnaExternalReference : public PjRtBuffer::ExternalReference {
  public:
-  // Hold a shared_ptr to prevent the buffer data from being freed while
-  // the external reference is alive.
+  // Hold a shared_ptr to the data vector, keeping it alive even if the
+  // owning XdnaBuffer is Delete'd or destroyed.
   XdnaExternalReference(void* data_ptr,
-                        std::shared_ptr<bool> prevent_deletion)
-      : prevent_deletion_(std::move(prevent_deletion)) {
+                        std::shared_ptr<std::vector<uint8_t>> data_hold)
+      : data_hold_(std::move(data_hold)) {
     data_ptr_ = data_ptr;
   }
   ~XdnaExternalReference() override = default;
 
  private:
-  std::shared_ptr<bool> prevent_deletion_;
+  std::shared_ptr<std::vector<uint8_t>> data_hold_;
 };
 }  // namespace
 
@@ -71,10 +71,7 @@ XdnaBuffer::AcquireExternalReference() {
   if (is_deleted_) {
     return absl::InternalError("Buffer has been deleted.");
   }
-  // Create a shared reference that prevents deletion while alive.
-  auto prevent_deletion = std::make_shared<bool>(true);
-  return std::make_unique<XdnaExternalReference>(data_.data(),
-                                                  std::move(prevent_deletion));
+  return std::make_unique<XdnaExternalReference>(data_->data(), data_);
 }
 
 Future<> XdnaBuffer::ToLiteral(MutableLiteralBase* literal) {
@@ -83,7 +80,7 @@ Future<> XdnaBuffer::ToLiteral(MutableLiteralBase* literal) {
   }
   size_t byte_size =
       static_cast<size_t>(ShapeUtil::ByteSizeOf(on_device_shape_));
-  std::memcpy(literal->untyped_data(), data_.data(), byte_size);
+  std::memcpy(literal->untyped_data(), data_->data(), byte_size);
   return Future<>(absl::OkStatus());
 }
 
@@ -98,7 +95,7 @@ Future<> XdnaBuffer::LazyToLiteral(
 }
 
 absl::StatusOr<size_t> XdnaBuffer::GetOnDeviceSizeInBytes() const {
-  return data_.size();
+  return data_->size();
 }
 
 Future<> XdnaBuffer::CopyRawToHost(void* dst, int64_t offset,
@@ -106,11 +103,11 @@ Future<> XdnaBuffer::CopyRawToHost(void* dst, int64_t offset,
   if (is_deleted_) {
     return Future<>(absl::InternalError("Buffer has been deleted."));
   }
-  if (offset + transfer_size > static_cast<int64_t>(data_.size())) {
+  if (offset + transfer_size > static_cast<int64_t>(data_->size())) {
     return Future<>(absl::InvalidArgumentError(
         "CopyRawToHost: offset + transfer_size exceeds buffer size."));
   }
-  std::memcpy(dst, data_.data() + offset, transfer_size);
+  std::memcpy(dst, data_->data() + offset, transfer_size);
   return Future<>(absl::OkStatus());
 }
 
@@ -131,7 +128,7 @@ absl::StatusOr<std::unique_ptr<PjRtBuffer>> XdnaBuffer::CopyToMemorySpace(
     return absl::InternalError("Buffer has been deleted.");
   }
   return std::make_unique<XdnaBuffer>(client_, device_, dst_memory_space,
-                                      on_device_shape_, data_);
+                                      on_device_shape_, *data_);
 }
 
 void XdnaBuffer::CopyToRemoteDevice(Future<std::string> serialized_descriptor,
