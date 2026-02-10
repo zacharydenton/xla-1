@@ -153,6 +153,60 @@ def test_bf16_multiply():
     np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
 
 
+def test_add_f32_256():
+    """Test 8: f32[256] add — scalar path (no f32 vector add in Peano)."""
+    a = np.random.randn(256).astype(np.float32)
+    b = np.random.randn(256).astype(np.float32)
+    result = jax.jit(lambda x, y: x + y)(a, b)
+    np.testing.assert_allclose(np.array(result), a + b, rtol=1e-5)
+
+
+def test_negate_f32_256():
+    """Test 9: f32[256] negate — vectorized via XOR sign-bit flip on <16 x i32>."""
+    a = np.random.randn(256).astype(np.float32)
+    result = jax.jit(lambda x: -x)(a)
+    np.testing.assert_allclose(np.array(result), -a, rtol=1e-5)
+
+
+def test_multiply_f32_256():
+    """Test 10: f32[256] multiply — scalar bf16 workaround (no f32 vector mul)."""
+    a = np.array([float(i) for i in range(1, 257)], dtype=np.float32)
+    b = np.full(256, 2.0, dtype=np.float32)
+    result = jax.jit(lambda x, y: x * y)(a, b)
+    # bf16 truncation loses precision, so use relaxed tolerance
+    expected = a * b
+    np.testing.assert_allclose(np.array(result), expected, rtol=1e-2)
+
+
+def test_bf16_add_256():
+    """Test 11: bf16[256] add — scalar path (no bf16 vector add in Peano)."""
+    import ml_dtypes
+    a = np.random.randn(256).astype(ml_dtypes.bfloat16)
+    b = np.random.randn(256).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda x, y: x + y)(a, b)
+    expected = (a.astype(np.float32) + b.astype(np.float32))
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
+
+
+def test_bf16_multiply_256():
+    """Test 12: bf16[256] multiply — vectorized fmul <32 x bfloat> (native)."""
+    import ml_dtypes
+    a = np.array([float(i) for i in range(1, 257)], dtype=ml_dtypes.bfloat16)
+    b = np.full(256, 2.0, dtype=ml_dtypes.bfloat16)
+    result = jax.jit(lambda x, y: x * y)(a, b)
+    expected = (a.astype(np.float32) * b.astype(np.float32))
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
+
+
+def test_bf16_negate_256():
+    """Test 13: bf16[256] negate — vectorized via XOR sign-bit flip on <32 x i16>."""
+    import ml_dtypes
+    a = np.random.randn(256).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda x: -x)(a)
+    expected = -(a.astype(np.float32))
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
+
+
 def test_cache_hit():
     """Test 8: Second compilation of same HLO hits XDNA cache.
 
@@ -194,6 +248,12 @@ def main():
         ("jit(x - y)", test_subtract),
         ("jit(x + y) bf16", test_bf16_add),
         ("jit(x * y) bf16", test_bf16_multiply),
+        ("jit(x + y) f32[256]", test_add_f32_256),
+        ("jit(-x) f32[256]", test_negate_f32_256),
+        ("jit(x * y) f32[256]", test_multiply_f32_256),
+        ("jit(x + y) bf16[256]", test_bf16_add_256),
+        ("jit(x * y) bf16[256]", test_bf16_multiply_256),
+        ("jit(-x) bf16[256]", test_bf16_negate_256),
         ("cache hit", test_cache_hit),
     ]
 

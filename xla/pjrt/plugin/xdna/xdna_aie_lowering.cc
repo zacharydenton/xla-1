@@ -71,6 +71,21 @@ int GetNumInputs(llvm::StringRef op_name) {
   return -1;  // unsupported
 }
 
+// Returns the vector width for an (element_type, kernel_op) pair, or 0 if
+// vectorization is not possible. Peano (Jan 2025) GlobalISel only legalizes:
+//   - fmul <32 x bfloat>  (native bf16 vector multiply)
+//   - integer add/sub/xor on <32 x i16> and <16 x i32>
+// It CANNOT legalize fadd/fsub/fneg on any vector type, nor any f32 vector
+// float op, nor fptrunc/fpext on vectors. We work around fneg by using
+// XOR with the sign bit (bitcast float→int, xor, bitcast back).
+int GetVectorWidth(const std::string& element_type,
+                   const std::string& kernel_op) {
+  if (element_type == "bf16" && kernel_op == "arith.mulf") return 32;
+  if (element_type == "bf16" && kernel_op == "arith.negf") return 32;
+  if (element_type == "f32" && kernel_op == "arith.negf") return 16;
+  return 0;
+}
+
 // Describes a linalg operation extracted from the module.
 struct LinalgOpInfo {
   std::string op_name;        // e.g., "linalg.add"
@@ -220,37 +235,13 @@ absl::StatusOr<LinalgOpInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
   return info;
 }
 
-// Generates a single-core element-wise loop as AIE core body text.
-std::string GenerateCoreBody(const LinalgOpInfo& info, int64_t chunk_size) {
+// Generates a scalar element-wise loop body (memref.load/store, step 1).
+std::string GenerateScalarLoop(const LinalgOpInfo& info,
+                               const std::string& memref_ty,
+                               int64_t chunk_size) {
   std::string body;
   const std::string& ty = info.element_type;
-  std::string memref_ty = absl::StrFormat("memref<%dx%s>", chunk_size, ty);
 
-  // Acquire input/output ObjectFIFO elements.
-  absl::StrAppend(&body,
-      "      %subview_in0 = aie.objectfifo.acquire @in0(Consume, 1) "
-      ": !aie.objectfifosubview<", memref_ty, ">\n");
-  absl::StrAppend(&body,
-      "      %elem_in0 = aie.objectfifo.subview.access %subview_in0[0] "
-      ": !aie.objectfifosubview<", memref_ty, "> -> ", memref_ty, "\n");
-
-  if (info.num_inputs == 2) {
-    absl::StrAppend(&body,
-        "      %subview_in1 = aie.objectfifo.acquire @in1(Consume, 1) "
-        ": !aie.objectfifosubview<", memref_ty, ">\n");
-    absl::StrAppend(&body,
-        "      %elem_in1 = aie.objectfifo.subview.access %subview_in1[0] "
-        ": !aie.objectfifosubview<", memref_ty, "> -> ", memref_ty, "\n");
-  }
-
-  absl::StrAppend(&body,
-      "      %subview_out = aie.objectfifo.acquire @out0(Produce, 1) "
-      ": !aie.objectfifosubview<", memref_ty, ">\n");
-  absl::StrAppend(&body,
-      "      %elem_out = aie.objectfifo.subview.access %subview_out[0] "
-      ": !aie.objectfifosubview<", memref_ty, "> -> ", memref_ty, "\n");
-
-  // Generate the element-wise loop.
   absl::StrAppend(&body,
       "      %c0 = arith.constant 0 : index\n"
       "      %c1 = arith.constant 1 : index\n");
@@ -293,6 +284,128 @@ std::string GenerateCoreBody(const LinalgOpInfo& info, int64_t chunk_size) {
       "        memref.store %val_out, %elem_out[%i] : ", memref_ty, "\n");
   absl::StrAppend(&body,
       "      }\n");
+
+  return body;
+}
+
+// Generates a vectorized element-wise loop body (vector.load/store).
+// Peano (Jan 2025) supports a limited set of vector operations:
+//   - fmul <32 x bfloat> (native bf16 multiply)
+//   - xor <32 x i16> / xor <16 x i32> (used for negate via sign-bit flip)
+// We use bitcast + XOR for negate since fneg on vectors is not legalizable.
+std::string GenerateVectorLoop(const LinalgOpInfo& info,
+                               const std::string& memref_ty,
+                               int64_t chunk_size, int vector_width) {
+  std::string body;
+  const std::string& ty = info.element_type;
+  std::string vec_ty = absl::StrFormat("vector<%dx%s>", vector_width, ty);
+
+  absl::StrAppend(&body,
+      "      %c0 = arith.constant 0 : index\n");
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%c%d = arith.constant %d : index\n", chunk_size, chunk_size));
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%c%d = arith.constant %d : index\n", vector_width, vector_width));
+
+  // For negate, pre-compute the sign-bit mask outside the loop.
+  bool is_negate = (info.kernel_op == "arith.negf");
+  if (is_negate) {
+    if (ty == "bf16") {
+      // bf16 sign bit is 0x8000 (bit 15), integer type is i16
+      absl::StrAppend(&body, absl::StrFormat(
+          "      %%sign_mask = arith.constant dense<-32768>"
+          " : vector<%dxi16>\n", vector_width));
+    } else {
+      // f32 sign bit is 0x80000000 (bit 31), integer type is i32
+      absl::StrAppend(&body, absl::StrFormat(
+          "      %%sign_mask = arith.constant dense<-2147483648>"
+          " : vector<%dxi32>\n", vector_width));
+    }
+  }
+
+  absl::StrAppend(&body, absl::StrFormat(
+      "      scf.for %%i = %%c0 to %%c%d step %%c%d {\n",
+      chunk_size, vector_width));
+
+  absl::StrAppend(&body, absl::StrFormat(
+      "        %%v0 = vector.load %%elem_in0[%%i] : %s, %s\n",
+      memref_ty, vec_ty));
+
+  if (is_negate) {
+    // Negate via bitcast to integer, XOR with sign bit, bitcast back.
+    // This avoids fneg which Peano's GlobalISel cannot legalize on vectors.
+    std::string int_ty = (ty == "bf16") ? "i16" : "i32";
+    std::string int_vec_ty = absl::StrFormat("vector<%dx%s>",
+                                              vector_width, int_ty);
+    absl::StrAppend(&body, absl::StrFormat(
+        "        %%v0_int = arith.bitcast %%v0 : %s to %s\n",
+        vec_ty, int_vec_ty));
+    absl::StrAppend(&body, absl::StrFormat(
+        "        %%vr_int = arith.xori %%v0_int, %%sign_mask : %s\n",
+        int_vec_ty));
+    absl::StrAppend(&body, absl::StrFormat(
+        "        %%vr = arith.bitcast %%vr_int : %s to %s\n",
+        int_vec_ty, vec_ty));
+  } else if (info.num_inputs == 2) {
+    absl::StrAppend(&body, absl::StrFormat(
+        "        %%v1 = vector.load %%elem_in1[%%i] : %s, %s\n",
+        memref_ty, vec_ty));
+    absl::StrAppend(&body, absl::StrFormat(
+        "        %%vr = %s %%v0, %%v1 : %s\n", info.kernel_op, vec_ty));
+  }
+
+  absl::StrAppend(&body, absl::StrFormat(
+      "        vector.store %%vr, %%elem_out[%%i] : %s, %s\n",
+      memref_ty, vec_ty));
+  absl::StrAppend(&body,
+      "      }\n");
+
+  return body;
+}
+
+// Generates a single-core element-wise loop as AIE core body text.
+// Uses vectorized path when tensor size is compatible with 512-bit registers,
+// falls back to scalar path for small tensors (e.g., f32[4]).
+std::string GenerateCoreBody(const LinalgOpInfo& info, int64_t chunk_size) {
+  std::string body;
+  const std::string& ty = info.element_type;
+  std::string memref_ty = absl::StrFormat("memref<%dx%s>", chunk_size, ty);
+
+  // Acquire input/output ObjectFIFO elements.
+  absl::StrAppend(&body,
+      "      %subview_in0 = aie.objectfifo.acquire @in0(Consume, 1) "
+      ": !aie.objectfifosubview<", memref_ty, ">\n");
+  absl::StrAppend(&body,
+      "      %elem_in0 = aie.objectfifo.subview.access %subview_in0[0] "
+      ": !aie.objectfifosubview<", memref_ty, "> -> ", memref_ty, "\n");
+
+  if (info.num_inputs == 2) {
+    absl::StrAppend(&body,
+        "      %subview_in1 = aie.objectfifo.acquire @in1(Consume, 1) "
+        ": !aie.objectfifosubview<", memref_ty, ">\n");
+    absl::StrAppend(&body,
+        "      %elem_in1 = aie.objectfifo.subview.access %subview_in1[0] "
+        ": !aie.objectfifosubview<", memref_ty, "> -> ", memref_ty, "\n");
+  }
+
+  absl::StrAppend(&body,
+      "      %subview_out = aie.objectfifo.acquire @out0(Produce, 1) "
+      ": !aie.objectfifosubview<", memref_ty, ">\n");
+  absl::StrAppend(&body,
+      "      %elem_out = aie.objectfifo.subview.access %subview_out[0] "
+      ": !aie.objectfifosubview<", memref_ty, "> -> ", memref_ty, "\n");
+
+  // Choose vectorized or scalar loop.
+  int vector_width = GetVectorWidth(info.element_type, info.kernel_op);
+  if (vector_width > 0 && chunk_size >= vector_width &&
+      chunk_size % vector_width == 0) {
+    absl::StrAppend(&body,
+                    GenerateVectorLoop(info, memref_ty, chunk_size,
+                                       vector_width));
+  } else {
+    absl::StrAppend(&body,
+                    GenerateScalarLoop(info, memref_ty, chunk_size));
+  }
 
   // Release ObjectFIFO elements.
   absl::StrAppend(&body,
