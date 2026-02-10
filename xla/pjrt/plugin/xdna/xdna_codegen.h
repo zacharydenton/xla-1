@@ -49,8 +49,10 @@ struct XdnaCodegenResult {
 //
 // `num_data_args` is the number of data buffer arguments (inputs + outputs)
 // in the kernel. Used to generate kernel metadata in the xclbin.
+// `num_cores` is the number of compute columns to compile ELFs for.
 absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
-    const std::string& aie_mlir, int num_data_args, const TargetCaps& caps);
+    const std::string& aie_mlir, int num_data_args, const TargetCaps& caps,
+    int num_cores);
 
 }  // namespace xla
 

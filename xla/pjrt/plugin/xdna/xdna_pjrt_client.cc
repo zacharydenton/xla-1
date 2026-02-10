@@ -277,8 +277,12 @@ XdnaPjrtClient::CompileInternal(
     // Use the entry computation's text representation as cache key.
     // This is stable across compilations of the same HLO (unlike ToProto()
     // which includes varying module IDs).
-    cache_key = tsl::Fingerprint64(
-        hlo_module->entry_computation()->ToString());
+    // Include XDNA_NUM_CORES override in key when set, so debug overrides
+    // don't get stale cache hits.
+    std::string cache_input = hlo_module->entry_computation()->ToString();
+    const char* nc = std::getenv("XDNA_NUM_CORES");
+    if (nc) absl::StrAppend(&cache_input, ":cores=", nc);
+    cache_key = tsl::Fingerprint64(cache_input);
 
     auto it = compilation_cache_.find(cache_key);
     if (it != compilation_cache_.end()) {

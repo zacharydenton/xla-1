@@ -15,7 +15,9 @@ limitations under the License.
 
 #include "xla/pjrt/plugin/xdna/xdna_compiler.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -80,14 +82,20 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
   // Step 3: linalg → AIE dialect MLIR (template-based generation).
   TargetCaps caps = StrixPointTargetCaps();
   AieLoweringConfig config;
+  config.num_columns = caps.num_columns;  // Auto-scale to hardware (4 on Strix Point).
+  const char* num_cores_env = std::getenv("XDNA_NUM_CORES");
+  if (num_cores_env)
+    config.num_columns = std::max(1, std::min(std::atoi(num_cores_env),
+                                               caps.num_columns));
   LOG(INFO) << "XDNA compiler: target=" << caps.device_name
             << " isa=" << caps.isa_target
             << " l1_usable=" << caps.l1_usable_bytes << "B"
-            << " columns=" << caps.num_columns;
-  TF_ASSIGN_OR_RETURN(std::string aie_mlir,
+            << " columns=" << config.num_columns;
+  TF_ASSIGN_OR_RETURN(AieLoweringResult lowering,
                       LowerLinalgToAie(*mlir_module, config, caps));
 
-  LOG(INFO) << "XDNA compiler: linalg → AIE lowering succeeded.";
+  LOG(INFO) << "XDNA compiler: linalg → AIE lowering succeeded ("
+            << lowering.num_cores << " core(s)).";
 
   // Compute number of data buffer args: inputs + outputs.
   int num_inputs = hlo_module->entry_computation()->num_parameters();
@@ -99,7 +107,8 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
 
   // Step 4: AIE → xclbin codegen (aie-opt + Peano + bootgen + xclbinutil).
   TF_ASSIGN_OR_RETURN(XdnaCodegenResult result,
-                      GenerateXclbinFromAie(aie_mlir, num_data_args, caps));
+                      GenerateXclbinFromAie(lowering.aie_mlir, num_data_args,
+                                            caps, lowering.num_cores));
 
   LOG(INFO) << "XDNA compiler: xclbin generated, "
             << result.xclbin_bytes.size() << " bytes.";

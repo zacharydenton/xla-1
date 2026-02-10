@@ -344,7 +344,8 @@ absl::Status CheckTools(const std::string& aie_opt,
 }  // namespace
 
 absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
-    const std::string& aie_mlir, int num_data_args, const TargetCaps& caps) {
+    const std::string& aie_mlir, int num_data_args, const TargetCaps& caps,
+    int num_cores) {
   // Create a temporary working directory.
   auto tmpdir = std::filesystem::temp_directory_path() / "xdna_codegen_XXXXXX";
   std::string tmpdir_str = tmpdir.string();
@@ -383,6 +384,10 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
   //   - create-pathfinder-flows: routes logical flows through physical switches
   //   - assign-buffer-addresses: allocates memory in tile local stores
   // -----------------------------------------------------------------------
+  // Step numbering: 1 shared + 7 per core + 5 shared = total.
+  int total_compile_steps = 7 * num_cores + 6;
+  int step = 1;
+
   std::string lowered_mlir = workdir + "/lowered.mlir";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       aie_opt,
@@ -401,102 +406,122 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " --aie-assign-buffer-addresses"
       " --convert-scf-to-cf"
       " ", input_mlir, " -o ", lowered_mlir),
-      "Step 1/13: AIE lowering passes"));
+      absl::StrFormat("Step %d/%d: AIE lowering passes",
+                      step++, total_compile_steps)));
 
   // -----------------------------------------------------------------------
   // Step 3: Per-core code compilation with Peano.
-  // Extract core(0,2) code → lower to LLVM → compile to ELF.
+  // Extract each core's code → lower to LLVM → compile to ELF.
+  // Loop over all compute columns used.
   // -----------------------------------------------------------------------
 
-  // 3a: Extract core code with AIE-specific lowering.
-  std::string core_mlir = workdir + "/core_0_2.mlir";
-  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
-      aie_opt,
-      " --aie-localize-locks"
-      " --aie-normalize-address-spaces"
-      " \"--aie-standard-lowering=tilecol=0 tilerow=2\""
-      " --aiex-standard-lowering"
-      " ", lowered_mlir, " -o ", core_mlir),
-      "Step 2/13: Core code extraction"));
+  for (int c = 0; c < num_cores; c++) {
+    int col = caps.partition_start_column + c;
+    int row = caps.first_compute_row;
+    std::string core = absl::StrFormat("core_%d_%d", col, row);
 
-  // 3b: Lower to LLVM dialect (matches aiecc.py LOWER_TO_LLVM_PIPELINE).
-  std::string core_opt_mlir = workdir + "/core_0_2.opt.mlir";
-  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
-      aie_opt,
-      " --canonicalize --cse"
-      " --convert-vector-to-llvm --expand-strided-metadata"
-      " --lower-affine --convert-math-to-llvm --convert-index-to-llvm"
-      " --arith-expand --convert-arith-to-llvm --finalize-memref-to-llvm"
-      " \"--convert-func-to-llvm=use-bare-ptr-memref-call-conv\""
-      " --convert-cf-to-llvm --canonicalize --cse"
-      " ", core_mlir, " -o ", core_opt_mlir),
-      "Step 3/13: LLVM dialect lowering"));
+    // 3a: Extract core code with AIE-specific lowering.
+    std::string core_mlir = absl::StrFormat("%s/%s.mlir", workdir, core);
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        aie_opt,
+        " --aie-localize-locks"
+        " --aie-normalize-address-spaces"
+        " \"--aie-standard-lowering=tilecol=", col, " tilerow=", row, "\""
+        " --aiex-standard-lowering"
+        " ", lowered_mlir, " -o ", core_mlir),
+        absl::StrFormat("Step %d/%d: Core (%d,%d) extraction",
+                        step++, total_compile_steps, col, row)));
 
-  // 3c: Translate to LLVM IR.
-  std::string core_ll = workdir + "/core_0_2.ll";
-  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
-      aie_translate, " --mlir-to-llvmir ", core_opt_mlir, " -o ", core_ll),
-      "Step 4/13: LLVM IR translation"));
+    // 3b: Lower to LLVM dialect.
+    std::string core_opt_mlir = absl::StrFormat("%s/%s.opt.mlir", workdir, core);
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        aie_opt,
+        " --canonicalize --cse"
+        " --convert-vector-to-llvm --expand-strided-metadata"
+        " --lower-affine --convert-math-to-llvm --convert-index-to-llvm"
+        " --arith-expand --convert-arith-to-llvm --finalize-memref-to-llvm"
+        " \"--convert-func-to-llvm=use-bare-ptr-memref-call-conv\""
+        " --convert-cf-to-llvm --canonicalize --cse"
+        " ", core_mlir, " -o ", core_opt_mlir),
+        absl::StrFormat("Step %d/%d: Core (%d,%d) LLVM lowering",
+                        step++, total_compile_steps, col, row)));
 
-  // 3d: Fix intrinsic names (llvm.aie2.* → llvm.<isa_target>.* for target).
-  // mlir-aie generates llvm.aie2.* intrinsics; Peano expects llvm.<target>.*.
-  {
-    std::ifstream ll_in(core_ll);
-    if (!ll_in.is_open()) {
-      return absl::InternalError(
-          absl::StrCat("Cannot read LLVM IR: ", core_ll));
+    // 3c: Translate to LLVM IR.
+    std::string core_ll = absl::StrFormat("%s/%s.ll", workdir, core);
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        aie_translate, " --mlir-to-llvmir ", core_opt_mlir, " -o ", core_ll),
+        absl::StrFormat("Step %d/%d: Core (%d,%d) LLVM IR translation",
+                        step++, total_compile_steps, col, row)));
+
+    // 3d: Fix intrinsic names (llvm.aie2.* → llvm.<isa_target>.*).
+    {
+      std::ifstream ll_in(core_ll);
+      if (!ll_in.is_open()) {
+        return absl::InternalError(
+            absl::StrCat("Cannot read LLVM IR: ", core_ll));
+      }
+      std::string ll_content((std::istreambuf_iterator<char>(ll_in)),
+                             std::istreambuf_iterator<char>());
+      ll_in.close();
+
+      std::string from = "llvm.aie2.";
+      std::string to = absl::StrCat("llvm.", caps.isa_target, ".");
+      size_t pos = 0;
+      while ((pos = ll_content.find(from, pos)) != std::string::npos) {
+        ll_content.replace(pos, from.size(), to);
+        pos += to.size();
+      }
+      TF_RETURN_IF_ERROR(WriteFile(core_ll, ll_content));
     }
-    std::string ll_content((std::istreambuf_iterator<char>(ll_in)),
-                           std::istreambuf_iterator<char>());
-    ll_in.close();
 
-    std::string from = "llvm.aie2.";
-    std::string to = absl::StrCat("llvm.", caps.isa_target, ".");
-    size_t pos = 0;
-    while ((pos = ll_content.find(from, pos)) != std::string::npos) {
-      ll_content.replace(pos, from.size(), to);
-      pos += to.size();
-    }
-    TF_RETURN_IF_ERROR(WriteFile(core_ll, ll_content));
+    // 3e: Peano opt.
+    // Disable loop unrolling: Peano (Jan 2025) has a VLIW scheduling bug
+    // where unrolled scalar loops produce incorrect results. The misscheduled
+    // stores write stale register values (typically the first element of an
+    // input buffer) to wrong output positions. This affects any loop with
+    // >4 iterations when fully unrolled. Disabling unrolling keeps a clean
+    // loop that Peano's backend schedules correctly.
+    std::string core_opt_ll = absl::StrFormat("%s/%s.opt.ll", workdir, core);
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        peano_opt,
+        " '--passes=default<O2>,strip'"
+        " -vectorize-slp=false"
+        " -vectorize-loops=false"
+        " -unroll-threshold=0"
+        " -S ",
+        core_ll, " -o ", core_opt_ll),
+        absl::StrFormat("Step %d/%d: Core (%d,%d) Peano optimization",
+                        step++, total_compile_steps, col, row)));
+
+    // 3f: Peano llc.
+    std::string core_obj = absl::StrFormat("%s/%s.o", workdir, core);
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        peano_llc, " ", core_opt_ll,
+        " -O2 --march=", caps.isa_target,
+        " --function-sections --filetype=obj"
+        " -o ", core_obj),
+        absl::StrFormat("Step %d/%d: Core (%d,%d) Peano codegen",
+                        step++, total_compile_steps, col, row)));
+
+    // 3g: Generate linker script.
+    std::string core_ldscript = absl::StrFormat("%s/%s.ld.script", workdir, core);
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        aie_translate,
+        " --aie-generate-ldscript --tilecol=", col, " --tilerow=", row, " ",
+        lowered_mlir, " -o ", core_ldscript),
+        absl::StrFormat("Step %d/%d: Core (%d,%d) linker script",
+                        step++, total_compile_steps, col, row)));
+
+    // 3h: Peano clang link.
+    std::string core_elf = absl::StrFormat("%s/%s.elf", workdir, core);
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        peano_clang,
+        " -O2 --target=", caps.isa_target, "-none-elf -nostdlib"
+        " -Wl,--gc-sections -Wl,--entry=", core, " ",
+        core_obj, " -Wl,-T,", core_ldscript, " -o ", core_elf),
+        absl::StrFormat("Step %d/%d: Core (%d,%d) Peano linking",
+                        step++, total_compile_steps, col, row)));
   }
-
-  // 3e: Peano opt → llc → clang link.
-  std::string core_opt_ll = workdir + "/core_0_2.opt.ll";
-  // Disable SLP/loop vectorization: Peano's O2 creates small vectors
-  // (e.g. <2 x bf16>) that are illegal on AIE2p — legal vector widths
-  // are 32/64 elements. Scalar code is fine: Peano's legalizer
-  // widens scalars to legal vector ops where needed.
-  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
-      peano_opt,
-      " '--passes=default<O2>,strip'"
-      " -vectorize-slp=false"
-      " -vectorize-loops=false"
-      " -S ",
-      core_ll, " -o ", core_opt_ll),
-      "Step 5/13: Peano optimization"));
-
-  std::string core_obj = workdir + "/core_0_2.o";
-  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
-      peano_llc, " ", core_opt_ll,
-      " -O2 --march=", caps.isa_target,
-      " --function-sections --filetype=obj"
-      " -o ", core_obj),
-      "Step 6/13: Peano codegen"));
-
-  std::string core_ldscript = workdir + "/core_0_2.ld.script";
-  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
-      aie_translate,
-      " --aie-generate-ldscript --tilecol=0 --tilerow=2 ",
-      lowered_mlir, " -o ", core_ldscript),
-      "Step 7/13: Linker script generation"));
-
-  std::string core_elf = workdir + "/core_0_2.elf";
-  TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
-      peano_clang,
-      " -O2 --target=", caps.isa_target, "-none-elf -nostdlib"
-      " -Wl,--gc-sections -Wl,--entry=core_0_2 ",
-      core_obj, " -Wl,-T,", core_ldscript, " -o ", core_elf),
-      "Step 8/13: Peano linking"));
 
   // -----------------------------------------------------------------------
   // Step 4: CDO generation.
@@ -507,17 +532,11 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " --aie-generate-cdo"
       " --work-dir-path=", workdir,
       " ", lowered_mlir),
-      "Step 9/13: CDO generation"));
+      absl::StrFormat("Step %d/%d: CDO generation",
+                      step++, total_compile_steps)));
 
   // -----------------------------------------------------------------------
   // Step 4b: Generate NPU instruction stream (DMA_TO_NPU pipeline).
-  // Matches aiecc.py's DMA_TO_NPU pipeline:
-  //   - materialize-bd-chains: materializes BD chain descriptors
-  //   - substitute-shim-dma-allocations: resolves ObjectFIFO → DMA channel
-  //   - assign-runtime-sequence-bd-ids: assigns BD IDs for runtime sequence
-  //   - dma-tasks-to-npu: converts DMA task ops to NPU operations
-  //   - dma-to-npu: final lowering to NPU write/sync operations
-  // Then aie-npu-instgen translates to a binary instruction stream.
   // -----------------------------------------------------------------------
   std::string npu_insts_mlir = workdir + "/npu_insts.mlir";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
@@ -528,14 +547,16 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " --aie-dma-tasks-to-npu"
       " --aie-dma-to-npu"
       " ", lowered_mlir, " -o ", npu_insts_mlir),
-      "Step 10/13: NPU DMA lowering"));
+      absl::StrFormat("Step %d/%d: NPU DMA lowering",
+                      step++, total_compile_steps)));
 
   std::string insts_txt = workdir + "/insts.txt";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
       aie_translate,
       " --aie-npu-instgen ",
       npu_insts_mlir, " -o ", insts_txt),
-      "Step 11/13: NPU instruction generation"));
+      absl::StrFormat("Step %d/%d: NPU instruction generation",
+                      step++, total_compile_steps)));
 
   auto instr_words_or = ReadInstrFile(insts_txt);
   if (!instr_words_or.ok()) {
@@ -555,7 +576,8 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       bootgen,
       " -arch versal -image ", design_bif,
       " -o ", design_pdi, " -w"),
-      "Step 12/13: PDI packaging"));
+      absl::StrFormat("Step %d/%d: PDI packaging",
+                      step++, total_compile_steps)));
 
   // -----------------------------------------------------------------------
   // Step 6: xclbinutil — assemble the xclbin.
@@ -582,7 +604,8 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " --add-replace-section AIE_PARTITION:JSON:", aie_partition_json,
       " --force --quiet"
       " --output ", final_xclbin),
-      "Step 13/13: xclbin assembly"));
+      absl::StrFormat("Step %d/%d: xclbin assembly",
+                      step++, total_compile_steps)));
 
   // -----------------------------------------------------------------------
   // Read the final xclbin and clean up.

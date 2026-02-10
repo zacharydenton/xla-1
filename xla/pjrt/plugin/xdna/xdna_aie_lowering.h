@@ -36,6 +36,12 @@ struct AieLoweringConfig {
   int l2_tile_bytes = 524288;
 };
 
+// Result of AIE lowering: MLIR text and actual core count used.
+struct AieLoweringResult {
+  std::string aie_mlir;
+  int num_cores;  // Actual columns used (may be < requested).
+};
+
 // Lowers a linalg-on-tensors MLIR module to AIE dialect MLIR text.
 //
 // Analyzes the linalg operations in the module and generates AIE dialect
@@ -47,11 +53,11 @@ struct AieLoweringConfig {
 //
 // The output text is suitable for processing by aie-opt and aie-translate.
 //
-// Currently supports:
-// - Element-wise ops (add, subtract, multiply) on single core
+// Supports element-wise ops (add, subtract, multiply, negate, etc.)
+// across multiple compute columns for data-parallel execution.
 //
-// Returns AIE dialect MLIR text string.
-absl::StatusOr<std::string> LowerLinalgToAie(
+// Returns AieLoweringResult with AIE dialect MLIR text and actual core count.
+absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
     mlir::ModuleOp linalg_module, const AieLoweringConfig& config,
     const TargetCaps& caps);
 

@@ -281,6 +281,60 @@ def _make_tiling_tests():
     return tests
 
 
+def test_multicore_auto_reduce():
+    """Test: 1006 elements not divisible by 4 or 3, auto-reduces to 2 cores.
+
+    f32[1006]: 1006 % 4 = 2, 1006 % 3 = 2, 1006 % 2 = 0 → 2 cores.
+    We verify the computation is correct with no tail-drop.
+    """
+    a = np.arange(1006, dtype=np.float32)
+    b = np.ones(1006, dtype=np.float32)
+    result = jax.jit(lambda x, y: x + y)(a, b)
+    np.testing.assert_allclose(np.array(result), a + b, rtol=1e-5)
+
+
+def test_multicore_single_fallback():
+    """Test: Prime size (7) forces single-core fallback.
+
+    f32[7]: 7 % 4 != 0, 7 % 3 != 0, 7 % 2 != 0, so falls back to 1 core.
+    """
+    a = np.arange(7, dtype=np.float32)
+    b = np.ones(7, dtype=np.float32)
+    result = jax.jit(lambda x, y: x + y)(a, b)
+    np.testing.assert_allclose(np.array(result), a + b, rtol=1e-5)
+
+
+def test_multicore_override_1():
+    """Test: XDNA_NUM_CORES=1 forces single-core execution.
+
+    Runs a subprocess with XDNA_NUM_CORES=1 to verify the override is
+    respected. The subprocess compiles and runs f32[256] add (which would
+    normally use 4 cores) and checks correctness.
+    """
+    import subprocess
+    script = (
+        "import os; os.environ['XDNA_NUM_CORES']='1'; "
+        "os.environ['JAX_PLATFORMS']='xdna'; "
+        "import sys; sys.path.insert(0,'.'); "
+        "from jax_xdna import initialize; initialize(); "
+        "import jax; import numpy as np; "
+        "a=np.arange(256,dtype=np.float32); b=np.ones(256,dtype=np.float32); "
+        "r=np.array(jax.jit(lambda x,y:x+y)(a,b)); "
+        "np.testing.assert_allclose(r,a+b,rtol=1e-5); "
+        "print('override OK')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=120,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+    assert result.returncode == 0, (
+        f"Override subprocess failed:\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr[-500:]}"
+    )
+    assert "override OK" in result.stdout
+
+
 def test_cache_hit():
     """Test 8: Second compilation of same HLO hits XDNA cache.
 
@@ -332,6 +386,9 @@ def main():
         ("jit(x + y) i16[256]", test_i16_add_256),
         ("jit(x + y) i8[256]", test_i8_add_256),
     ] + _make_tiling_tests() + [
+        ("multicore auto-reduce f32[1006]", test_multicore_auto_reduce),
+        ("multicore single fallback f32[7]", test_multicore_single_fallback),
+        ("multicore override f32[256]", test_multicore_override_1),
         ("cache hit", test_cache_hit),
     ]
 
