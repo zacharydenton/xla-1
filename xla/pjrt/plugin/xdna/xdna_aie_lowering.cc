@@ -72,17 +72,33 @@ int GetNumInputs(llvm::StringRef op_name) {
 }
 
 // Returns the vector width for an (element_type, kernel_op) pair, or 0 if
-// vectorization is not possible. Peano (Jan 2025) GlobalISel only legalizes:
-//   - fmul <32 x bfloat>  (native bf16 vector multiply)
-//   - integer add/sub/xor on <32 x i16> and <16 x i32>
-// It CANNOT legalize fadd/fsub/fneg on any vector type, nor any f32 vector
-// float op, nor fptrunc/fpext on vectors. We work around fneg by using
-// XOR with the sign bit (bitcast float→int, xor, bitcast back).
+// vectorization is not possible. Peano (Jan 2025) GlobalISel legalizes:
+//   - fmul on <32 x bfloat> and <32 x half>  (native 16-bit float multiply)
+//   - integer add/sub on <64 x i8>, <32 x i16>, <16 x i32>
+//   - integer xor on <32 x i16>, <16 x i32> (used for float negate)
+// It CANNOT legalize: fadd/fsub/fneg on any float vector, any integer mul
+// on vectors, fptrunc/fpext on vectors, or any f32 vector float op.
+// We work around fneg by XOR with the sign bit (bitcast float→int, xor).
 int GetVectorWidth(const std::string& element_type,
                    const std::string& kernel_op) {
-  if (element_type == "bf16" && kernel_op == "arith.mulf") return 32;
+  // Float multiply: bf16 and f16 have native 32-wide fmul.
+  if ((element_type == "bf16" || element_type == "f16") &&
+      kernel_op == "arith.mulf")
+    return 32;
+  // Float negate: XOR sign bit works for all float types.
   if (element_type == "bf16" && kernel_op == "arith.negf") return 32;
+  if (element_type == "f16" && kernel_op == "arith.negf") return 32;
   if (element_type == "f32" && kernel_op == "arith.negf") return 16;
+  // Integer add/sub: native vector support (512-bit register).
+  if (element_type == "i8" &&
+      (kernel_op == "arith.addi" || kernel_op == "arith.subi"))
+    return 64;
+  if (element_type == "i16" &&
+      (kernel_op == "arith.addi" || kernel_op == "arith.subi"))
+    return 32;
+  if (element_type == "i32" &&
+      (kernel_op == "arith.addi" || kernel_op == "arith.subi"))
+    return 16;
   return 0;
 }
 
@@ -310,8 +326,8 @@ std::string GenerateVectorLoop(const LinalgOpInfo& info,
   // For negate, pre-compute the sign-bit mask outside the loop.
   bool is_negate = (info.kernel_op == "arith.negf");
   if (is_negate) {
-    if (ty == "bf16") {
-      // bf16 sign bit is 0x8000 (bit 15), integer type is i16
+    if (ty == "bf16" || ty == "f16") {
+      // bf16/f16 sign bit is 0x8000 (bit 15), integer type is i16
       absl::StrAppend(&body, absl::StrFormat(
           "      %%sign_mask = arith.constant dense<-32768>"
           " : vector<%dxi16>\n", vector_width));
@@ -334,7 +350,7 @@ std::string GenerateVectorLoop(const LinalgOpInfo& info,
   if (is_negate) {
     // Negate via bitcast to integer, XOR with sign bit, bitcast back.
     // This avoids fneg which Peano's GlobalISel cannot legalize on vectors.
-    std::string int_ty = (ty == "bf16") ? "i16" : "i32";
+    std::string int_ty = (ty == "bf16" || ty == "f16") ? "i16" : "i32";
     std::string int_vec_ty = absl::StrFormat("vector<%dx%s>",
                                               vector_width, int_ty);
     absl::StrAppend(&body, absl::StrFormat(

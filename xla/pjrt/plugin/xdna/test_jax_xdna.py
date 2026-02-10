@@ -207,6 +207,30 @@ def test_bf16_negate_256():
     np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
 
 
+def test_i32_add_256():
+    """Test 14: i32[256] add — vectorized add <16 x i32> (native)."""
+    a = np.arange(1, 257, dtype=np.int32)
+    b = np.full(256, 10, dtype=np.int32)
+    result = jax.jit(lambda x, y: x + y)(a, b)
+    np.testing.assert_array_equal(np.array(result), a + b)
+
+
+def test_i16_add_256():
+    """Test 15: i16[256] add — vectorized add <32 x i16> (native)."""
+    a = np.arange(1, 257, dtype=np.int16)
+    b = np.full(256, 10, dtype=np.int16)
+    result = jax.jit(lambda x, y: x + y)(a, b)
+    np.testing.assert_array_equal(np.array(result), a + b)
+
+
+def test_i8_add_256():
+    """Test 16: i8[256] add — vectorized add <64 x i8> (native)."""
+    a = np.tile(np.arange(1, 65, dtype=np.int8), 4)  # 256 elements in i8 range
+    b = np.full(256, 2, dtype=np.int8)
+    result = jax.jit(lambda x, y: x + y)(a, b)
+    np.testing.assert_array_equal(np.array(result), (a + b).astype(np.int8))
+
+
 def test_cache_hit():
     """Test 8: Second compilation of same HLO hits XDNA cache.
 
@@ -254,6 +278,9 @@ def main():
         ("jit(x + y) bf16[256]", test_bf16_add_256),
         ("jit(x * y) bf16[256]", test_bf16_multiply_256),
         ("jit(-x) bf16[256]", test_bf16_negate_256),
+        ("jit(x + y) i32[256]", test_i32_add_256),
+        ("jit(x + y) i16[256]", test_i16_add_256),
+        ("jit(x + y) i8[256]", test_i8_add_256),
         ("cache hit", test_cache_hit),
     ]
 
