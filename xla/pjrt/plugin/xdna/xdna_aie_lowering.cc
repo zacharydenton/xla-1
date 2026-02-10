@@ -589,16 +589,50 @@ std::string GenerateMultiOpScalarLoop(mlir::linalg::GenericOp generic,
   return body;
 }
 
+// Shim DMA BD size fields are 10 bits for d0 and d1, giving a max of 1023
+// 32-bit words per dimension.
+static constexpr int64_t kMaxBdWords = 1023;
+
+// Tries to split chunk_size elements into d0_size * d0_reps where both
+// fit within the shim DMA BD 10-bit fields (≤ 1023 32-bit words).
+// Returns true and sets d0_size/d0_reps on success; false if no valid split
+// exists.
+bool FindDmaSplit(int64_t chunk_size, int element_bytes,
+                  int64_t& d0_size, int64_t& d0_reps) {
+  int64_t max_d0_elements = kMaxBdWords * 4 / element_bytes;
+  if (chunk_size <= max_d0_elements) {
+    d0_size = chunk_size;
+    d0_reps = 1;
+    return true;
+  }
+  // Find largest d0_size ≤ max_d0_elements that evenly divides chunk_size
+  // and yields d0_reps ≤ kMaxBdWords.
+  d0_size = max_d0_elements;
+  while (d0_size > 0) {
+    if (chunk_size % d0_size == 0) {
+      d0_reps = chunk_size / d0_size;
+      if (d0_reps <= kMaxBdWords) return true;
+    }
+    d0_size--;
+  }
+  return false;
+}
+
 // Computes the largest chunk size that evenly divides num_elements, fits
-// within max_chunk elements, and is aligned to vector_width (if nonzero).
+// within max_chunk elements, is aligned to vector_width (if nonzero), and
+// has a valid DMA d0/d1 split (both ≤ 1023 32-bit words).
 // Returns 0 if no valid chunk size exists.
 int64_t ComputeChunkSize(int64_t num_elements, int64_t max_chunk,
-                          int vector_width) {
+                          int vector_width, int element_bytes) {
   int alignment = std::max(1, vector_width);
   // Round max_chunk down to a multiple of alignment.
   int64_t chunk = (max_chunk / alignment) * alignment;
   while (chunk > 0) {
-    if (num_elements % chunk == 0) return chunk;
+    if (num_elements % chunk == 0) {
+      // Verify this chunk has a valid DMA split.
+      int64_t d0, d1;
+      if (FindDmaSplit(chunk, element_bytes, d0, d1)) return chunk;
+    }
     chunk -= alignment;
   }
   return 0;
@@ -684,43 +718,71 @@ std::string GenerateCoreBody(const LinalgProgramInfo& program,
 //   2. Set up output DMA with issue_token=true (enables completion tracking)
 //   3. dma_wait on the output ObjectFIFO
 //
-// The shim DMA d0 (innermost) dimension is limited to 1023 32-bit words.
-// When chunk_size exceeds this, we split each chunk into sub-transfers
-// using the d1 dimension. Combined with tiling (num_chunks), the 4D
-// addressing is:
+// Shim DMA ND addressing uses 4 dimensions with the following limits
+// (empirically verified against aie-opt from mlir-aie commit 0d03400dca76):
+//
+//   sizes:   [d3,         d2,         d1,        d0        ]
+//   limits:  [1:64]       [no limit]  [0:1023]   [0:1023]
+//
+// d0 and d1 limits are in 32-bit words — verified empirically:
+//   f32[1024] (1024 words) fails when d1 stride is non-zero
+//   bf16[1024] (512 words) passes in same context
+// The verifier only enforces d0/d1 limits when the dimension is active
+// (i.e., its stride is non-zero). Single-transfer cases with stride=0
+// bypass the check.
+//
+// Our 4D addressing pattern:
 //   sizes:   [1, num_chunks, d0_reps, d0_size]
 //   strides: [0, chunk_size, d0_size, 1]
 // Unused strides (for dims with size=1) are set to 0 to satisfy the
 // aie-opt verifier on rank-1 host buffers.
-std::string GenerateNpuSequence(const LinalgProgramInfo& program,
-                                int64_t chunk_size, int64_t num_chunks) {
+//
+// Dimension mapping:
+//   d0 = d0_size: innermost contiguous transfer (≤ 1023 32-bit words)
+//   d1 = d0_reps: sub-chunks within a tile chunk (≤ 1023)
+//   d2 = num_chunks: tile chunks (no practical limit)
+//   d3 = 1: always (limit [1:64])
+absl::StatusOr<std::string> GenerateNpuSequence(
+    const LinalgProgramInfo& program,
+    int64_t chunk_size, int64_t num_chunks,
+    bool use_mem_tile) {
   const std::string& ty = program.storage_type;
   int64_t total_elements = chunk_size * num_chunks;
   // Runtime sequence args use full tensor memref; ObjectFIFOs use chunk memref.
   std::string host_memref_ty =
       absl::StrFormat("memref<%dx%s>", total_elements, ty);
 
-  // Compute element size for DMA d0 limit.
+  // Compute element size for DMA d0/d1 limits.
   int element_bytes = 4;
   if (ty == "bf16" || ty == "f16" || ty == "i16") element_bytes = 2;
   else if (ty == "i8") element_bytes = 1;
 
-  // Shim DMA d0 dimension is limited to 1023 32-bit words.
-  // Split chunk into d0_reps sub-transfers of d0_size elements if needed.
-  int64_t max_d0_elements = static_cast<int64_t>(1023) * 4 / element_bytes;
+  // For single-chunk contiguous transfers (num_chunks==1), all higher strides
+  // are 0, so d0 can be arbitrarily large — the verifier only enforces the
+  // 1023-word limit when the dimension's stride is non-zero.
   int64_t d0_size = chunk_size;
   int64_t d0_reps = 1;
-  if (chunk_size > max_d0_elements) {
-    d0_size = max_d0_elements;
-    while (d0_size > 0 && chunk_size % d0_size != 0) d0_size--;
-    if (d0_size <= 0) d0_size = 1;
-    d0_reps = chunk_size / d0_size;
+  if (num_chunks > 1) {
+    // Tiled case: chunk planning (ComputeChunkSize) already verified a valid
+    // DMA split exists for this chunk_size.
+    bool ok = FindDmaSplit(chunk_size, element_bytes, d0_size, d0_reps);
+    if (!ok) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "No valid DMA split for chunk_size=%d (element_bytes=%d). "
+          "This should have been caught by ComputeChunkSize.",
+          chunk_size, element_bytes));
+    }
   }
 
   // Strides: set to 0 when the corresponding dim has size 1 (unused),
   // to satisfy the aie-opt verifier on rank-1 memrefs.
   int64_t s1 = (d0_reps > 1) ? d0_size : 0;
   int64_t s2 = (num_chunks > 1) ? chunk_size : 0;
+
+  // Metadata names for shim-side ObjectFIFOs.
+  // With mem tile routing, shim connects to @in*_L2 / @out0_L2.
+  std::string l2 = use_mem_tile ? "_L2" : "";
+  std::string out_meta = absl::StrFormat("out0%s", l2);
 
   std::string seq;
 
@@ -744,10 +806,10 @@ std::string GenerateNpuSequence(const LinalgProgramInfo& program,
     absl::StrAppend(&seq, absl::StrFormat(
         "      aiex.npu.dma_memcpy_nd(0, 0, %%arg%d[0, 0, 0, 0]"
         "[1, %d, %d, %d][0, %d, %d, 1]) "
-        "{id = %d : i64, metadata = @in%d} : %s\n",
+        "{id = %d : i64, metadata = @in%d%s} : %s\n",
         i, num_chunks, d0_reps, d0_size,
         s2, s1,
-        i, i, host_memref_ty));
+        i, i, l2, host_memref_ty));
   }
 
   // DMA transfer: output with issue_token for completion tracking.
@@ -756,14 +818,14 @@ std::string GenerateNpuSequence(const LinalgProgramInfo& program,
   absl::StrAppend(&seq, absl::StrFormat(
       "      aiex.npu.dma_memcpy_nd(0, 0, %%arg%d[0, 0, 0, 0]"
       "[1, %d, %d, %d][0, %d, %d, 1]) "
-      "{id = %d : i64, metadata = @out0, issue_token = true} : %s\n",
+      "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
       out_arg, num_chunks, d0_reps, d0_size,
       s2, s1,
-      out_id, host_memref_ty));
+      out_id, out_meta, host_memref_ty));
 
   // Wait for output DMA completion (lowered to npu.sync by aie-dma-to-npu).
-  absl::StrAppend(&seq,
-      "      aiex.npu.dma_wait { symbol = @out0 }\n");
+  absl::StrAppend(&seq, absl::StrFormat(
+      "      aiex.npu.dma_wait { symbol = @%s }\n", out_meta));
 
   absl::StrAppend(&seq, "    }\n");
 
@@ -816,7 +878,7 @@ absl::StatusOr<std::string> LowerLinalgToAie(
     num_chunks = 1;
   } else {
     chunk_size = ComputeChunkSize(program.num_elements, max_chunk,
-                                   vector_width);
+                                   vector_width, element_bytes);
     if (chunk_size <= 0) {
       return absl::InvalidArgumentError(absl::StrFormat(
           "Cannot tile %d elements into L1 (%d bytes). "
@@ -830,17 +892,22 @@ absl::StatusOr<std::string> LowerLinalgToAie(
     num_chunks = program.num_elements / chunk_size;
   }
 
+  bool use_mem_tile = (num_chunks > 1);
   LOG(INFO) << "XDNA AIE lowering: tiling " << program.num_elements
             << " elements into " << num_chunks << " chunk(s) of "
-            << chunk_size << " (L1 budget: " << l1_limit << "B)";
+            << chunk_size << " (L1 budget: " << l1_limit << "B"
+            << (use_mem_tile ? ", mem tile staging" : ", direct") << ")";
 
   // Step 2: Generate AIE dialect MLIR text.
   //
   // Architecture: npu2 (XDNA 2 / Strix Halo / AIE2PS)
   // Layout: single column (col 0)
   //   - Shim tile (0, 0): host DMA interface
-  //   - Mem tile (0, 1): L2 buffer (unused for single-core)
+  //   - Mem tile (0, 1): L2 staging buffer (used when tiling)
   //   - Compute tile (0, 2): runs the kernel
+  //
+  // Data flow (tiled): shim → mem_tile → compute → mem_tile → shim
+  // Data flow (single chunk): shim → compute → shim
 
   std::string aie_mlir;
   const std::string& ty = program.storage_type;
@@ -851,26 +918,64 @@ absl::StatusOr<std::string> LowerLinalgToAie(
   int compute_row = caps.first_compute_row;
   std::string shim_tile = absl::StrFormat("tile_%d_%d", col, shim_row);
   std::string compute_tile = absl::StrFormat("tile_%d_%d", col, compute_row);
+  std::string mem_tile_name = absl::StrFormat("tile_%d_%d", col,
+                                               caps.mem_tile_row);
 
   absl::StrAppend(&aie_mlir, "module {\n");
   absl::StrAppend(&aie_mlir,
       absl::StrFormat("  aie.device(%s) {\n", caps.device_name));
 
-  // Tiles.
+  // Tile declarations.
   absl::StrAppend(&aie_mlir, absl::StrFormat(
       "    %%%s = aie.tile(%d, %d)\n", shim_tile, col, shim_row));
+  if (use_mem_tile) {
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%%s = aie.tile(%d, %d)\n", mem_tile_name, col,
+        caps.mem_tile_row));
+  }
   absl::StrAppend(&aie_mlir, absl::StrFormat(
       "    %%%s = aie.tile(%d, %d)\n", compute_tile, col, compute_row));
 
-  // ObjectFIFOs for data movement: shim → compute.
-  for (int i = 0; i < program.num_inputs; i++) {
+  // ObjectFIFOs for data movement.
+  if (use_mem_tile) {
+    // Route through memory tile (L2 staging) for tiled execution.
+    // L2 ObjectFIFOs: shim ↔ mem tile (buffers in 512KB memory tile).
+    for (int i = 0; i < program.num_inputs; i++) {
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "    aie.objectfifo @in%d_L2(%%%s, {%%%s}, 2 : i32) "
+          ": !aie.objectfifo<%s>\n", i, shim_tile, mem_tile_name, memref_ty));
+    }
     absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "    aie.objectfifo @in%d(%%%s, {%%%s}, 2 : i32) "
-        ": !aie.objectfifo<%s>\n", i, shim_tile, compute_tile, memref_ty));
+        "    aie.objectfifo @out0_L2(%%%s, {%%%s}, 2 : i32) "
+        ": !aie.objectfifo<%s>\n", mem_tile_name, shim_tile, memref_ty));
+    // L1 ObjectFIFOs: mem tile ↔ compute (buffers in compute tile L1).
+    for (int i = 0; i < program.num_inputs; i++) {
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "    aie.objectfifo @in%d(%%%s, {%%%s}, 2 : i32) "
+          ": !aie.objectfifo<%s>\n", i, mem_tile_name, compute_tile,
+          memref_ty));
+    }
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @out0(%%%s, {%%%s}, 2 : i32) "
+        ": !aie.objectfifo<%s>\n", compute_tile, mem_tile_name, memref_ty));
+    // Link L2 ↔ L1 ObjectFIFOs through memory tile.
+    for (int i = 0; i < program.num_inputs; i++) {
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "    aie.objectfifo.link [@in%d_L2] -> [@in%d] ([] [])\n", i, i));
+    }
+    absl::StrAppend(&aie_mlir,
+        "    aie.objectfifo.link [@out0] -> [@out0_L2] ([] [])\n");
+  } else {
+    // Direct shim ↔ compute (no memory tile for single-chunk execution).
+    for (int i = 0; i < program.num_inputs; i++) {
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "    aie.objectfifo @in%d(%%%s, {%%%s}, 2 : i32) "
+          ": !aie.objectfifo<%s>\n", i, shim_tile, compute_tile, memref_ty));
+    }
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @out0(%%%s, {%%%s}, 2 : i32) "
+        ": !aie.objectfifo<%s>\n", compute_tile, shim_tile, memref_ty));
   }
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @out0(%%%s, {%%%s}, 2 : i32) "
-      ": !aie.objectfifo<%s>\n", compute_tile, shim_tile, memref_ty));
 
   // Core body.
   absl::StrAppend(&aie_mlir, absl::StrFormat(
@@ -882,8 +987,10 @@ absl::StatusOr<std::string> LowerLinalgToAie(
       "    }\n");
 
   // NPU instruction sequence.
-  absl::StrAppend(&aie_mlir, GenerateNpuSequence(program, chunk_size,
-                                                   num_chunks));
+  auto npu_seq_or = GenerateNpuSequence(program, chunk_size, num_chunks,
+                                         use_mem_tile);
+  if (!npu_seq_or.ok()) return npu_seq_or.status();
+  absl::StrAppend(&aie_mlir, *npu_seq_or);
 
   absl::StrAppend(&aie_mlir, "  }\n");
   absl::StrAppend(&aie_mlir, "}\n");
