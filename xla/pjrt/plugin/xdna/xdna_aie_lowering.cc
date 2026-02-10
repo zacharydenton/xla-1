@@ -249,14 +249,30 @@ std::string GenerateCoreBody(const LinalgOpInfo& info, int64_t chunk_size) {
       "      scf.for %%i = %%c0 to %%c%d step %%c1 {\n", chunk_size));
 
   // Load, compute, store.
+  //
+  // For f32 multiply: AIE2p has native bf16 multiply (vmul.f) but no f32
+  // multiply instruction. Peano's legalizer has custom scalar bf16 fmul
+  // (insert→vmul→extract) but falls back to __mulsf3 libcall for f32.
+  // We truncate f32→bf16 before multiply and extend bf16→f32 after.
+  bool needs_bf16_cast =
+      (info.kernel_op == "arith.mulf" && info.element_type == "f32");
+
   absl::StrAppend(&body,
       "        %val_in0 = memref.load %elem_in0[%i] : ", memref_ty, "\n");
   if (info.num_inputs == 2) {
     absl::StrAppend(&body,
         "        %val_in1 = memref.load %elem_in1[%i] : ", memref_ty, "\n");
-    absl::StrAppend(&body,
-        "        %val_out = ", info.kernel_op,
-        " %val_in0, %val_in1 : ", ty, "\n");
+    if (needs_bf16_cast) {
+      absl::StrAppend(&body,
+          "        %bf16_in0 = arith.truncf %val_in0 : f32 to bf16\n"
+          "        %bf16_in1 = arith.truncf %val_in1 : f32 to bf16\n"
+          "        %bf16_out = arith.mulf %bf16_in0, %bf16_in1 : bf16\n"
+          "        %val_out = arith.extf %bf16_out : bf16 to f32\n");
+    } else {
+      absl::StrAppend(&body,
+          "        %val_out = ", info.kernel_op,
+          " %val_in0, %val_in1 : ", ty, "\n");
+    }
   } else {
     absl::StrAppend(&body,
         "        %val_out = ", info.kernel_op,
