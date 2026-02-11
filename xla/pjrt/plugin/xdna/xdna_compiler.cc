@@ -17,9 +17,11 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "absl/log/log.h"
@@ -96,6 +98,13 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
 
   LOG(INFO) << "XDNA compiler: linalg → AIE lowering succeeded ("
             << lowering.num_cores << " core(s)).";
+  // Write to stderr directly so subprocess tests can observe core count.
+  {
+    char buf[80];
+    int n = snprintf(buf, sizeof(buf), "XDNA: using %d core(s)\n",
+                     lowering.num_cores);
+    (void)write(STDERR_FILENO, buf, n);
+  }
 
   // Compute number of data buffer args: inputs + outputs.
   int num_inputs = hlo_module->entry_computation()->num_parameters();

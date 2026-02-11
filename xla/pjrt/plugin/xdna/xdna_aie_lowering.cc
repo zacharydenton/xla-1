@@ -131,6 +131,17 @@ struct LinalgProgramInfo {
   }
 };
 
+// Matmul program description for AIE lowering.
+struct MatmulProgramInfo {
+  int64_t M, K, N;
+  std::string element_type;  // "f32" or "bf16"
+};
+
+// Matmul tile sizes for L1 tiling.
+struct MatmulTileConfig {
+  int64_t m, k, n;  // tile dimensions
+};
+
 // Returns true if the given op name is a supported body op for DAG analysis.
 bool IsSupportedBodyOp(llvm::StringRef name) {
   return name == "arith.addf" || name == "arith.subf" || name == "arith.mulf" ||
@@ -251,6 +262,66 @@ std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
 
   return program;
 }
+
+// Selects matmul tile sizes (m, k, n) that fit in L1 memory.
+//
+// L1 budget with depth-2 ObjectFIFOs (ping-pong):
+//   bf16: 4*(m*k + k*n + 2*m*n) bytes  (A,B bf16 FIFOs + C bf16 FIFO + f32 acc)
+//   f32:  8*(m*k + k*n + m*n)   bytes  (A,B,C f32 FIFOs, accumulate in C)
+absl::StatusOr<MatmulTileConfig> SelectMatmulTiles(
+    const MatmulProgramInfo& info, const TargetCaps& caps) {
+  int64_t l1_limit = caps.l1_usable_bytes;
+  const char* limit_env = std::getenv("XDNA_L1_LIMIT_BYTES");
+  if (limit_env) l1_limit = std::atol(limit_env);
+
+  bool is_bf16 = (info.element_type == "bf16");
+
+  // Tile candidates: try largest first.
+  // Peano's VLIW scheduler (Jan 2025) has a bug at opt O2, but we use
+  // opt O0 + llc O2 to avoid it. Larger tiles reduce DMA command count
+  // (limited by BD slots, ~16 per channel).
+  // k is capped at 4 to keep the innermost MAC loop small enough for
+  // Peano's instruction scheduler even at O0.
+  static constexpr int64_t kMNCandidates[] = {64, 48, 32, 16, 8, 4};
+  static constexpr int64_t kKCandidates[] = {4};
+
+  auto fits_l1 = [&](int64_t m, int64_t k, int64_t n) -> bool {
+    int64_t bytes;
+    if (is_bf16) {
+      // A(bf16) + B(bf16) + C(bf16) FIFOs each depth 2 = 4*elem_count*2
+      // Plus f32 accumulator buffer (not a FIFO, single copy) = 4*m*n
+      bytes = 4 * (m * k + k * n + m * n) + 4 * m * n;
+    } else {
+      // A,B,C f32 FIFOs each depth 2 = 4*elem_count*2 = 8*elem_count
+      bytes = 8 * (m * k + k * n + m * n);
+    }
+    return bytes <= l1_limit;
+  };
+
+  // Try all combinations (largest first for m and n, k capped separately).
+  for (int64_t m : kMNCandidates) {
+    if (info.M % m != 0) continue;
+    for (int64_t k : kKCandidates) {
+      if (info.K % k != 0) continue;
+      for (int64_t n : kMNCandidates) {
+        if (info.N % n != 0) continue;
+        if (info.N / n > 64) continue;  // DMA d3 limit
+        if (fits_l1(m, k, n)) {
+          return MatmulTileConfig{m, k, n};
+        }
+      }
+    }
+  }
+
+  return absl::InvalidArgumentError(absl::StrFormat(
+      "Cannot tile matmul [%d,%d]@[%d,%d] %s into L1 (%d bytes). "
+      "No valid (m,k,n) tile found from candidates {64,48,32,16,8,4}.",
+      info.M, info.K, info.K, info.N, info.element_type, l1_limit));
+}
+
+// Forward declaration.
+absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
+    const MatmulProgramInfo& info, const TargetCaps& caps);
 
 // Analyzes the linalg module to extract program info.
 absl::StatusOr<LinalgProgramInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
@@ -863,6 +934,429 @@ absl::StatusOr<std::string> GenerateNpuSequence(
   return seq;
 }
 
+// Generates the matmul core body for AIE dialect.
+// Pattern: for each output tile (M/m * N/n iterations):
+//   acquire C → zero accumulator → for kt in K/k: acquire A,B → MAC → release
+//   → [bf16: truncate acc→C] → release C
+std::string GenerateMatmulCoreBody(
+    const MatmulProgramInfo& info, const MatmulTileConfig& tile) {
+  std::string body;
+  const std::string& ty = info.element_type;
+  bool is_bf16 = (ty == "bf16");
+
+  int64_t Mt = info.M / tile.m;
+  int64_t Nt = info.N / tile.n;
+  int64_t Kt = info.K / tile.k;
+
+  std::string a_memref = absl::StrFormat("memref<%dx%dx%s>", tile.m, tile.k, ty);
+  std::string b_memref = absl::StrFormat("memref<%dx%dx%s>", tile.k, tile.n, ty);
+  std::string c_memref = absl::StrFormat("memref<%dx%dx%s>", tile.m, tile.n, ty);
+  std::string acc_memref = absl::StrFormat("memref<%dx%dxf32>", tile.m, tile.n);
+
+  // Constants.
+  absl::StrAppend(&body,
+      "      %c0 = arith.constant 0 : index\n"
+      "      %c1 = arith.constant 1 : index\n");
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%cm = arith.constant %d : index\n", tile.m));
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%cn = arith.constant %d : index\n", tile.n));
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%ck = arith.constant %d : index\n", tile.k));
+  if (is_bf16) {
+    absl::StrAppend(&body,
+        "      %zero_f32 = arith.constant 0.0 : f32\n");
+  } else {
+    absl::StrAppend(&body, absl::StrFormat(
+        "      %%zero_%s = arith.constant 0.0 : %s\n", ty, ty));
+  }
+
+  int64_t total_out_tiles = Mt * Nt;
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%n_out_tiles = arith.constant %d : index\n", total_out_tiles));
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%n_k_tiles = arith.constant %d : index\n", Kt));
+
+  // Outer loop over output tiles.
+  absl::StrAppend(&body,
+      "      scf.for %ot = %c0 to %n_out_tiles step %c1 {\n");
+
+  // Acquire C (Produce).
+  absl::StrAppend(&body, absl::StrFormat(
+      "        %%subview_c = aie.objectfifo.acquire @outC(Produce, 1) "
+      ": !aie.objectfifosubview<%s>\n", c_memref));
+  absl::StrAppend(&body, absl::StrFormat(
+      "        %%elem_c = aie.objectfifo.subview.access %%subview_c[0] "
+      ": !aie.objectfifosubview<%s> -> %s\n", c_memref, c_memref));
+
+  // Zero the accumulator.
+  if (is_bf16) {
+    // Zero the f32 accumulator buffer.
+    absl::StrAppend(&body,
+        "        scf.for %zi = %c0 to %cm step %c1 {\n"
+        "          scf.for %zj = %c0 to %cn step %c1 {\n");
+    absl::StrAppend(&body, absl::StrFormat(
+        "            memref.store %%zero_f32, %%acc[%%zi, %%zj] : %s\n",
+        acc_memref));
+    absl::StrAppend(&body,
+        "          }\n"
+        "        }\n");
+  } else {
+    // Zero the C buffer directly.
+    absl::StrAppend(&body,
+        "        scf.for %zi = %c0 to %cm step %c1 {\n"
+        "          scf.for %zj = %c0 to %cn step %c1 {\n");
+    absl::StrAppend(&body, absl::StrFormat(
+        "            memref.store %%zero_%s, %%elem_c[%%zi, %%zj] : %s\n",
+        ty, c_memref));
+    absl::StrAppend(&body,
+        "          }\n"
+        "        }\n");
+  }
+
+  // K-tile loop.
+  absl::StrAppend(&body,
+      "        scf.for %kt = %c0 to %n_k_tiles step %c1 {\n");
+
+  // Acquire A and B (Consume).
+  absl::StrAppend(&body, absl::StrFormat(
+      "          %%subview_a = aie.objectfifo.acquire @inA(Consume, 1) "
+      ": !aie.objectfifosubview<%s>\n", a_memref));
+  absl::StrAppend(&body, absl::StrFormat(
+      "          %%elem_a = aie.objectfifo.subview.access %%subview_a[0] "
+      ": !aie.objectfifosubview<%s> -> %s\n", a_memref, a_memref));
+  absl::StrAppend(&body, absl::StrFormat(
+      "          %%subview_b = aie.objectfifo.acquire @inB(Consume, 1) "
+      ": !aie.objectfifosubview<%s>\n", b_memref));
+  absl::StrAppend(&body, absl::StrFormat(
+      "          %%elem_b = aie.objectfifo.subview.access %%subview_b[0] "
+      ": !aie.objectfifosubview<%s> -> %s\n", b_memref, b_memref));
+
+  // Triple nested MAC loop.
+  absl::StrAppend(&body,
+      "          scf.for %i = %c0 to %cm step %c1 {\n"
+      "            scf.for %j = %c0 to %cn step %c1 {\n"
+      "              scf.for %p = %c0 to %ck step %c1 {\n");
+
+  if (is_bf16) {
+    // bf16: native multiply, f32 accumulator.
+    absl::StrAppend(&body, absl::StrFormat(
+        "                %%a_val = memref.load %%elem_a[%%i, %%p] : %s\n",
+        a_memref));
+    absl::StrAppend(&body, absl::StrFormat(
+        "                %%b_val = memref.load %%elem_b[%%p, %%j] : %s\n",
+        b_memref));
+    absl::StrAppend(&body,
+        "                %prod_bf = arith.mulf %a_val, %b_val : bf16\n"
+        "                %prod_f32 = arith.extf %prod_bf : bf16 to f32\n");
+    absl::StrAppend(&body, absl::StrFormat(
+        "                %%c_old = memref.load %%acc[%%i, %%j] : %s\n",
+        acc_memref));
+    absl::StrAppend(&body,
+        "                %c_new = arith.addf %c_old, %prod_f32 : f32\n");
+    absl::StrAppend(&body, absl::StrFormat(
+        "                memref.store %%c_new, %%acc[%%i, %%j] : %s\n",
+        acc_memref));
+  } else {
+    // f32: truncate→bf16 multiply→extend workaround, accumulate in C.
+    absl::StrAppend(&body, absl::StrFormat(
+        "                %%a_val = memref.load %%elem_a[%%i, %%p] : %s\n",
+        a_memref));
+    absl::StrAppend(&body, absl::StrFormat(
+        "                %%b_val = memref.load %%elem_b[%%p, %%j] : %s\n",
+        b_memref));
+    absl::StrAppend(&body,
+        "                %a_bf = arith.truncf %a_val : f32 to bf16\n"
+        "                %b_bf = arith.truncf %b_val : f32 to bf16\n"
+        "                %prod_bf = arith.mulf %a_bf, %b_bf : bf16\n"
+        "                %prod_f32 = arith.extf %prod_bf : bf16 to f32\n");
+    absl::StrAppend(&body, absl::StrFormat(
+        "                %%c_old = memref.load %%elem_c[%%i, %%j] : %s\n",
+        c_memref));
+    absl::StrAppend(&body,
+        "                %c_new = arith.addf %c_old, %prod_f32 : f32\n");
+    absl::StrAppend(&body, absl::StrFormat(
+        "                memref.store %%c_new, %%elem_c[%%i, %%j] : %s\n",
+        c_memref));
+  }
+
+  // Close triple loop.
+  absl::StrAppend(&body,
+      "              }\n"
+      "            }\n"
+      "          }\n");
+
+  // Release A and B.
+  absl::StrAppend(&body,
+      "          aie.objectfifo.release @inA(Consume, 1)\n"
+      "          aie.objectfifo.release @inB(Consume, 1)\n");
+
+  // Close K-tile loop.
+  absl::StrAppend(&body,
+      "        }\n");
+
+  // bf16: truncate f32 accumulator → bf16 into C buffer.
+  if (is_bf16) {
+    absl::StrAppend(&body,
+        "        scf.for %ci = %c0 to %cm step %c1 {\n"
+        "          scf.for %cj = %c0 to %cn step %c1 {\n");
+    absl::StrAppend(&body, absl::StrFormat(
+        "            %%acc_val = memref.load %%acc[%%ci, %%cj] : %s\n",
+        acc_memref));
+    absl::StrAppend(&body,
+        "            %acc_bf = arith.truncf %acc_val : f32 to bf16\n");
+    absl::StrAppend(&body, absl::StrFormat(
+        "            memref.store %%acc_bf, %%elem_c[%%ci, %%cj] : %s\n",
+        c_memref));
+    absl::StrAppend(&body,
+        "          }\n"
+        "        }\n");
+  }
+
+  // Release C.
+  absl::StrAppend(&body,
+      "        aie.objectfifo.release @outC(Produce, 1)\n");
+
+  // Close output tile loop.
+  absl::StrAppend(&body,
+      "      }\n");
+
+  return body;
+}
+
+// Generates the NPU DMA sequence for matmul.
+//
+// Data layout: A[M,K] row-major, B[K,N] row-major, C[M,N] row-major.
+// Host memrefs are 1D (flat). We unroll the M-tile loop, emitting one DMA
+// command block per mt value. Within each block, 4D addressing covers
+// N-tiles and K-chunks.
+//
+// Core consumes tiles in order: for each output tile (mt, nt):
+//   for kt in K/k: A[mt*m..mt*m+m, kt*k..kt*k+k], B[kt*k..kt*k+k, nt*n..nt*n+n]
+//   then produces C[mt*m..mt*m+m, nt*n..nt*n+n]
+//
+// So the total order of tile consumption is:
+//   for mt in M/m:
+//     for nt in N/n:
+//       for kt in K/k: one A tile, one B tile
+//     one C tile
+//
+// DMA must deliver tiles in exactly this order.
+absl::StatusOr<std::string> GenerateMatmulNpuSequence(
+    const MatmulProgramInfo& info, const MatmulTileConfig& tile,
+    const TargetCaps& caps) {
+  const std::string& ty = info.element_type;
+  int64_t Mt = info.M / tile.m;
+  int64_t Nt = info.N / tile.n;
+  int64_t Kt = info.K / tile.k;
+
+  int element_bytes = (ty == "bf16") ? 2 : 4;
+
+  std::string a_host_memref = absl::StrFormat("memref<%dx%s>",
+      info.M * info.K, ty);
+  std::string b_host_memref = absl::StrFormat("memref<%dx%s>",
+      info.K * info.N, ty);
+  std::string c_host_memref = absl::StrFormat("memref<%dx%s>",
+      info.M * info.N, ty);
+
+  std::string seq;
+  absl::StrAppend(&seq, absl::StrFormat(
+      "    aiex.runtime_sequence(%%arg0: %s, %%arg1: %s, %%arg2: %s) {\n",
+      a_host_memref, b_host_memref, c_host_memref));
+
+  int dma_id = 0;
+
+  for (int64_t mt = 0; mt < Mt; mt++) {
+    // For this mt row, the core will process N/n output columns.
+    // For each (mt, nt) pair, it needs K/k A tiles and K/k B tiles.
+    //
+    // A tiles needed: for each nt in [0, Nt), for each kt in [0, Kt):
+    //   A[mt*m:(mt+1)*m, kt*k:(kt+1)*k]
+    //   Since A doesn't depend on nt, we need Nt repetitions of the
+    //   same K/k A tiles.
+    //
+    // 4D DMA for A: [Nt, Kt, m, k] with strides [0, k, K, 1]
+    //   d3=Nt: repeat for each N-tile (stride 0 = broadcast)
+    //   d2=Kt: iterate over K-tiles (stride k elements)
+    //   d1=m: rows of tile (stride K = row stride in A)
+    //   d0=k: elements per row (stride 1)
+    int64_t a_offset = mt * tile.m * info.K;
+    // Check DMA limits: d0 and d1 are in 32-bit words, max 1023.
+    int64_t a_d0_words = tile.k * element_bytes / 4;
+    int64_t a_d1 = tile.m;
+    if (a_d0_words > kMaxBdWords || a_d1 > kMaxBdWords) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Matmul A DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
+          a_d0_words, a_d1));
+    }
+    absl::StrAppend(&seq, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(0, 0, %%arg0"
+        "[0, 0, 0, %d][%d, %d, %d, %d][0, %d, %d, 1]) "
+        "{id = %d : i64, metadata = @inA_L2} : %s\n",
+        a_offset,
+        Nt, Kt, tile.m, tile.k,
+        tile.k, info.K,
+        dma_id++, a_host_memref));
+
+    // B tiles needed: for each nt in [0, Nt), for each kt in [0, Kt):
+    //   B[kt*k:(kt+1)*k, nt*n:(nt+1)*n]
+    //
+    // 4D DMA for B: [Nt, Kt, k, n] with strides [n, k*N, N, 1]
+    //   d3=Nt: iterate over N-tiles (stride n)
+    //   d2=Kt: iterate over K-tiles (stride k*N)
+    //   d1=k: rows of tile (stride N = row stride in B)
+    //   d0=n: elements per row (stride 1)
+    int64_t b_d0_words = tile.n * element_bytes / 4;
+    int64_t b_d1 = tile.k;
+    if (b_d0_words > kMaxBdWords || b_d1 > kMaxBdWords) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Matmul B DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
+          b_d0_words, b_d1));
+    }
+    if (Nt > 64) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Matmul B DMA d3=%d exceeds limit 64", Nt));
+    }
+    absl::StrAppend(&seq, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(0, 0, %%arg1"
+        "[0, 0, 0, 0][%d, %d, %d, %d][%d, %d, %d, 1]) "
+        "{id = %d : i64, metadata = @inB_L2} : %s\n",
+        Nt, Kt, tile.k, tile.n,
+        tile.n, tile.k * info.N, info.N,
+        dma_id++, b_host_memref));
+
+    // C tiles: for each nt in [0, Nt):
+    //   C[mt*m:(mt+1)*m, nt*n:(nt+1)*n]
+    //
+    // 4D DMA for C: [1, Nt, m, n] with strides [0, n, N, 1]
+    int64_t c_offset = mt * tile.m * info.N;
+    int64_t c_d0_words = tile.n * element_bytes / 4;
+    int64_t c_d1 = tile.m;
+    if (c_d0_words > kMaxBdWords || c_d1 > kMaxBdWords) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Matmul C DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
+          c_d0_words, c_d1));
+    }
+    // Add issue_token on EVERY C DMA (not just last) and dma_wait after
+    // each mt block. This serializes mt blocks so the instruction processor
+    // doesn't submit the next mt's BDs before the current mt's BDs finish.
+    // Without this, later BDs on the same channel can interfere with
+    // in-progress BDs when the ObjectFIFO backpressure delays completion.
+    absl::StrAppend(&seq, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(0, 0, %%arg2"
+        "[0, 0, 0, %d][1, %d, %d, %d][0, %d, %d, 1]) "
+        "{id = %d : i64, metadata = @outC_L2, issue_token = true} : %s\n",
+        c_offset,
+        Nt, tile.m, tile.n,
+        tile.n, info.N,
+        dma_id++, c_host_memref));
+    absl::StrAppend(&seq,
+        "      aiex.npu.dma_wait { symbol = @outC_L2 }\n");
+  }
+  absl::StrAppend(&seq, "    }\n");
+
+  return seq;
+}
+
+// Lowers a matmul to AIE dialect MLIR (single-core, scalar kernel).
+absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
+    const MatmulProgramInfo& info, const TargetCaps& caps) {
+  // Select tile sizes.
+  auto tile_or = SelectMatmulTiles(info, caps);
+  if (!tile_or.ok()) return tile_or.status();
+  MatmulTileConfig tile = *tile_or;
+
+  LOG(INFO) << "XDNA matmul lowering: tiles m=" << tile.m << " k=" << tile.k
+            << " n=" << tile.n << " (M=" << info.M << " K=" << info.K
+            << " N=" << info.N << " " << info.element_type << ")";
+
+  bool is_bf16 = (info.element_type == "bf16");
+  const std::string& ty = info.element_type;
+  int start_col = caps.partition_start_column;
+  int shim_row = caps.shim_row;
+  int compute_row = caps.first_compute_row;
+
+  std::string a_memref = absl::StrFormat("memref<%dx%dx%s>", tile.m, tile.k, ty);
+  std::string b_memref = absl::StrFormat("memref<%dx%dx%s>", tile.k, tile.n, ty);
+  std::string c_memref = absl::StrFormat("memref<%dx%dx%s>", tile.m, tile.n, ty);
+
+  std::string aie_mlir;
+  absl::StrAppend(&aie_mlir, "module {\n");
+  absl::StrAppend(&aie_mlir,
+      absl::StrFormat("  aie.device(%s) {\n", caps.device_name));
+
+  // Tile declarations.
+  int col = start_col;
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, shim_row, col, shim_row));
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, caps.mem_tile_row,
+      col, caps.mem_tile_row));
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, compute_row,
+      col, compute_row));
+
+  std::string shim_tile = absl::StrFormat("tile_%d_%d", col, shim_row);
+  std::string mem_tile = absl::StrFormat("tile_%d_%d", col, caps.mem_tile_row);
+  std::string compute_tile = absl::StrFormat("tile_%d_%d", col, compute_row);
+
+  // ObjectFIFOs: shim ↔ mem tile (L2).
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.objectfifo @inA_L2(%%%s, {%%%s}, 2 : i32) "
+      ": !aie.objectfifo<%s>\n", shim_tile, mem_tile, a_memref));
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.objectfifo @inB_L2(%%%s, {%%%s}, 2 : i32) "
+      ": !aie.objectfifo<%s>\n", shim_tile, mem_tile, b_memref));
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.objectfifo @outC_L2(%%%s, {%%%s}, 2 : i32) "
+      ": !aie.objectfifo<%s>\n", mem_tile, shim_tile, c_memref));
+
+  // ObjectFIFOs: mem tile ↔ compute (L1).
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.objectfifo @inA(%%%s, {%%%s}, 2 : i32) "
+      ": !aie.objectfifo<%s>\n", mem_tile, compute_tile, a_memref));
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.objectfifo @inB(%%%s, {%%%s}, 2 : i32) "
+      ": !aie.objectfifo<%s>\n", mem_tile, compute_tile, b_memref));
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.objectfifo @outC(%%%s, {%%%s}, 2 : i32) "
+      ": !aie.objectfifo<%s>\n", compute_tile, mem_tile, c_memref));
+
+  // Links through memory tile.
+  absl::StrAppend(&aie_mlir,
+      "    aie.objectfifo.link [@inA_L2] -> [@inA] ([] [])\n"
+      "    aie.objectfifo.link [@inB_L2] -> [@inB] ([] [])\n"
+      "    aie.objectfifo.link [@outC] -> [@outC_L2] ([] [])\n");
+
+  // Local accumulator buffer (bf16 only).
+  if (is_bf16) {
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%acc = aie.buffer(%%%s) {sym_name = \"acc\"} "
+        ": memref<%dx%dxf32>\n", compute_tile, tile.m, tile.n));
+  }
+
+  // Core body.
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    %%core_%d_%d = aie.core(%%%s) {\n", col, compute_row,
+      compute_tile));
+  absl::StrAppend(&aie_mlir, GenerateMatmulCoreBody(info, tile));
+  absl::StrAppend(&aie_mlir,
+      "      aie.end\n"
+      "    }\n");
+
+  // NPU DMA sequence.
+  auto npu_seq_or = GenerateMatmulNpuSequence(info, tile, caps);
+  if (!npu_seq_or.ok()) return npu_seq_or.status();
+  absl::StrAppend(&aie_mlir, *npu_seq_or);
+
+  absl::StrAppend(&aie_mlir, "  }\n");
+  absl::StrAppend(&aie_mlir, "}\n");
+
+  LOG(INFO) << "XDNA matmul lowering: generated AIE MLIR:\n" << aie_mlir;
+
+  return AieLoweringResult{aie_mlir, /*num_cores=*/1};
+}
+
 }  // namespace
 
 // Returns the byte size of a single element for the given type string.
@@ -874,10 +1368,107 @@ int GetElementBytes(const std::string& element_type) {
   return 4;  // default
 }
 
+// Detects a matmul program in the module: linalg.fill + linalg.matmul.
+// Returns MatmulProgramInfo if found, nullopt otherwise.
+std::optional<MatmulProgramInfo> DetectMatmul(mlir::ModuleOp module) {
+  mlir::func::FuncOp entry_func;
+  module.walk([&](mlir::func::FuncOp func) {
+    if (func.getName() == "main" || !entry_func) entry_func = func;
+  });
+  if (!entry_func) return std::nullopt;
+
+  // Count linalg ops: we accept exactly {fill, matmul} or just {matmul}.
+  int fill_count = 0;
+  int matmul_count = 0;
+  int other_linalg_count = 0;
+  mlir::Operation* matmul_op = nullptr;
+  mlir::Operation* fill_op = nullptr;
+
+  entry_func.walk([&](mlir::Operation* op) {
+    llvm::StringRef name = op->getName().getStringRef();
+    if (!name.starts_with("linalg.")) return;
+    if (name == "linalg.yield") return;  // Skip terminators inside linalg regions.
+    if (name == "linalg.fill") {
+      fill_count++;
+      fill_op = op;
+    } else if (name == "linalg.matmul") {
+      matmul_count++;
+      matmul_op = op;
+    } else {
+      other_linalg_count++;
+    }
+  });
+
+  if (matmul_count != 1 || other_linalg_count != 0) return std::nullopt;
+  if (fill_count > 1) return std::nullopt;  // At most one fill
+
+  // Validate fill value is zero — our lowering unconditionally zeroes the
+  // accumulator, so a non-zero fill would be silently dropped.
+  if (fill_count == 1 && fill_op) {
+    // linalg.fill: operand 0 is the scalar fill value (DPS input).
+    mlir::Value fill_val = fill_op->getOperand(0);
+    auto* def_op = fill_val.getDefiningOp();
+    bool is_zero = false;
+    if (def_op && def_op->getName().getStringRef() == "arith.constant") {
+      if (auto fa = mlir::dyn_cast_or_null<mlir::FloatAttr>(
+              def_op->getAttr("value"))) {
+        is_zero = fa.getValue().isZero();
+      } else if (auto ia = mlir::dyn_cast_or_null<mlir::IntegerAttr>(
+                     def_op->getAttr("value"))) {
+        is_zero = ia.getValue().isZero();
+      }
+    }
+    if (!is_zero) {
+      LOG(INFO) << "XDNA: linalg.fill value is not zero, cannot lower matmul "
+                << "(non-zero init not supported)";
+      return std::nullopt;
+    }
+  }
+
+  // Extract M, K, N from matmul operand shapes.
+  // linalg.matmul ins(%A : tensor<MxKxTy>, %B : tensor<KxNxTy>)
+  //               outs(%C : tensor<MxNxTy>)
+  if (matmul_op->getNumOperands() < 3) return std::nullopt;
+
+  auto a_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      matmul_op->getOperand(0).getType());
+  auto b_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      matmul_op->getOperand(1).getType());
+  if (!a_type || !b_type) return std::nullopt;
+  if (a_type.getRank() != 2 || b_type.getRank() != 2) return std::nullopt;
+
+  std::string elem_type = GetElementTypeStr(a_type.getElementType());
+  // V1: only f32 and bf16.
+  if (elem_type != "f32" && elem_type != "bf16") return std::nullopt;
+
+  int64_t M = a_type.getShape()[0];
+  int64_t K = a_type.getShape()[1];
+  int64_t N = b_type.getShape()[1];
+
+  // Sanity: B's first dim should be K.
+  if (b_type.getShape()[0] != K) return std::nullopt;
+
+  MatmulProgramInfo info;
+  info.M = M;
+  info.K = K;
+  info.N = N;
+  info.element_type = elem_type;
+  return info;
+}
+
 absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
     mlir::ModuleOp linalg_module, const AieLoweringConfig& config,
     const TargetCaps& caps) {
-  // Step 1: Analyze the linalg module.
+  // Check for matmul before elementwise analysis.
+  auto matmul_info = DetectMatmul(linalg_module);
+  if (matmul_info.has_value()) {
+    LOG(INFO) << "XDNA AIE lowering: detected matmul [" << matmul_info->M
+              << "," << matmul_info->K << "]@[" << matmul_info->K << ","
+              << matmul_info->N << "] " << matmul_info->element_type;
+    return LowerMatmulToAieInternal(*matmul_info, caps);
+  }
+
+  // Step 1: Analyze the linalg module (elementwise path).
   auto program_result = AnalyzeLinalgModule(linalg_module);
   if (!program_result.ok()) return program_result.status();
   LinalgProgramInfo program = std::move(*program_result);

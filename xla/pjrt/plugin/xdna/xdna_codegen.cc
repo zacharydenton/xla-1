@@ -484,7 +484,7 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     std::string core_opt_ll = absl::StrFormat("%s/%s.opt.ll", workdir, core);
     TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
         peano_opt,
-        " '--passes=default<O2>,strip'"
+        " '--passes=default<O0>,strip'"
         " -vectorize-slp=false"
         " -vectorize-loops=false"
         " -unroll-threshold=0"

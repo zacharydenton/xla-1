@@ -332,7 +332,80 @@ def test_multicore_override_1():
         f"Override subprocess failed:\nstdout: {result.stdout}\n"
         f"stderr: {result.stderr[-500:]}"
     )
+    assert 'using 1 core(s)' in result.stderr, (
+        f"Expected 'using 1 core(s)' in compiler log but got:\n"
+        f"{result.stderr[-500:]}"
+    )
     assert "override OK" in result.stdout
+
+
+def test_matmul_f32_identity():
+    """Matmul: f32 [4,4] @ [4,4] identity matrix passthrough."""
+    a = np.array([[1, 2, 3, 4],
+                  [5, 6, 7, 8],
+                  [9, 10, 11, 12],
+                  [13, 14, 15, 16]], dtype=np.float32)
+    b = np.eye(4, dtype=np.float32)
+    result = jax.jit(jnp.dot)(a, b)
+    np.testing.assert_allclose(np.array(result), a @ b, atol=0.5)
+
+
+def test_matmul_f32_16x16():
+    """Matmul: f32 [16,16] @ [16,16] — single tile."""
+    rng = np.random.RandomState(42)
+    a = rng.randn(16, 16).astype(np.float32)
+    b = rng.randn(16, 16).astype(np.float32)
+    result = jax.jit(jnp.dot)(a, b)
+    np.testing.assert_allclose(np.array(result), a @ b, atol=0.5)
+
+
+def test_matmul_f32_32x32():
+    """Matmul: f32 [32,32] @ [32,32]."""
+    rng = np.random.RandomState(43)
+    a = rng.randn(32, 32).astype(np.float32)
+    b = rng.randn(32, 32).astype(np.float32)
+    result = jax.jit(jnp.dot)(a, b)
+    np.testing.assert_allclose(np.array(result), a @ b, atol=0.5)
+
+
+def test_matmul_f32_rect():
+    """Matmul: f32 [8,16] @ [16,4] — rectangular M!=K!=N."""
+    rng = np.random.RandomState(44)
+    a = rng.randn(8, 16).astype(np.float32)
+    b = rng.randn(16, 4).astype(np.float32)
+    result = jax.jit(jnp.dot)(a, b)
+    np.testing.assert_allclose(np.array(result), a @ b, atol=0.5)
+
+
+def test_matmul_f32_64x64():
+    """Matmul: f32 [64,64] @ [64,64] — multi-tile with K-accumulation."""
+    rng = np.random.RandomState(45)
+    a = rng.randn(64, 64).astype(np.float32)
+    b = rng.randn(64, 64).astype(np.float32)
+    result = jax.jit(jnp.dot)(a, b)
+    np.testing.assert_allclose(np.array(result), a @ b, atol=0.5)
+
+
+def test_matmul_bf16_32x32():
+    """Matmul: bf16 [32,32] @ [32,32] — native multiply, f32 accumulation."""
+    import ml_dtypes
+    rng = np.random.RandomState(46)
+    a = rng.randn(32, 32).astype(ml_dtypes.bfloat16)
+    b = rng.randn(32, 32).astype(ml_dtypes.bfloat16)
+    result = jax.jit(jnp.dot)(a, b)
+    expected = a.astype(np.float32) @ b.astype(np.float32)
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, atol=0.5)
+
+
+def test_matmul_bf16_64x64():
+    """Matmul: bf16 [64,64] @ [64,64] — multi-tile bf16."""
+    import ml_dtypes
+    rng = np.random.RandomState(47)
+    a = rng.randn(64, 64).astype(ml_dtypes.bfloat16)
+    b = rng.randn(64, 64).astype(ml_dtypes.bfloat16)
+    result = jax.jit(jnp.dot)(a, b)
+    expected = a.astype(np.float32) @ b.astype(np.float32)
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, atol=0.5)
 
 
 def test_cache_hit():
@@ -386,6 +459,14 @@ def main():
         ("jit(x + y) i16[256]", test_i16_add_256),
         ("jit(x + y) i8[256]", test_i8_add_256),
     ] + _make_tiling_tests() + [
+        ("matmul f32 identity [4,4]@[4,4]", test_matmul_f32_identity),
+        ("matmul f32 [16,16]@[16,16]", test_matmul_f32_16x16),
+        ("matmul f32 [32,32]@[32,32]", test_matmul_f32_32x32),
+        ("matmul f32 rect [8,16]@[16,4]", test_matmul_f32_rect),
+        ("matmul f32 [64,64]@[64,64]", test_matmul_f32_64x64),
+        ("matmul bf16 [32,32]@[32,32]", test_matmul_bf16_32x32),
+        ("matmul bf16 [64,64]@[64,64]", test_matmul_bf16_64x64),
+    ] + [
         ("multicore auto-reduce f32[1006]", test_multicore_auto_reduce),
         ("multicore single fallback f32[7]", test_multicore_single_fallback),
         ("multicore override f32[256]", test_multicore_override_1),
