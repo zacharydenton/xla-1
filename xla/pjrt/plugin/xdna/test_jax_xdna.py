@@ -477,6 +477,27 @@ def test_relu_bf16_256():
     np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
 
 
+def test_relu_f32_nan():
+    """ReLU with NaN: f32[4] — NaN should propagate through max(x, 0).
+    Note: f32 uses integer bitcast comparison. Positive NaN (0x7FC00000)
+    has i32 value > 0, so cmpi sgt returns true → keeps NaN. Correct."""
+    a = np.array([float('nan'), -1.0, 0.0, 1.0], dtype=np.float32)
+    result = jax.jit(jax.nn.relu)(a)
+    result_np = np.array(result)
+    # NaN should be preserved (positive NaN bitcast > 0 in i32).
+    assert np.isnan(result_np[0]), f"Expected NaN at [0], got {result_np[0]}"
+    np.testing.assert_allclose(result_np[1:], [0.0, 0.0, 1.0], rtol=1e-5)
+
+
+def test_relu_f32_1024():
+    """ReLU: f32[1024] — multicore relu (4 cores * 256 elements each)."""
+    rng = np.random.RandomState(101)
+    a = rng.randn(1024).astype(np.float32)
+    result = jax.jit(jax.nn.relu)(a)
+    expected = np.maximum(a, 0.0)
+    np.testing.assert_allclose(np.array(result), expected, rtol=1e-5)
+
+
 def test_cache_hit():
     """Test 8: Second compilation of same HLO hits XDNA cache.
 
@@ -543,6 +564,8 @@ def main():
         ("relu f32[4]", test_relu_f32_4),
         ("relu f32[256]", test_relu_f32_256),
         ("relu bf16[256]", test_relu_bf16_256),
+        ("relu f32 NaN", test_relu_f32_nan),
+        ("relu f32[1024] multicore", test_relu_f32_1024),
     ] + [
         ("multicore auto-reduce f32[1006]", test_multicore_auto_reduce),
         ("multicore single fallback f32[7]", test_multicore_single_fallback),

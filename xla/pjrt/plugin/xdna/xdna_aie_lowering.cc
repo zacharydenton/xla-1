@@ -564,8 +564,12 @@ absl::StatusOr<LinalgProgramInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
 
   // Count all supported linalg ops to detect multi-op programs.
   // Also collect unsupported op names for better error messages.
-  // Walk the entire module (not just entry_func) because XLA may generate
-  // private helper functions (e.g., @relu.1) containing the linalg ops.
+  // Walk the module (not just entry_func) because XLA may generate private
+  // helper functions (e.g., @relu.1) containing linalg ops. The MLIR inliner
+  // may not inline all functions (depends on call graph structure).
+  // Note: if the inliner creates duplicates (inlined copy + dead original),
+  // the original should be deleted by the inliner. If not, we may overcount
+  // but this is handled by the op_count > 1 check producing a clear error.
   int op_count = 0;
   std::vector<std::string> unsupported_ops;
   LinalgProgramInfo program;
@@ -761,6 +765,11 @@ std::string GenerateScalarLoop(const LinalgOpInfo& info,
           rhs_name, cmp_pred, rhs_name));
     } else {
       // bf16/f16: use arith.cmpf (native bf16 comparison on AIE2p).
+      // Use ordered predicates (ogt/olt). NaN propagation is not guaranteed:
+      // if either operand is NaN, ogt/olt returns false, selecting RHS.
+      // This matches JAX's relu behavior (no NaN inputs expected).
+      // TODO: use ugt/ult for proper IEEE 754-2019 maximumf NaN semantics
+      // once we verify Peano supports unordered float compares on AIE2p.
       std::string cmp_pred = is_maxf ? "ogt" : "olt";
       absl::StrAppend(&body, absl::StrFormat(
           "        %%cmp = arith.cmpf %s, %%val_in0, %s : %s\n",
@@ -821,20 +830,27 @@ std::string GenerateVectorLoop(const LinalgOpInfo& info,
         vector_width));
   }
 
-  // For negate, pre-compute the sign-bit mask outside the loop.
+  // Pre-compute constants outside the loop.
   bool is_negate = (info.kernel_op == "arith.negf");
+  bool has_constant = !info.embedded_constant.empty();
   if (is_negate) {
     if (ty == "bf16" || ty == "f16") {
-      // bf16/f16 sign bit is 0x8000 (bit 15), integer type is i16
       absl::StrAppend(&body, absl::StrFormat(
           "      %%sign_mask = arith.constant dense<-32768>"
           " : vector<%dxi16>\n", vector_width));
     } else {
-      // f32 sign bit is 0x80000000 (bit 31), integer type is i32
       absl::StrAppend(&body, absl::StrFormat(
           "      %%sign_mask = arith.constant dense<-2147483648>"
           " : vector<%dxi32>\n", vector_width));
     }
+  }
+  if (has_constant) {
+    // Splat the embedded constant to a vector for the binary op.
+    absl::StrAppend(&body, absl::StrFormat(
+        "      %%scalar_const = arith.constant %s\n", info.embedded_constant));
+    absl::StrAppend(&body, absl::StrFormat(
+        "      %%v_const = vector.broadcast %%scalar_const : %s to %s\n",
+        ty, vec_ty));
   }
 
   absl::StrAppend(&body, absl::StrFormat(
@@ -847,7 +863,6 @@ std::string GenerateVectorLoop(const LinalgOpInfo& info,
 
   if (is_negate) {
     // Negate via bitcast to integer, XOR with sign bit, bitcast back.
-    // This avoids fneg which Peano's GlobalISel cannot legalize on vectors.
     std::string int_ty = (ty == "bf16" || ty == "f16") ? "i16" : "i32";
     std::string int_vec_ty = absl::StrFormat("vector<%dx%s>",
                                               vector_width, int_ty);
@@ -860,6 +875,10 @@ std::string GenerateVectorLoop(const LinalgOpInfo& info,
     absl::StrAppend(&body, absl::StrFormat(
         "        %%vr = arith.bitcast %%vr_int : %s to %s\n",
         int_vec_ty, vec_ty));
+  } else if (has_constant) {
+    // Binary op with one DMA input vector and one splatted constant vector.
+    absl::StrAppend(&body, absl::StrFormat(
+        "        %%vr = %s %%v0, %%v_const : %s\n", info.kernel_op, vec_ty));
   } else if (info.num_inputs == 2) {
     absl::StrAppend(&body, absl::StrFormat(
         "        %%v1 = vector.load %%elem_in1[%%i] : %s, %s\n",
@@ -971,6 +990,7 @@ std::string GenerateMultiOpScalarLoop(mlir::linalg::GenericOp generic,
     } else if (op_name == "arith.maximumf" || op_name == "arith.minimumf" ||
                op_name == "arith.maxsi" || op_name == "arith.minsi") {
       // Max/min ops: use cmpf/cmpi + select to avoid __unordsf2 libcall.
+      // Float: use ordered predicates (ogt/olt). NaN not propagated.
       bool is_float = (op_name == "arith.maximumf" || op_name == "arith.minimumf");
       std::string cmp_op = is_float ? "arith.cmpf" : "arith.cmpi";
       std::string pred = (op_name == "arith.maximumf") ? "ogt"
@@ -2327,10 +2347,28 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
   LOG(INFO) << "XDNA AIE lowering: generated AIE MLIR:\n" << aie_mlir;
 
   // Detect if kernel uses float comparison ops that need soft-float stubs.
+  // This applies to both single-op and multi-op paths: arith.maximumf/minimumf
+  // are lowered to arith.cmpf which requires __gtsf2/__ltsf2 etc. for f32.
+  // Note: f32 single-op uses bitcast comparison (no soft-float needed), but
+  // bf16 single-op uses native cmpf. Multi-op always uses cmpf for float max/min.
   bool needs_softfloat = false;
   if (program.single_op.has_value()) {
     const auto& op = program.single_op->kernel_op;
+    // bf16 cmpf is native; f32 uses bitcast. Only need stubs for bf16 cmpf
+    // which is actually native... so single-op doesn't need stubs at all.
+    // But keep the flag for safety in case other paths emit cmpf for f32.
     needs_softfloat = (op == "arith.maximumf" || op == "arith.minimumf");
+  }
+  if (program.is_multi_op() && program.generic_op) {
+    // Walk multi-op body for float max/min ops that emit arith.cmpf.
+    for (mlir::Operation& body_op :
+         program.generic_op.getRegion().front().without_terminator()) {
+      llvm::StringRef bname = body_op.getName().getStringRef();
+      if (bname == "arith.maximumf" || bname == "arith.minimumf") {
+        needs_softfloat = true;
+        break;
+      }
+    }
   }
 
   return AieLoweringResult{aie_mlir, num_cores, /*use_aievec=*/false,
