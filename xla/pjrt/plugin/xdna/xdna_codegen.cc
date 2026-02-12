@@ -311,7 +311,11 @@ std::string GenerateKernelsJson(const std::string& kernel_name,
 }
 
 std::string GenerateAiePartitionJson(const std::string& pdi_path,
-                                     const TargetCaps& caps) {
+                                     const TargetCaps& caps,
+                                     int num_cores) {
+  // Use actual num_cores for column_width so the partition request matches
+  // the columns allocated by the aie.device(npu2_Ncol) directive.
+  int column_width = num_cores;
   return absl::StrFormat(R"({
   "aie_partition": {
     "name": "QoS",
@@ -338,7 +342,7 @@ std::string GenerateAiePartitionJson(const std::string& pdi_path,
       }
     ]
   }
-})", caps.partition_column_width, caps.partition_start_column, pdi_path);
+})", column_width, caps.partition_start_column, pdi_path);
 }
 
 std::string GenerateDesignBif(const std::string& workdir) {
@@ -1073,7 +1077,7 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       WriteFile(kernels_json, GenerateKernelsJson(kernel_name, num_data_args)));
   TF_RETURN_IF_ERROR(WriteFile(
       aie_partition_json,
-      GenerateAiePartitionJson(design_pdi, caps)));
+      GenerateAiePartitionJson(design_pdi, caps, num_cores)));
 
   std::string final_xclbin = workdir + "/final.xclbin";
   TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(

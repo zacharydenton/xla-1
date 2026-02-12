@@ -46,6 +46,15 @@ struct TargetCaps {
   int partition_start_column = 0;
 };
 
+// Returns the partition-aware device name for a given number of columns.
+// mlir-aie provides npu2_1col through npu2_7col which restrict tile
+// allocation to exact column counts, preventing resource conflicts when
+// other applications share the NPU.
+inline std::string DeviceNameForColumns(int num_columns) {
+  if (num_columns <= 0 || num_columns > 7) return "npu2";
+  return "npu2_" + std::to_string(num_columns) + "col";
+}
+
 // Factory for Strix Point (XDNA 2 / Ryzen AI 300 / AIE2PS).
 inline TargetCaps StrixPointTargetCaps() { return TargetCaps{}; }
 

@@ -1593,7 +1593,8 @@ absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
   std::string aie_mlir;
   absl::StrAppend(&aie_mlir, "module {\n");
   absl::StrAppend(&aie_mlir,
-      absl::StrFormat("  aie.device(%s) {\n", caps.device_name));
+      absl::StrFormat("  aie.device(%s) {\n",
+                      DeviceNameForColumns(num_cores)));
 
   // Pass 1: All tile declarations.
   for (int c = 0; c < num_cores; c++) {
@@ -1917,7 +1918,8 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
 
   absl::StrAppend(&aie_mlir, "module {\n");
   absl::StrAppend(&aie_mlir,
-      absl::StrFormat("  aie.device(%s) {\n", caps.device_name));
+      absl::StrFormat("  aie.device(%s) {\n",
+                      DeviceNameForColumns(num_cores)));
 
   // mlir-aie requires all tile declarations before ObjectFIFOs and cores.
   // Split generation into 3 passes: tiles, ObjectFIFOs, cores.
