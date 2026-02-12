@@ -117,7 +117,8 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
   // Step 4: AIE → xclbin codegen (aie-opt + Peano + bootgen + xclbinutil).
   TF_ASSIGN_OR_RETURN(XdnaCodegenResult result,
                       GenerateXclbinFromAie(lowering.aie_mlir, num_data_args,
-                                            caps, lowering.num_cores));
+                                            caps, lowering.num_cores,
+                                            lowering.use_aievec));
 
   LOG(INFO) << "XDNA compiler: xclbin generated, "
             << result.xclbin_bytes.size() << " bytes.";

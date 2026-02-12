@@ -52,7 +52,7 @@ struct XdnaCodegenResult {
 // `num_cores` is the number of compute columns to compile ELFs for.
 absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     const std::string& aie_mlir, int num_data_args, const TargetCaps& caps,
-    int num_cores);
+    int num_cores, bool use_aievec = false);
 
 }  // namespace xla
 

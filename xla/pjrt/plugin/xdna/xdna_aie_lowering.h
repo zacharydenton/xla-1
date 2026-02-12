@@ -40,6 +40,7 @@ struct AieLoweringConfig {
 struct AieLoweringResult {
   std::string aie_mlir;
   int num_cores;  // Actual columns used (may be < requested).
+  bool use_aievec = false;  // Enable aievec passes for vectorized matmul.
 };
 
 // Lowers a linalg-on-tensors MLIR module to AIE dialect MLIR text.

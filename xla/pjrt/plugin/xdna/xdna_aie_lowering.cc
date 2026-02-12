@@ -276,14 +276,24 @@ absl::StatusOr<MatmulTileConfig> SelectMatmulTiles(
 
   bool is_bf16 = (info.element_type == "bf16");
 
-  // Tile candidates: try largest first.
+  // Tile candidates: try largest first for m; scalar uses all for n.
   // Peano's VLIW scheduler (Jan 2025) has a bug at opt O2, but we use
   // opt O0 + llc O2 to avoid it. Larger tiles reduce DMA command count
   // (limited by BD slots, ~16 per channel).
-  // k is capped at 4 to keep the innermost MAC loop small enough for
-  // Peano's instruction scheduler even at O0.
   static constexpr int64_t kMNCandidates[] = {64, 48, 32, 16, 8, 4};
-  static constexpr int64_t kKCandidates[] = {4};
+  static constexpr int64_t kKCandidatesScalar[] = {4};
+
+  // For bf16 vectorized matmul (hardware MAC 4x8x8):
+  //   k=8 fixed (MAC reduction width),
+  //   m must be multiple of 4 (MAC output rows), prefer large m to
+  //   reduce Mt (DMA blocks), since shim DMA has ~16 BD slots.
+  //   n=8 (MAC output width, one MAC column per tile).
+  //   The inner loop iterates over m in steps of 4, so any m works.
+  static constexpr int64_t kMCandidatesVec[] = {32, 16, 8, 4};
+  static constexpr int64_t kNCandidatesVec[] = {8};
+
+  // Use vectorized path for bf16 when K is divisible by 8.
+  bool use_vectorized = is_bf16 && (info.K % 8 == 0);
 
   auto fits_l1 = [&](int64_t m, int64_t k, int64_t n) -> bool {
     int64_t bytes;
@@ -298,20 +308,47 @@ absl::StatusOr<MatmulTileConfig> SelectMatmulTiles(
     return bytes <= l1_limit;
   };
 
-  // Try all combinations (largest first for m and n, k capped separately).
-  for (int64_t m : kMNCandidates) {
-    if (info.M % m != 0) continue;
-    for (int64_t k : kKCandidates) {
-      if (info.K % k != 0) continue;
-      for (int64_t n : kMNCandidates) {
+  if (use_vectorized) {
+    // Vectorized: m from kMCandidatesVec, n=8, k=8 (fixed MAC width).
+    // The K-tile loop is fully unrolled at the MLIR level to avoid Peano
+    // miscompilation of loops containing BFP MAC intrinsics.
+    static constexpr int64_t kKCandidatesVec[] = {8};
+    for (int64_t m : kMCandidatesVec) {
+      if (info.M % m != 0) continue;
+      for (int64_t n : kNCandidatesVec) {
         if (info.N % n != 0) continue;
         if (info.N / n > 64) continue;  // DMA d3 limit
-        if (fits_l1(m, k, n)) {
-          return MatmulTileConfig{m, k, n};
+        for (int64_t k : kKCandidatesVec) {
+          if (info.K % k != 0) continue;
+          if (fits_l1(m, k, n)) {
+            return MatmulTileConfig{m, k, n};
+          }
         }
       }
     }
+    // Fall back to scalar if vectorized tiles don't fit.
   }
+
+  // Scalar: try all m,n candidates with k=4.
+  auto try_scalar = [&]() -> std::optional<MatmulTileConfig> {
+    for (int64_t m : kMNCandidates) {
+      if (info.M % m != 0) continue;
+      for (int64_t k : kKCandidatesScalar) {
+        if (info.K % k != 0) continue;
+        for (int64_t n : kMNCandidates) {
+          if (info.N % n != 0) continue;
+          if (info.N / n > 64) continue;
+          if (fits_l1(m, k, n)) {
+            return MatmulTileConfig{m, k, n};
+          }
+        }
+      }
+    }
+    return std::nullopt;
+  };
+
+  auto result = try_scalar();
+  if (result.has_value()) return *result;
 
   return absl::InvalidArgumentError(absl::StrFormat(
       "Cannot tile matmul [%d,%d]@[%d,%d] %s into L1 (%d bytes). "
@@ -873,14 +910,14 @@ absl::StatusOr<std::string> GenerateNpuSequence(
   std::string seq;
 
   // Runtime sequence: N inputs + 1 output.
-  // Uses aiex.runtime_sequence (not func.func @sequence) so that
+  // Uses aie.runtime_sequence (not func.func @sequence) so that
   // aie-dma-to-npu can lower the DMA ops to NPU instructions.
   std::vector<std::string> arg_types;
   for (int i = 0; i < program.num_inputs + 1; i++) {
     arg_types.push_back(absl::StrFormat("%%arg%d: %s", i, host_memref_ty));
   }
   absl::StrAppend(&seq, absl::StrFormat(
-      "    aiex.runtime_sequence(%s) {\n",
+      "    aie.runtime_sequence(%s) {\n",
       absl::StrJoin(arg_types, ", ")));
 
   // DMA transfers for each column.
@@ -899,10 +936,10 @@ absl::StatusOr<std::string> GenerateNpuSequence(
       int dma_id = c * (program.num_inputs + 1) + i;
       std::string meta = fifo_name(c, absl::StrFormat("in%d%s", i, l2));
       absl::StrAppend(&seq, absl::StrFormat(
-          "      aiex.npu.dma_memcpy_nd(%d, 0, %%arg%d[0, 0, 0, %d]"
+          "      aiex.npu.dma_memcpy_nd(%%arg%d[0, 0, 0, %d]"
           "[1, %d, %d, %d][0, %d, %d, 1]) "
           "{id = %d : i64, metadata = @%s} : %s\n",
-          col, i, offset,
+          i, offset,
           num_chunks, d0_reps, d0_size,
           s2, s1,
           dma_id, meta, host_memref_ty));
@@ -913,10 +950,10 @@ absl::StatusOr<std::string> GenerateNpuSequence(
     int out_dma_id = c * (program.num_inputs + 1) + program.num_inputs;
     std::string out_meta = fifo_name(c, absl::StrFormat("out0%s", l2));
     absl::StrAppend(&seq, absl::StrFormat(
-        "      aiex.npu.dma_memcpy_nd(%d, 0, %%arg%d[0, 0, 0, %d]"
+        "      aiex.npu.dma_memcpy_nd(%%arg%d[0, 0, 0, %d]"
         "[1, %d, %d, %d][0, %d, %d, 1]) "
         "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
-        col, out_arg, offset,
+        out_arg, offset,
         num_chunks, d0_reps, d0_size,
         s2, s1,
         out_dma_id, out_meta, host_memref_ty));
@@ -932,6 +969,224 @@ absl::StatusOr<std::string> GenerateNpuSequence(
   absl::StrAppend(&seq, "    }\n");
 
   return seq;
+}
+
+// Generates a vectorized matmul core body using hardware MAC intrinsics.
+// Emits aievec.matmul_aie2p directly (4x8x8 shape: A: 4x8 bf16, B: 8x8 bf16,
+// C: 4x8 f32). The 4x8x8 shape naturally fills ACC1024 (32 f32) without
+// padding, matching mlir-aie reference kernels. We emit the aievec op directly
+// rather than vector.contract because --convert-vector-to-aievec also converts
+// vector.transfer_read into broken half-register aievec.upd loads. By emitting
+// aievec.matmul_aie2p ourselves, we only need --convert-aievec-to-llvm (which
+// correctly lowers matmul_aie2p → xllvm intrinsics) while vector.transfer_read
+// /write are handled by --convert-vector-to-llvm.
+// bf16 only — k=8 fixed (MAC width), n=8 (MAC output width).
+// The K-tile loop is kept as scf.for to minimize code size. Each iteration
+// acquires A/B tiles, performs MAC over 4-row blocks, then releases.
+// The objectFifo-stateful-transform pass handles ping-pong buffering.
+std::string GenerateVectorizedMatmulCoreBody(
+    const MatmulProgramInfo& info, const MatmulTileConfig& tile) {
+  std::string body;
+
+  int64_t Mt = info.M / tile.m;
+  int64_t Nt = info.N / tile.n;
+  int64_t Kt = info.K / tile.k;
+
+  // 2D memref types (for ObjectFIFO acquire/release).
+  std::string a_memref = absl::StrFormat("memref<%dx%dxbf16>", tile.m, tile.k);
+  std::string b_memref = absl::StrFormat("memref<%dx%dxbf16>", tile.k, tile.n);
+  std::string c_memref = absl::StrFormat("memref<%dx%dxbf16>", tile.m, tile.n);
+  std::string acc_memref = absl::StrFormat("memref<%dx%dxf32>", tile.m, tile.n);
+
+  // 1D flattened memref types (for vector.transfer_read/write).
+  // convert-vector-to-llvm can't lower 2D transfers; we flatten to 1D.
+  int64_t a_flat_size = tile.m * tile.k;
+  int64_t b_flat_size = tile.k * tile.n;
+  int64_t acc_flat_size = tile.m * tile.n;
+  std::string a_flat = absl::StrFormat("memref<%dxbf16>", a_flat_size);
+  std::string b_flat = absl::StrFormat("memref<%dxbf16>", b_flat_size);
+  std::string acc_flat = absl::StrFormat("memref<%dxf32>", acc_flat_size);
+
+  // Vector types (1D for transfers, 2D for MAC).
+  int64_t mac_m = 4, mac_n = 8, mac_k = 8;
+  int64_t acc_vec_1d = mac_m * mac_n;   // 32
+  int64_t a_vec_1d = mac_m * mac_k;     // 32
+  int64_t b_vec_1d = mac_k * mac_n;     // 64
+
+  // Constants.
+  absl::StrAppend(&body,
+      "      %c0 = arith.constant 0 : index\n"
+      "      %c1 = arith.constant 1 : index\n"
+      "      %c4 = arith.constant 4 : index\n");
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%cm = arith.constant %d : index\n", tile.m));
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%cn = arith.constant %d : index\n", tile.n));
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%ck = arith.constant %d : index\n", tile.k));
+  absl::StrAppend(&body,
+      "      %pad_f32 = arith.constant 0.0 : f32\n"
+      "      %pad_bf16 = arith.constant 0.0 : bf16\n");
+  int64_t total_out_tiles = Mt * Nt;
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%n_out_tiles = arith.constant %d : index\n", total_out_tiles));
+
+  // Flatten accumulator memref to 1D for vector transfers.
+  absl::StrAppend(&body, absl::StrFormat(
+      "      %%flat_acc = memref.collapse_shape %%acc [[0, 1]]"
+      " : %s into %s\n", acc_memref, acc_flat));
+
+  // Outer loop over output tiles.
+  absl::StrAppend(&body,
+      "      scf.for %ot = %c0 to %n_out_tiles step %c1 {\n");
+
+  // Acquire C (Produce).
+  absl::StrAppend(&body, absl::StrFormat(
+      "        %%subview_c = aie.objectfifo.acquire @outC(Produce, 1) "
+      ": !aie.objectfifosubview<%s>\n", c_memref));
+  absl::StrAppend(&body, absl::StrFormat(
+      "        %%elem_c = aie.objectfifo.subview.access %%subview_c[0] "
+      ": !aie.objectfifosubview<%s> -> %s\n", c_memref, c_memref));
+
+  // Zero the f32 accumulator buffer with scalar stores.
+  // Using scalar stores instead of vector.transfer_write to avoid memset
+  // at llc -O0 (required to work around Peano VLIW scheduler bugs).
+  absl::StrAppend(&body,
+      "        scf.for %zi = %c0 to %cm step %c1 {\n"
+      "          scf.for %zj = %c0 to %cn step %c1 {\n");
+  absl::StrAppend(&body, absl::StrFormat(
+      "            memref.store %%pad_f32, %%acc[%%zi, %%zj] : %s\n",
+      acc_memref));
+  absl::StrAppend(&body,
+      "          }\n"
+      "        }\n");
+
+  // K-tile loop: kept as scf.for to minimize code size.
+  // Each iteration acquires one A/B tile, does MAC, releases.
+  // The objectFifo-stateful-transform pass handles ping-pong buffering.
+  absl::StrAppend(&body, absl::StrFormat(
+      "        %%n_k_tiles = arith.constant %d : index\n", Kt));
+  absl::StrAppend(&body,
+      "        scf.for %kt = %c0 to %n_k_tiles step %c1 {\n");
+
+  {
+    // Acquire A and B (Consume), flatten to 1D.
+    absl::StrAppend(&body, absl::StrFormat(
+        "          %%subview_a = aie.objectfifo.acquire @inA(Consume, 1) "
+        ": !aie.objectfifosubview<%s>\n", a_memref));
+    absl::StrAppend(&body, absl::StrFormat(
+        "          %%elem_a = aie.objectfifo.subview.access %%subview_a[0] "
+        ": !aie.objectfifosubview<%s> -> %s\n", a_memref, a_memref));
+    absl::StrAppend(&body, absl::StrFormat(
+        "          %%flat_a = memref.collapse_shape %%elem_a [[0, 1]]"
+        " : %s into %s\n", a_memref, a_flat));
+    absl::StrAppend(&body, absl::StrFormat(
+        "          %%subview_b = aie.objectfifo.acquire @inB(Consume, 1) "
+        ": !aie.objectfifosubview<%s>\n", b_memref));
+    absl::StrAppend(&body, absl::StrFormat(
+        "          %%elem_b = aie.objectfifo.subview.access %%subview_b[0] "
+        ": !aie.objectfifosubview<%s> -> %s\n", b_memref, b_memref));
+    absl::StrAppend(&body, absl::StrFormat(
+        "          %%flat_b = memref.collapse_shape %%elem_b [[0, 1]]"
+        " : %s into %s\n", b_memref, b_flat));
+
+    // Inner MAC loop over 4-row blocks.
+    absl::StrAppend(&body,
+        "          scf.for %mi = %c0 to %cm step %c4 {\n");
+
+    // Load accumulator from memory.
+    absl::StrAppend(&body,
+        "            %acc_off = arith.muli %mi, %cn : index\n");
+    absl::StrAppend(&body, absl::StrFormat(
+        "            %%acc_1d = vector.transfer_read %%flat_acc[%%acc_off], %%pad_f32"
+        " {in_bounds = [true]} : %s, vector<%dxf32>\n",
+        acc_flat.c_str(), acc_vec_1d));
+    absl::StrAppend(&body, absl::StrFormat(
+        "            %%acc_init = vector.shape_cast %%acc_1d"
+        " : vector<%dxf32> to vector<%dx%dxf32>\n",
+        acc_vec_1d, mac_m, mac_n));
+
+    // A offset: mi * k (flat index into m×k tile). k=8 so contiguous read works.
+    absl::StrAppend(&body,
+        "            %a_off = arith.muli %mi, %ck : index\n");
+    absl::StrAppend(&body, absl::StrFormat(
+        "            %%a_1d = vector.transfer_read %%flat_a[%%a_off], %%pad_bf16"
+        " {in_bounds = [true]} : %s, vector<%dxbf16>\n",
+        a_flat.c_str(), a_vec_1d));
+    absl::StrAppend(&body, absl::StrFormat(
+        "            %%a_tile = vector.shape_cast %%a_1d"
+        " : vector<%dxbf16> to vector<%dx%dxbf16>\n",
+        a_vec_1d, mac_m, mac_k));
+
+    // B offset: 0 (entire 8×8 tile).
+    absl::StrAppend(&body, absl::StrFormat(
+        "            %%b_1d = vector.transfer_read %%flat_b[%%c0], %%pad_bf16"
+        " {in_bounds = [true]} : %s, vector<%dxbf16>\n",
+        b_flat.c_str(), b_vec_1d));
+    absl::StrAppend(&body, absl::StrFormat(
+        "            %%b_tile = vector.shape_cast %%b_1d"
+        " : vector<%dxbf16> to vector<%dx%dxbf16>\n",
+        b_vec_1d, mac_k, mac_n));
+
+    // Hardware MAC.
+    absl::StrAppend(&body, absl::StrFormat(
+        "            %%mac_result = aievec.matmul_aie2p"
+        " %%a_tile, %%b_tile, %%acc_init"
+        " : vector<%dx%dxbf16>, vector<%dx%dxbf16> into vector<%dx%dxf32>\n",
+        mac_m, mac_k, mac_k, mac_n, mac_m, mac_n));
+
+    // Store accumulator back to memory.
+    absl::StrAppend(&body, absl::StrFormat(
+        "            %%result_1d = vector.shape_cast %%mac_result"
+        " : vector<%dx%dxf32> to vector<%dxf32>\n",
+        mac_m, mac_n, acc_vec_1d));
+    absl::StrAppend(&body, absl::StrFormat(
+        "            vector.transfer_write %%result_1d, %%flat_acc[%%acc_off]"
+        " {in_bounds = [true]}"
+        " : vector<%dxf32>, %s\n",
+        acc_vec_1d, acc_flat.c_str()));
+
+    // Close mi loop.
+    absl::StrAppend(&body,
+        "          }\n");
+
+    // Release A and B.
+    absl::StrAppend(&body,
+        "          aie.objectfifo.release @inA(Consume, 1)\n"
+        "          aie.objectfifo.release @inB(Consume, 1)\n");
+  }
+
+  // Close K-tile loop.
+  absl::StrAppend(&body,
+      "        }\n");
+
+  // Truncate f32 accumulator → bf16 into C buffer (scalar).
+  // Peano (Jan 2025) cannot legalize fptrunc on any vector type, so we
+  // must truncate element-by-element.
+  absl::StrAppend(&body,
+      "        scf.for %ci = %c0 to %cm step %c1 {\n"
+      "          scf.for %cj = %c0 to %cn step %c1 {\n");
+  absl::StrAppend(&body, absl::StrFormat(
+      "            %%acc_val = memref.load %%acc[%%ci, %%cj] : %s\n",
+      acc_memref));
+  absl::StrAppend(&body,
+      "            %bf16_val = arith.truncf %acc_val : f32 to bf16\n");
+  absl::StrAppend(&body, absl::StrFormat(
+      "            memref.store %%bf16_val, %%elem_c[%%ci, %%cj] : %s\n",
+      c_memref));
+  absl::StrAppend(&body,
+      "          }\n"
+      "        }\n");
+
+  // Release C.
+  absl::StrAppend(&body,
+      "        aie.objectfifo.release @outC(Produce, 1)\n");
+
+  // Close output tile loop.
+  absl::StrAppend(&body,
+      "      }\n");
+
+  return body;
 }
 
 // Generates the matmul core body for AIE dialect.
@@ -1161,7 +1416,7 @@ absl::StatusOr<std::string> GenerateMatmulNpuSequence(
 
   std::string seq;
   absl::StrAppend(&seq, absl::StrFormat(
-      "    aiex.runtime_sequence(%%arg0: %s, %%arg1: %s, %%arg2: %s) {\n",
+      "    aie.runtime_sequence(%%arg0: %s, %%arg1: %s, %%arg2: %s) {\n",
       a_host_memref, b_host_memref, c_host_memref));
 
   int dma_id = 0;
@@ -1190,9 +1445,9 @@ absl::StatusOr<std::string> GenerateMatmulNpuSequence(
           a_d0_words, a_d1));
     }
     absl::StrAppend(&seq, absl::StrFormat(
-        "      aiex.npu.dma_memcpy_nd(0, 0, %%arg0"
+        "      aiex.npu.dma_memcpy_nd(%%arg0"
         "[0, 0, 0, %d][%d, %d, %d, %d][0, %d, %d, 1]) "
-        "{id = %d : i64, metadata = @inA_L2} : %s\n",
+        "{id = %d : i64, metadata = @inA_L2, issue_token = true} : %s\n",
         a_offset,
         Nt, Kt, tile.m, tile.k,
         tile.k, info.K,
@@ -1218,9 +1473,9 @@ absl::StatusOr<std::string> GenerateMatmulNpuSequence(
           "Matmul B DMA d3=%d exceeds limit 64", Nt));
     }
     absl::StrAppend(&seq, absl::StrFormat(
-        "      aiex.npu.dma_memcpy_nd(0, 0, %%arg1"
+        "      aiex.npu.dma_memcpy_nd(%%arg1"
         "[0, 0, 0, 0][%d, %d, %d, %d][%d, %d, %d, 1]) "
-        "{id = %d : i64, metadata = @inB_L2} : %s\n",
+        "{id = %d : i64, metadata = @inB_L2, issue_token = true} : %s\n",
         Nt, Kt, tile.k, tile.n,
         tile.n, tile.k * info.N, info.N,
         dma_id++, b_host_memref));
@@ -1237,21 +1492,24 @@ absl::StatusOr<std::string> GenerateMatmulNpuSequence(
           "Matmul C DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
           c_d0_words, c_d1));
     }
-    // Add issue_token on EVERY C DMA (not just last) and dma_wait after
-    // each mt block. This serializes mt blocks so the instruction processor
-    // doesn't submit the next mt's BDs before the current mt's BDs finish.
-    // Without this, later BDs on the same channel can interfere with
-    // in-progress BDs when the ObjectFIFO backpressure delays completion.
+    // Add issue_token on ALL DMAs and dma_wait for ALL channels after
+    // each mt block. This ensures all DMA channel states are fully reset
+    // before the next block's BDs are submitted. Without A/B waits, the
+    // shim DMA channels may not be in a clean state when new BDs arrive,
+    // causing timeouts on larger matrices (e.g. 64x64 with Mt=2).
     absl::StrAppend(&seq, absl::StrFormat(
-        "      aiex.npu.dma_memcpy_nd(0, 0, %%arg2"
+        "      aiex.npu.dma_memcpy_nd(%%arg2"
         "[0, 0, 0, %d][1, %d, %d, %d][0, %d, %d, 1]) "
         "{id = %d : i64, metadata = @outC_L2, issue_token = true} : %s\n",
         c_offset,
         Nt, tile.m, tile.n,
         tile.n, info.N,
         dma_id++, c_host_memref));
+    // Wait for C first (completes last), then A and B (already done).
     absl::StrAppend(&seq,
-        "      aiex.npu.dma_wait { symbol = @outC_L2 }\n");
+        "      aiex.npu.dma_wait { symbol = @outC_L2 }\n"
+        "      aiex.npu.dma_wait { symbol = @inA_L2 }\n"
+        "      aiex.npu.dma_wait { symbol = @inB_L2 }\n");
   }
   absl::StrAppend(&seq, "    }\n");
 
@@ -1266,11 +1524,12 @@ absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
   if (!tile_or.ok()) return tile_or.status();
   MatmulTileConfig tile = *tile_or;
 
+  bool is_bf16 = (info.element_type == "bf16");
+  bool use_vectorized = is_bf16 && tile.k == 8;
   LOG(INFO) << "XDNA matmul lowering: tiles m=" << tile.m << " k=" << tile.k
             << " n=" << tile.n << " (M=" << info.M << " K=" << info.K
-            << " N=" << info.N << " " << info.element_type << ")";
-
-  bool is_bf16 = (info.element_type == "bf16");
+            << " N=" << info.N << " " << info.element_type
+            << (use_vectorized ? " VECTORIZED" : " scalar") << ")";
   const std::string& ty = info.element_type;
   int start_col = caps.partition_start_column;
   int shim_row = caps.shim_row;
@@ -1300,27 +1559,29 @@ absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
   std::string mem_tile = absl::StrFormat("tile_%d_%d", col, caps.mem_tile_row);
   std::string compute_tile = absl::StrFormat("tile_%d_%d", col, compute_row);
 
+  int fifo_depth = 2;
+
   // ObjectFIFOs: shim ↔ mem tile (L2).
   absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @inA_L2(%%%s, {%%%s}, 2 : i32) "
-      ": !aie.objectfifo<%s>\n", shim_tile, mem_tile, a_memref));
+      "    aie.objectfifo @inA_L2(%%%s, {%%%s}, %d : i32) "
+      ": !aie.objectfifo<%s>\n", shim_tile, mem_tile, fifo_depth, a_memref));
   absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @inB_L2(%%%s, {%%%s}, 2 : i32) "
-      ": !aie.objectfifo<%s>\n", shim_tile, mem_tile, b_memref));
+      "    aie.objectfifo @inB_L2(%%%s, {%%%s}, %d : i32) "
+      ": !aie.objectfifo<%s>\n", shim_tile, mem_tile, fifo_depth, b_memref));
   absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @outC_L2(%%%s, {%%%s}, 2 : i32) "
-      ": !aie.objectfifo<%s>\n", mem_tile, shim_tile, c_memref));
+      "    aie.objectfifo @outC_L2(%%%s, {%%%s}, %d : i32) "
+      ": !aie.objectfifo<%s>\n", mem_tile, shim_tile, fifo_depth, c_memref));
 
   // ObjectFIFOs: mem tile ↔ compute (L1).
   absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @inA(%%%s, {%%%s}, 2 : i32) "
-      ": !aie.objectfifo<%s>\n", mem_tile, compute_tile, a_memref));
+      "    aie.objectfifo @inA(%%%s, {%%%s}, %d : i32) "
+      ": !aie.objectfifo<%s>\n", mem_tile, compute_tile, fifo_depth, a_memref));
   absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @inB(%%%s, {%%%s}, 2 : i32) "
-      ": !aie.objectfifo<%s>\n", mem_tile, compute_tile, b_memref));
+      "    aie.objectfifo @inB(%%%s, {%%%s}, %d : i32) "
+      ": !aie.objectfifo<%s>\n", mem_tile, compute_tile, fifo_depth, b_memref));
   absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @outC(%%%s, {%%%s}, 2 : i32) "
-      ": !aie.objectfifo<%s>\n", compute_tile, mem_tile, c_memref));
+      "    aie.objectfifo @outC(%%%s, {%%%s}, %d : i32) "
+      ": !aie.objectfifo<%s>\n", compute_tile, mem_tile, fifo_depth, c_memref));
 
   // Links through memory tile.
   absl::StrAppend(&aie_mlir,
@@ -1339,7 +1600,11 @@ absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
   absl::StrAppend(&aie_mlir, absl::StrFormat(
       "    %%core_%d_%d = aie.core(%%%s) {\n", col, compute_row,
       compute_tile));
-  absl::StrAppend(&aie_mlir, GenerateMatmulCoreBody(info, tile));
+  if (use_vectorized) {
+    absl::StrAppend(&aie_mlir, GenerateVectorizedMatmulCoreBody(info, tile));
+  } else {
+    absl::StrAppend(&aie_mlir, GenerateMatmulCoreBody(info, tile));
+  }
   absl::StrAppend(&aie_mlir,
       "      aie.end\n"
       "    }\n");
@@ -1354,7 +1619,8 @@ absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
 
   LOG(INFO) << "XDNA matmul lowering: generated AIE MLIR:\n" << aie_mlir;
 
-  return AieLoweringResult{aie_mlir, /*num_cores=*/1};
+  return AieLoweringResult{aie_mlir, /*num_cores=*/1,
+                           /*use_aievec=*/use_vectorized};
 }
 
 }  // namespace
