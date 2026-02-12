@@ -413,7 +413,7 @@ absl::Status CheckTools(const std::string& aie_opt,
 
 absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     const std::string& aie_mlir, int num_data_args, const TargetCaps& caps,
-    int num_cores, bool use_aievec) {
+    int num_cores, bool use_aievec, bool needs_softfloat_stubs) {
   // Create a temporary working directory.
   auto tmpdir = std::filesystem::temp_directory_path() / "xdna_codegen_XXXXXX";
   std::string tmpdir_str = tmpdir.string();
@@ -453,7 +453,8 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
   //   - assign-buffer-addresses: allocates memory in tile local stores
   // -----------------------------------------------------------------------
   // Step numbering: 1 shared + N per core + 5 shared = total.
-  int steps_per_core = use_aievec ? 8 : 7;  // +1 for rt stubs
+  bool needs_rt_stubs = use_aievec || needs_softfloat_stubs;
+  int steps_per_core = needs_rt_stubs ? 8 : 7;  // +1 for rt stubs
   int total_compile_steps = steps_per_core * num_cores + 6;
   int step = 1;
 
@@ -962,25 +963,65 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
         absl::StrFormat("Step %d/%d: Core (%d,%d) linker script",
                         step++, total_compile_steps, col, row)));
 
-    // 3h: Compile runtime stubs (for llc -O0 which needs __muldi3).
+    // 3h: Compile runtime stubs (soft-float and integer intrinsics).
     std::string rt_stubs_obj;
-    if (use_aievec) {
+    if (needs_rt_stubs) {
       std::string rt_src = absl::StrFormat("%s/rt_stubs.c", workdir);
       rt_stubs_obj = absl::StrFormat("%s/rt_stubs.o", workdir);
-      TF_RETURN_IF_ERROR(WriteFile(rt_src,
-          "typedef unsigned int su_int;\n"
-          "typedef long long di_int;\n"
-          "typedef unsigned long long du_int;\n"
-          "di_int __muldi3(di_int a, di_int b) {\n"
-          "    su_int al=(su_int)a, ah=(su_int)(a>>32);\n"
-          "    su_int bl=(su_int)b, bh=(su_int)(b>>32);\n"
-          "    du_int lo=(du_int)al*bl;\n"
-          "    su_int hi=(su_int)(lo>>32)+ah*bl+al*bh;\n"
-          "    return ((di_int)hi<<32)|(su_int)lo;\n"
-          "}\n"));
+      std::string rt_code;
+      if (use_aievec) {
+        absl::StrAppend(&rt_code,
+            "typedef unsigned int su_int;\n"
+            "typedef long long di_int;\n"
+            "typedef unsigned long long du_int;\n"
+            "di_int __muldi3(di_int a, di_int b) {\n"
+            "    su_int al=(su_int)a, ah=(su_int)(a>>32);\n"
+            "    su_int bl=(su_int)b, bh=(su_int)(b>>32);\n"
+            "    du_int lo=(du_int)al*bl;\n"
+            "    su_int hi=(su_int)(lo>>32)+ah*bl+al*bh;\n"
+            "    return ((di_int)hi<<32)|(su_int)lo;\n"
+            "}\n");
+      }
+      if (needs_softfloat_stubs) {
+        // Soft-float comparison stubs for Peano's baremetal AIE2p target.
+        // arith.cmpf lowers to fcmp which needs __gtsf2, __ltsf2, etc.
+        // These follow GCC's soft-float ABI: return >0 if true, <=0 if false.
+        absl::StrAppend(&rt_code,
+            "typedef union { float f; unsigned int i; } fu_t;\n"
+            "static int _fcmp(float a, float b) {\n"
+            "    fu_t ua = {a}, ub = {b};\n"
+            "    unsigned ea = (ua.i >> 23) & 0xFF;\n"
+            "    unsigned eb = (ub.i >> 23) & 0xFF;\n"
+            "    unsigned ma = ua.i & 0x7FFFFF;\n"
+            "    unsigned mb = ub.i & 0x7FFFFF;\n"
+            "    if ((ea == 0xFF && ma) || (eb == 0xFF && mb)) return -2;\n"
+            "    int sa = ua.i >> 31, sb = ub.i >> 31;\n"
+            "    if (ua.i == 0x80000000u) ua.i = 0;\n"
+            "    if (ub.i == 0x80000000u) ub.i = 0;\n"
+            "    if (!sa && !sb) return (ua.i > ub.i) ? 1 : (ua.i == ub.i) ? 0 : -1;\n"
+            "    if (sa && sb) return (ua.i < ub.i) ? 1 : (ua.i == ub.i) ? 0 : -1;\n"
+            "    if (sa) return -1;\n"
+            "    return 1;\n"
+            "}\n"
+            "int __gtsf2(float a, float b) { return _fcmp(a, b); }\n"
+            "int __gesf2(float a, float b) { return _fcmp(a, b); }\n"
+            "int __ltsf2(float a, float b) { return _fcmp(a, b); }\n"
+            "int __lesf2(float a, float b) { return _fcmp(a, b); }\n"
+            "int __eqsf2(float a, float b) { return _fcmp(a, b); }\n"
+            "int __nesf2(float a, float b) { return _fcmp(a, b); }\n"
+            "int __unordsf2(float a, float b) {\n"
+            "    fu_t ua = {a}, ub = {b};\n"
+            "    unsigned ea = (ua.i >> 23) & 0xFF;\n"
+            "    unsigned eb = (ub.i >> 23) & 0xFF;\n"
+            "    unsigned ma = ua.i & 0x7FFFFF;\n"
+            "    unsigned mb = ub.i & 0x7FFFFF;\n"
+            "    return (ea == 0xFF && ma) || (eb == 0xFF && mb);\n"
+            "}\n");
+      }
+      TF_RETURN_IF_ERROR(WriteFile(rt_src, rt_code));
       TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
           peano_clang,
-          " --target=", caps.isa_target, "-none-elf -O2 -c ",
+          " --target=", caps.isa_target, "-none-elf -O0 -c ",
           rt_src, " -o ", rt_stubs_obj),
           absl::StrFormat("Step %d/%d: Core (%d,%d) runtime stubs",
                           step++, total_compile_steps, col, row)));

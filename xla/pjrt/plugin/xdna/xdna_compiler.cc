@@ -33,6 +33,7 @@ limitations under the License.
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 #include "stablehlo/conversions/linalg/transforms/Passes.h"
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/hlo/translate/hlo_to_mhlo/hlo_to_mlir_hlo.h"
@@ -68,6 +69,9 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
   // Step 2: StableHLO → linalg-on-tensors.
   mlir::PassManager pm(&context);
   pm.addPass(mlir::stablehlo::createStablehloLegalizeToLinalgPass());
+  // Inline private helper functions so that constants (e.g., relu zero)
+  // are directly visible to AnalyzeLinalgGeneric.
+  pm.addPass(mlir::createInlinerPass());
   if (mlir::failed(pm.run(*mlir_module))) {
     return absl::InternalError(
         "XDNA compiler: StableHLO → linalg conversion failed.");
@@ -118,7 +122,8 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
   TF_ASSIGN_OR_RETURN(XdnaCodegenResult result,
                       GenerateXclbinFromAie(lowering.aie_mlir, num_data_args,
                                             caps, lowering.num_cores,
-                                            lowering.use_aievec));
+                                            lowering.use_aievec,
+                                            lowering.needs_softfloat_stubs));
 
   LOG(INFO) << "XDNA compiler: xclbin generated, "
             << result.xclbin_bytes.size() << " bytes.";

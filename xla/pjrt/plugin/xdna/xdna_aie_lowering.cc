@@ -107,10 +107,14 @@ int GetVectorWidth(const std::string& element_type,
 // Describes a linalg operation extracted from the module.
 struct LinalgOpInfo {
   std::string op_name;        // e.g., "linalg.add"
-  int num_inputs;             // 1 or 2
+  int num_inputs;             // 1 or 2 (DMA inputs, excluding embedded constants)
   int64_t num_elements;       // total element count
   std::string element_type;   // e.g., "f32"
   std::string kernel_op;      // e.g., "arith.addf"
+  // For ops with a broadcast constant (e.g., relu = max(x, 0)):
+  // embedded_constant holds the MLIR literal (e.g., "0.000000e+00 : f32").
+  // The op is a 2-operand op at the MLIR level but only 1 DMA input.
+  std::string embedded_constant;
 };
 
 // Full program description for AIE lowering.
@@ -147,6 +151,8 @@ bool IsSupportedBodyOp(llvm::StringRef name) {
   return name == "arith.addf" || name == "arith.subf" || name == "arith.mulf" ||
          name == "arith.negf" || name == "arith.addi" || name == "arith.subi" ||
          name == "arith.muli" || name == "arith.extf" || name == "arith.truncf" ||
+         name == "arith.maximumf" || name == "arith.maxsi" ||
+         name == "arith.minimumf" || name == "arith.minsi" ||
          name == "math.exp" || name == "math.log";
 }
 
@@ -156,6 +162,8 @@ std::string GetSingleOpName(llvm::StringRef kernel_op) {
   if (kernel_op == "arith.subf" || kernel_op == "arith.subi") return "linalg.generic(sub)";
   if (kernel_op == "arith.mulf" || kernel_op == "arith.muli") return "linalg.generic(mul)";
   if (kernel_op == "arith.negf") return "linalg.generic(neg)";
+  if (kernel_op == "arith.maximumf" || kernel_op == "arith.maxsi") return "linalg.generic(max)";
+  if (kernel_op == "arith.minimumf" || kernel_op == "arith.minsi") return "linalg.generic(min)";
   if (kernel_op == "math.exp") return "linalg.generic(exp)";
   if (kernel_op == "math.log") return "linalg.generic(log)";
   return "linalg.generic(unknown)";
@@ -165,13 +173,139 @@ std::string GetSingleOpName(llvm::StringRef kernel_op) {
 int GetSingleOpNumInputs(llvm::StringRef kernel_op) {
   if (kernel_op == "arith.negf" || kernel_op == "math.exp" || kernel_op == "math.log")
     return 1;
+  // arith.maximumf/maxsi/minimumf/minsi are 2-input ops (e.g., relu = max(x, 0))
   return 2;
+}
+
+// Traces a Value through function call boundaries to find its origin.
+// If `value` is a block argument of a private function, finds the corresponding
+// actual argument at the call site. Returns the original value otherwise.
+mlir::Value TraceBlockArgToCallSite(mlir::Value value,
+                                    mlir::ModuleOp module) {
+  auto block_arg = mlir::dyn_cast<mlir::BlockArgument>(value);
+  if (!block_arg) return value;  // Already an SSA value with defining op.
+
+  // Get the parent function.
+  auto parent_func = mlir::dyn_cast<mlir::func::FuncOp>(
+      block_arg.getOwner()->getParentOp());
+  if (!parent_func) return value;
+
+  // Find a call site of this function in the module.
+  llvm::StringRef func_name = parent_func.getSymName();
+  mlir::Value result = value;
+  module.walk([&](mlir::func::CallOp call) {
+    if (call.getCallee() == func_name) {
+      unsigned arg_idx = block_arg.getArgNumber();
+      if (arg_idx < call.getNumOperands()) {
+        result = call.getOperand(arg_idx);
+      }
+    }
+  });
+  return result;
+}
+
+// Formats a scalar constant as an MLIR literal string (e.g. "0.000000e+00 : f32").
+std::string FormatScalarConstant(mlir::Type elem_type, mlir::Attribute splat_val) {
+  std::string type_str = GetElementTypeStr(elem_type);
+  if (elem_type.isIntOrIndex()) {
+    auto int_attr = mlir::dyn_cast<mlir::IntegerAttr>(splat_val);
+    if (!int_attr) return "";
+    return absl::StrFormat("%d : %s", int_attr.getInt(), type_str);
+  }
+  auto float_attr = mlir::dyn_cast<mlir::FloatAttr>(splat_val);
+  if (!float_attr) return "";
+  auto val = float_attr.getValue();
+  llvm::SmallString<32> float_str;
+  val.toString(float_str, /*FormatPrecision=*/6, /*FormatMaxPadding=*/0);
+  std::string s = float_str.str().str();
+  if (s.find('.') == std::string::npos && s.find('E') == std::string::npos &&
+      s.find('e') == std::string::npos) {
+    s += ".0";
+  }
+  return absl::StrCat(s, " : ", type_str);
+}
+
+// Tries to extract a scalar constant value from an MLIR Value.
+// Returns the MLIR literal string (e.g., "0.000000e+00 : f32") or empty.
+// Handles:
+//   1. arith.constant dense<splat> : tensor<...>  (broadcast map)
+//   2. linalg.fill ins(%cst) outs(%empty)         (identity-mapped splat tensor)
+std::string TryExtractScalarConstant(mlir::Value value) {
+  auto* def_op = value.getDefiningOp();
+  if (!def_op) return "";
+
+  llvm::StringRef op_name = def_op->getName().getStringRef();
+
+  // Case 1: arith.constant dense<splat>
+  if (op_name == "arith.constant") {
+    auto attr = def_op->getAttr("value");
+    if (!attr) return "";
+    auto dense = mlir::dyn_cast<mlir::DenseElementsAttr>(attr);
+    if (!dense || !dense.isSplat()) return "";
+    auto elem_type = dense.getElementType();
+    std::string type_str = GetElementTypeStr(elem_type);
+    if (elem_type.isIntOrIndex()) {
+      auto val = dense.getSplatValue<mlir::APInt>();
+      return absl::StrFormat("%d : %s", val.getSExtValue(), type_str);
+    }
+    auto val = dense.getSplatValue<mlir::APFloat>();
+    llvm::SmallString<32> float_str;
+    val.toString(float_str, /*FormatPrecision=*/6, /*FormatMaxPadding=*/0);
+    std::string s = float_str.str().str();
+    if (s.find('.') == std::string::npos && s.find('E') == std::string::npos &&
+        s.find('e') == std::string::npos) {
+      s += ".0";
+    }
+    return absl::StrCat(s, " : ", type_str);
+  }
+
+  // Case 2: linalg.fill ins(%cst : scalar) outs(%empty)
+  // stablehlo→linalg produces this for broadcast constants (e.g., relu zero).
+  if (op_name == "linalg.fill") {
+    if (def_op->getNumOperands() < 1) return "";
+    // linalg.fill DPS: first operand is the scalar fill value.
+    mlir::Value fill_val = def_op->getOperand(0);
+    auto* fill_def = fill_val.getDefiningOp();
+    if (!fill_def || fill_def->getName().getStringRef() != "arith.constant")
+      return "";
+    auto attr = fill_def->getAttr("value");
+    if (!attr) return "";
+    auto elem_type = fill_val.getType();
+    return FormatScalarConstant(elem_type, attr);
+  }
+
+  // Case 3: linalg.generic that broadcasts a scalar constant to a tensor.
+  // stablehlo.broadcast_in_dim(%cst) lowers to a linalg.generic with a
+  // scalar input (map: (d0)->()) and body that just yields the input.
+  if (op_name == "linalg.generic") {
+    auto generic = mlir::dyn_cast<mlir::linalg::GenericOp>(def_op);
+    if (!generic) return "";
+    // Must have exactly 1 input (the scalar to broadcast).
+    if (generic.getInputs().size() != 1) return "";
+    // Body must be trivial: just yield the input block arg.
+    mlir::Block& body = generic.getRegion().front();
+    int non_yield = 0;
+    for (mlir::Operation& op : body.without_terminator()) {
+      (void)op;
+      non_yield++;
+    }
+    if (non_yield != 0) return "";
+    // The single input should be a constant.
+    return TryExtractScalarConstant(generic.getInputs()[0]);
+  }
+
+  return "";
 }
 
 // Analyzes a linalg.generic to build a LinalgProgramInfo.
 // Returns nullopt if the generic is not a supported element-wise computation.
+//
+// Supports two patterns:
+//   1. All-identity indexing maps (standard elementwise: add, sub, mul, neg)
+//   2. Mixed identity + scalar-broadcast maps where broadcast inputs are
+//      compile-time constants (e.g., relu = max(x, 0) where 0 is broadcast)
 std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
-    mlir::linalg::GenericOp generic) {
+    mlir::linalg::GenericOp generic, mlir::ModuleOp module) {
   // Check that all iterator types are parallel (element-wise).
   auto iter_types = generic.getIteratorTypesArray();
   for (auto it : iter_types) {
@@ -183,19 +317,58 @@ std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
   // Reject multi-output generics (we only support single output).
   if (generic.getNumDpsInits() != 1) return std::nullopt;
 
-  // Validate all indexing maps are identity (flat element-wise).
-  for (auto map : generic.getIndexingMapsArray()) {
-    if (!map.isIdentity()) return std::nullopt;
+  // Classify indexing maps: identity (DMA input) or scalar broadcast (constant).
+  auto maps = generic.getIndexingMapsArray();
+  int num_total_inputs = static_cast<int>(generic.getInputs().size());
+  std::vector<bool> is_broadcast(num_total_inputs, false);
+  std::vector<std::string> broadcast_values(num_total_inputs);
+
+  for (int i = 0; i < num_total_inputs; i++) {
+    auto map = maps[i];
+    if (map.isIdentity()) {
+      // Identity map: could be a DMA input OR a constant splat tensor.
+      // stablehlo→linalg materializes broadcast constants as linalg.fill
+      // inside private helper functions. Trace through call boundaries.
+      mlir::Value inp = generic.getInputs()[i];
+      mlir::Value traced = TraceBlockArgToCallSite(inp, module);
+      std::string constant = TryExtractScalarConstant(traced);
+      if (!constant.empty()) {
+        is_broadcast[i] = true;
+        broadcast_values[i] = constant;
+      }
+      continue;
+    }
+    // Allow scalar broadcast: (d0, ...) -> () — all dims dropped.
+    if (map.getNumResults() == 0) {
+      // Must be a compile-time constant for us to embed it.
+      std::string constant = TryExtractScalarConstant(generic.getInputs()[i]);
+      if (constant.empty()) return std::nullopt;
+      is_broadcast[i] = true;
+      broadcast_values[i] = constant;
+    } else {
+      return std::nullopt;  // Unsupported indexing pattern.
+    }
   }
 
-  // Get shape and element type from first input.
-  auto input_type = mlir::dyn_cast<mlir::RankedTensorType>(
-      generic.getInputs().front().getType());
+  // Output map must be identity.
+  auto output_map = maps[num_total_inputs];  // output is after all inputs
+  if (!output_map.isIdentity()) return std::nullopt;
+
+  // Get shape and element type from the first non-broadcast input.
+  mlir::RankedTensorType input_type;
+  for (int i = 0; i < num_total_inputs; i++) {
+    if (is_broadcast[i]) continue;
+    input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic.getInputs()[i].getType());
+    break;
+  }
   if (!input_type) return std::nullopt;
 
-  // Verify all inputs have the same shape.
-  for (auto input : generic.getInputs()) {
-    auto ty = mlir::dyn_cast<mlir::RankedTensorType>(input.getType());
+  // Verify all non-broadcast inputs have the same shape.
+  for (int i = 0; i < num_total_inputs; i++) {
+    if (is_broadcast[i]) continue;
+    auto ty = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic.getInputs()[i].getType());
     if (!ty || ty.getShape() != input_type.getShape()) return std::nullopt;
   }
 
@@ -206,9 +379,7 @@ std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
   // incorrect results. All f16 ops are broken until Peano adds proper support.
   if (storage_type == "f16") return std::nullopt;
 
-  // Verify output element type matches input element type. Our lowering uses
-  // a single storage_type for all ObjectFIFOs (inputs + output). If the output
-  // type differs, the generated memref types would be wrong.
+  // Verify output element type matches input element type.
   auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
       generic.getDpsInits()[0].getType());
   if (!output_type) return std::nullopt;
@@ -222,8 +393,7 @@ std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
 
   mlir::Block& body = generic.getRegion().front();
 
-  // Validate all body ops are supported. Count total ops and compute ops
-  // (non-cast) to decide single-op vs multi-op path.
+  // Validate all body ops are supported.
   int total_op_count = 0;
   int compute_op_count = 0;
   std::string sole_kernel_op;
@@ -239,21 +409,32 @@ std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
 
   if (compute_op_count == 0) return std::nullopt;
 
+  // Count DMA inputs (non-broadcast).
+  int dma_inputs = 0;
+  for (int i = 0; i < num_total_inputs; i++) {
+    if (!is_broadcast[i]) dma_inputs++;
+  }
+
   LinalgProgramInfo program;
-  program.num_inputs = static_cast<int>(generic.getInputs().size());
+  program.num_inputs = dma_inputs;
   program.num_elements = num_elements;
   program.storage_type = storage_type;
 
-  // Single op with NO casts → use single_op path for vectorization and
-  // bf16 multiply workaround. If casts are present (e.g., f16 extf→addf→truncf),
-  // use multi-op path so the casts are correctly emitted.
+  // Single op with NO casts → use single_op path.
   if (total_op_count == 1 && compute_op_count == 1) {
     LinalgOpInfo single;
     single.kernel_op = sole_kernel_op;
     single.op_name = GetSingleOpName(sole_kernel_op);
-    single.num_inputs = GetSingleOpNumInputs(sole_kernel_op);
+    single.num_inputs = dma_inputs;
     single.element_type = storage_type;
     single.num_elements = num_elements;
+    // If there's a broadcast constant, embed it.
+    for (int i = 0; i < num_total_inputs; i++) {
+      if (is_broadcast[i]) {
+        single.embedded_constant = broadcast_values[i];
+        break;
+      }
+    }
     program.single_op = single;
   } else {
     // Multi-op: store the GenericOp handle for direct body walking in codegen.
@@ -382,22 +563,34 @@ absl::StatusOr<LinalgProgramInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
   }
 
   // Count all supported linalg ops to detect multi-op programs.
+  // Also collect unsupported op names for better error messages.
+  // Walk the entire module (not just entry_func) because XLA may generate
+  // private helper functions (e.g., @relu.1) containing the linalg ops.
   int op_count = 0;
+  std::vector<std::string> unsupported_ops;
   LinalgProgramInfo program;
 
-  // Walk the function body to find linalg named ops.
-  entry_func.walk([&](mlir::Operation* op) {
+  // Walk the module to find linalg named ops.
+  module.walk([&](mlir::Operation* op) {
     llvm::StringRef name = op->getName().getStringRef();
     if (!name.starts_with("linalg.")) return;
 
     // Skip linalg.generic — handled separately below.
     if (name == "linalg.generic") return;
+    // Skip linalg.fill — used for zero-init before matmul.
+    if (name == "linalg.fill") return;
 
     int num_inputs = GetNumInputs(name);
-    if (num_inputs < 0) return;
+    if (num_inputs < 0) {
+      unsupported_ops.push_back(name.str());
+      return;
+    }
 
     std::string kernel_op = GetCoreKernelOp(name);
-    if (kernel_op.empty()) return;
+    if (kernel_op.empty()) {
+      unsupported_ops.push_back(name.str());
+      return;
+    }
 
     // Get shape info from the result type.
     if (op->getNumResults() < 1) return;
@@ -424,10 +617,20 @@ absl::StatusOr<LinalgProgramInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
     program.storage_type = info.element_type;
   });
 
-  // Also walk linalg.generic ops.
-  entry_func.walk([&](mlir::linalg::GenericOp generic) {
-    auto result = AnalyzeLinalgGeneric(generic);
-    if (!result.has_value()) return;
+  // Also walk linalg.generic ops. Collect unsupported body ops for diagnostics.
+  module.walk([&](mlir::linalg::GenericOp generic) {
+    auto result = AnalyzeLinalgGeneric(generic, module);
+    if (!result.has_value()) {
+      // Collect unsupported body ops for error messages.
+      mlir::Block& body = generic.getRegion().front();
+      for (mlir::Operation& body_op : body.without_terminator()) {
+        llvm::StringRef bname = body_op.getName().getStringRef();
+        if (!IsSupportedBodyOp(bname) && bname != "linalg.yield") {
+          unsupported_ops.push_back(bname.str());
+        }
+      }
+      return;
+    }
     op_count++;
     program = std::move(*result);
   });
@@ -440,13 +643,22 @@ absl::StatusOr<LinalgProgramInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
   }
 
   if (op_count == 0) {
+    // Build descriptive error message with unsupported ops.
+    std::string unsupported_str;
+    if (!unsupported_ops.empty()) {
+      unsupported_str = absl::StrCat(
+          " Unsupported ops found: ", absl::StrJoin(unsupported_ops, ", "),
+          ".");
+    }
     // Print the module for debugging.
     std::string module_str;
     llvm::raw_string_ostream os(module_str);
     module.print(os);
     return absl::UnimplementedError(absl::StrCat(
-        "No supported linalg operation found in module. "
-        "Currently supported: add, sub, mul, neg, exp, log. "
+        "No supported linalg operation found in module.",
+        unsupported_str,
+        " Currently supported: elementwise (add, sub, mul, neg, max, min),"
+        " matmul (dot product). "
         "Module IR:\n", module_str));
   }
 
@@ -477,6 +689,14 @@ std::string GenerateScalarLoop(const LinalgOpInfo& info,
     absl::StrAppend(&body, absl::StrFormat(
         "      %%c%d = arith.constant %d : index\n", chunk_size, chunk_size));
   }
+
+  // Emit embedded constant before the loop (e.g., relu zero constant).
+  bool has_constant = !info.embedded_constant.empty();
+  if (has_constant) {
+    absl::StrAppend(&body, absl::StrFormat(
+        "      %%const_val = arith.constant %s\n", info.embedded_constant));
+  }
+
   absl::StrAppend(&body, absl::StrFormat(
       "      scf.for %%i = %%c0 to %%c%d step %%c1 {\n", chunk_size));
 
@@ -489,11 +709,72 @@ std::string GenerateScalarLoop(const LinalgOpInfo& info,
   bool needs_bf16_cast =
       (info.kernel_op == "arith.mulf" && info.element_type == "f32");
 
+  // Determine if this is a max/min op that needs cmpf+select lowering.
+  // arith.maximumf/minimumf lower to llvm.intr.maximum/minimum which call
+  // __unordsf2 (soft-float NaN check) — unavailable in Peano's baremetal env.
+  // arith.maxsi/minsi lower to llvm.smax/smin which may also need intrinsics.
+  // We use compare+select instead, which Peano handles natively.
+  bool is_maxf = (info.kernel_op == "arith.maximumf");
+  bool is_minf = (info.kernel_op == "arith.minimumf");
+  bool is_maxi = (info.kernel_op == "arith.maxsi");
+  bool is_mini = (info.kernel_op == "arith.minsi");
+  bool is_cmp_select_op = is_maxf || is_minf || is_maxi || is_mini;
+
   absl::StrAppend(&body,
       "        %val_in0 = memref.load %elem_in0[%i] : ", memref_ty, "\n");
-  if (info.num_inputs == 2) {
+
+  // Determine the second operand name.
+  std::string rhs_name;
+  if (has_constant) {
+    rhs_name = "%const_val";
+  } else if (info.num_inputs == 2) {
     absl::StrAppend(&body,
         "        %val_in1 = memref.load %elem_in1[%i] : ", memref_ty, "\n");
+    rhs_name = "%val_in1";
+  }
+
+  if (is_cmp_select_op && !rhs_name.empty()) {
+    if (is_maxi || is_mini) {
+      // Integer max/min: use arith.cmpi directly (native on AIE).
+      std::string cmp_pred = is_maxi ? "sgt" : "slt";
+      absl::StrAppend(&body, absl::StrFormat(
+          "        %%cmp = arith.cmpi %s, %%val_in0, %s : %s\n",
+          cmp_pred, rhs_name, ty));
+      absl::StrAppend(&body, absl::StrFormat(
+          "        %%val_out = arith.select %%cmp, %%val_in0, %s : %s\n",
+          rhs_name, ty));
+    } else if (ty == "f32") {
+      // Float max/min for f32: use integer bitcast comparison.
+      // AIE2p has no native f32 comparison instruction; arith.cmpf would
+      // lower to __gtsf2/__ltsf2 soft-float calls which crash/hang at -O0.
+      // IEEE 754 f32 sign bit: positive floats have bit 31 = 0.
+      // For max(x, y): bitcast to i32, check signs, compare magnitudes.
+      // Simplified for common case (relu: max(x, 0.0)):
+      //   - positive x: sign bit 0 → i32 >= 0 → x > 0.0 → output x
+      //   - negative x: sign bit 1 → i32 < 0  → x < 0.0 → output 0.0
+      std::string cmp_pred = is_maxf ? "sgt" : "slt";
+      absl::StrAppend(&body, absl::StrFormat(
+          "        %%bits_a = arith.bitcast %%val_in0 : f32 to i32\n"
+          "        %%bits_b = arith.bitcast %s : f32 to i32\n"
+          "        %%cmp = arith.cmpi %s, %%bits_a, %%bits_b : i32\n"
+          "        %%val_out = arith.select %%cmp, %%val_in0, %s : f32\n",
+          rhs_name, cmp_pred, rhs_name));
+    } else {
+      // bf16/f16: use arith.cmpf (native bf16 comparison on AIE2p).
+      std::string cmp_pred = is_maxf ? "ogt" : "olt";
+      absl::StrAppend(&body, absl::StrFormat(
+          "        %%cmp = arith.cmpf %s, %%val_in0, %s : %s\n",
+          cmp_pred, rhs_name, ty));
+      absl::StrAppend(&body, absl::StrFormat(
+          "        %%val_out = arith.select %%cmp, %%val_in0, %s : %s\n",
+          rhs_name, ty));
+    }
+  } else if (has_constant) {
+    // Binary op with one DMA input and one embedded constant.
+    absl::StrAppend(&body,
+        "        %val_out = ", info.kernel_op,
+        " %val_in0, %const_val : ", ty, "\n");
+  } else if (info.num_inputs == 2) {
     if (needs_bf16_cast) {
       absl::StrAppend(&body,
           "        %bf16_in0 = arith.truncf %val_in0 : f32 to bf16\n"
@@ -687,6 +968,23 @@ std::string GenerateMultiOpScalarLoop(mlir::linalg::GenericOp generic,
           "        %s = %s %s : %s\n",
           result_name, op_name,
           ResolveName(names, op.getOperand(0)), result_type));
+    } else if (op_name == "arith.maximumf" || op_name == "arith.minimumf" ||
+               op_name == "arith.maxsi" || op_name == "arith.minsi") {
+      // Max/min ops: use cmpf/cmpi + select to avoid __unordsf2 libcall.
+      bool is_float = (op_name == "arith.maximumf" || op_name == "arith.minimumf");
+      std::string cmp_op = is_float ? "arith.cmpf" : "arith.cmpi";
+      std::string pred = (op_name == "arith.maximumf") ? "ogt"
+                       : (op_name == "arith.minimumf") ? "olt"
+                       : (op_name == "arith.maxsi") ? "sgt" : "slt";
+      std::string lhs = ResolveName(names, op.getOperand(0));
+      std::string rhs = ResolveName(names, op.getOperand(1));
+      std::string cmp_name = absl::StrFormat("%%t%d_cmp", node_idx);
+      absl::StrAppend(&body, absl::StrFormat(
+          "        %s = %s %s, %s, %s : %s\n",
+          cmp_name, cmp_op, pred, lhs, rhs, result_type));
+      absl::StrAppend(&body, absl::StrFormat(
+          "        %s = arith.select %s, %s, %s : %s\n",
+          result_name, cmp_name, lhs, rhs, result_type));
     } else {
       // Binary ops: %tN = arith.addf %lhs, %rhs : type
       absl::StrAppend(&body, absl::StrFormat(
@@ -2028,7 +2326,15 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
 
   LOG(INFO) << "XDNA AIE lowering: generated AIE MLIR:\n" << aie_mlir;
 
-  return AieLoweringResult{aie_mlir, num_cores};
+  // Detect if kernel uses float comparison ops that need soft-float stubs.
+  bool needs_softfloat = false;
+  if (program.single_op.has_value()) {
+    const auto& op = program.single_op->kernel_op;
+    needs_softfloat = (op == "arith.maximumf" || op == "arith.minimumf");
+  }
+
+  return AieLoweringResult{aie_mlir, num_cores, /*use_aievec=*/false,
+                           needs_softfloat};
 }
 
 }  // namespace xla

@@ -450,6 +450,33 @@ def test_matmul_f32_multicore_fallback():
     np.testing.assert_allclose(np.array(result), a @ b, atol=0.5)
 
 
+def test_relu_f32_4():
+    """ReLU: f32[4] max(x, 0) — simplest activation function."""
+    a = np.array([-2.0, -1.0, 1.0, 3.0], dtype=np.float32)
+    result = jax.jit(jax.nn.relu)(a)
+    expected = np.array([0.0, 0.0, 1.0, 3.0], dtype=np.float32)
+    np.testing.assert_allclose(np.array(result), expected, rtol=1e-5)
+
+
+def test_relu_f32_256():
+    """ReLU: f32[256] — larger input with mixed positive/negative values."""
+    rng = np.random.RandomState(99)
+    a = rng.randn(256).astype(np.float32)
+    result = jax.jit(jax.nn.relu)(a)
+    expected = np.maximum(a, 0.0)
+    np.testing.assert_allclose(np.array(result), expected, rtol=1e-5)
+
+
+def test_relu_bf16_256():
+    """ReLU: bf16[256] — bf16 activation function."""
+    import ml_dtypes
+    rng = np.random.RandomState(100)
+    a = rng.randn(256).astype(ml_dtypes.bfloat16)
+    result = jax.jit(jax.nn.relu)(a)
+    expected = np.maximum(a.astype(np.float32), 0.0)
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
+
+
 def test_cache_hit():
     """Test 8: Second compilation of same HLO hits XDNA cache.
 
@@ -512,6 +539,10 @@ def main():
         ("matmul bf16 multicore [32,64]@[64,32]", test_matmul_bf16_multicore),
         ("matmul bf16 multicore large [64,64]@[64,128]", test_matmul_bf16_multicore_large),
         ("matmul f32 multicore fallback [16,16]@[16,24]", test_matmul_f32_multicore_fallback),
+    ] + [
+        ("relu f32[4]", test_relu_f32_4),
+        ("relu f32[256]", test_relu_f32_256),
+        ("relu bf16[256]", test_relu_bf16_256),
     ] + [
         ("multicore auto-reduce f32[1006]", test_multicore_auto_reduce),
         ("multicore single fallback f32[7]", test_multicore_single_fallback),
