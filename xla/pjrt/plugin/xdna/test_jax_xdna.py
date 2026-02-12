@@ -410,6 +410,46 @@ def test_matmul_bf16_64x64():
     np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, atol=1.0)
 
 
+def test_matmul_f32_multicore():
+    """Matmul: f32 [32,32] @ [32,128] — N=128 triggers 4-core parallel."""
+    rng = np.random.RandomState(50)
+    a = rng.randn(32, 32).astype(np.float32)
+    b = rng.randn(32, 128).astype(np.float32)
+    result = jax.jit(jnp.dot)(a, b)
+    np.testing.assert_allclose(np.array(result), a @ b, atol=0.5)
+
+
+def test_matmul_bf16_multicore():
+    """Matmul: bf16 [32,64] @ [64,32] — N=32, n=8, Nt=4, divisible by 4."""
+    import ml_dtypes
+    rng = np.random.RandomState(51)
+    a = rng.randn(32, 64).astype(ml_dtypes.bfloat16)
+    b = rng.randn(64, 32).astype(ml_dtypes.bfloat16)
+    result = jax.jit(jnp.dot)(a, b)
+    expected = a.astype(np.float32) @ b.astype(np.float32)
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, atol=1.0)
+
+
+def test_matmul_bf16_multicore_large():
+    """Matmul: bf16 [64,64] @ [64,128] — Mt=2 + 4 cores."""
+    import ml_dtypes
+    rng = np.random.RandomState(52)
+    a = rng.randn(64, 64).astype(ml_dtypes.bfloat16)
+    b = rng.randn(64, 128).astype(ml_dtypes.bfloat16)
+    result = jax.jit(jnp.dot)(a, b)
+    expected = a.astype(np.float32) @ b.astype(np.float32)
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, atol=1.0)
+
+
+def test_matmul_f32_multicore_fallback():
+    """Matmul: f32 [16,16] @ [16,24] — N=24, n=8→Nt=3, only divisible by 3."""
+    rng = np.random.RandomState(53)
+    a = rng.randn(16, 16).astype(np.float32)
+    b = rng.randn(16, 24).astype(np.float32)
+    result = jax.jit(jnp.dot)(a, b)
+    np.testing.assert_allclose(np.array(result), a @ b, atol=0.5)
+
+
 def test_cache_hit():
     """Test 8: Second compilation of same HLO hits XDNA cache.
 
@@ -468,6 +508,10 @@ def main():
         ("matmul f32 [64,64]@[64,64]", test_matmul_f32_64x64),
         ("matmul bf16 [32,32]@[32,32]", test_matmul_bf16_32x32),
         ("matmul bf16 [64,64]@[64,64]", test_matmul_bf16_64x64),
+        ("matmul f32 multicore [32,32]@[32,128]", test_matmul_f32_multicore),
+        ("matmul bf16 multicore [32,64]@[64,32]", test_matmul_bf16_multicore),
+        ("matmul bf16 multicore large [64,64]@[64,128]", test_matmul_bf16_multicore_large),
+        ("matmul f32 multicore fallback [16,16]@[16,24]", test_matmul_f32_multicore_fallback),
     ] + [
         ("multicore auto-reduce f32[1006]", test_multicore_auto_reduce),
         ("multicore single fallback f32[7]", test_multicore_single_fallback),
@@ -480,11 +524,18 @@ def main():
 
     passed = 0
     failed = 0
-    for name, fn in tests:
+    for idx, (name, fn) in enumerate(tests):
         if run_test(name, fn):
             passed += 1
         else:
             failed += 1
+        # Release hw_contexts periodically to avoid driver exhaustion.
+        # The XDNA driver has a finite number of hw_context slots per
+        # process (~48). JAX caches executables, preventing GC. Clear
+        # the caches every 40 tests to reclaim slots.
+        if (idx + 1) % 40 == 0:
+            jax.clear_caches()
+            import gc; gc.collect()
 
     print(f"=" * 40, flush=True)
     print(f"Results: {passed} passed, {failed} failed, {len(tests)} total", flush=True)

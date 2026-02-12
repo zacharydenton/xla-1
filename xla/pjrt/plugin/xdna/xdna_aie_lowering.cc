@@ -269,7 +269,8 @@ std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
 //   bf16: 4*(m*k + k*n + 2*m*n) bytes  (A,B bf16 FIFOs + C bf16 FIFO + f32 acc)
 //   f32:  8*(m*k + k*n + m*n)   bytes  (A,B,C f32 FIFOs, accumulate in C)
 absl::StatusOr<MatmulTileConfig> SelectMatmulTiles(
-    const MatmulProgramInfo& info, const TargetCaps& caps) {
+    const MatmulProgramInfo& info, const TargetCaps& caps,
+    int num_cores) {
   int64_t l1_limit = caps.l1_usable_bytes;
   const char* limit_env = std::getenv("XDNA_L1_LIMIT_BYTES");
   if (limit_env) l1_limit = std::atol(limit_env);
@@ -317,7 +318,9 @@ absl::StatusOr<MatmulTileConfig> SelectMatmulTiles(
       if (info.M % m != 0) continue;
       for (int64_t n : kNCandidatesVec) {
         if (info.N % n != 0) continue;
-        if (info.N / n > 64) continue;  // DMA d3 limit
+        int64_t Nt = info.N / n;
+        if (Nt % num_cores != 0) continue;
+        if (Nt / num_cores > 64) continue;  // DMA d3 limit per core
         for (int64_t k : kKCandidatesVec) {
           if (info.K % k != 0) continue;
           if (fits_l1(m, k, n)) {
@@ -337,7 +340,9 @@ absl::StatusOr<MatmulTileConfig> SelectMatmulTiles(
         if (info.K % k != 0) continue;
         for (int64_t n : kMNCandidates) {
           if (info.N % n != 0) continue;
-          if (info.N / n > 64) continue;
+          int64_t Nt = info.N / n;
+          if (Nt % num_cores != 0) continue;
+          if (Nt / num_cores > 64) continue;  // DMA d3 limit per core
           if (fits_l1(m, k, n)) {
             return MatmulTileConfig{m, k, n};
           }
@@ -358,7 +363,8 @@ absl::StatusOr<MatmulTileConfig> SelectMatmulTiles(
 
 // Forward declaration.
 absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
-    const MatmulProgramInfo& info, const TargetCaps& caps);
+    const MatmulProgramInfo& info, const TargetCaps& caps,
+    int max_columns);
 
 // Analyzes the linalg module to extract program info.
 absl::StatusOr<LinalgProgramInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
@@ -932,8 +938,11 @@ absl::StatusOr<std::string> GenerateNpuSequence(
     int64_t offset = c * per_core_elements;
 
     // Input DMAs for this column.
+    // BD IDs are per-core (0..num_inputs), not global. Each column's shim
+    // has its own BD space, so different columns can reuse the same IDs.
+    // The hardware has 16 BDs per shim (4-bit ID field: 0-15).
     for (int i = 0; i < program.num_inputs; i++) {
-      int dma_id = c * (program.num_inputs + 1) + i;
+      int dma_id = i;
       std::string meta = fifo_name(c, absl::StrFormat("in%d%s", i, l2));
       absl::StrAppend(&seq, absl::StrFormat(
           "      aiex.npu.dma_memcpy_nd(%%arg%d[0, 0, 0, %d]"
@@ -947,7 +956,7 @@ absl::StatusOr<std::string> GenerateNpuSequence(
 
     // Output DMA for this column with issue_token for completion tracking.
     int out_arg = program.num_inputs;
-    int out_dma_id = c * (program.num_inputs + 1) + program.num_inputs;
+    int out_dma_id = program.num_inputs;
     std::string out_meta = fifo_name(c, absl::StrFormat("out0%s", l2));
     absl::StrAppend(&seq, absl::StrFormat(
         "      aiex.npu.dma_memcpy_nd(%%arg%d[0, 0, 0, %d]"
@@ -985,11 +994,12 @@ absl::StatusOr<std::string> GenerateNpuSequence(
 // acquires A/B tiles, performs MAC over 4-row blocks, then releases.
 // The objectFifo-stateful-transform pass handles ping-pong buffering.
 std::string GenerateVectorizedMatmulCoreBody(
-    const MatmulProgramInfo& info, const MatmulTileConfig& tile) {
+    const MatmulProgramInfo& info, const MatmulTileConfig& tile,
+    int64_t Nt_per_core, const std::string& fifo_prefix,
+    const std::string& acc_name) {
   std::string body;
 
   int64_t Mt = info.M / tile.m;
-  int64_t Nt = info.N / tile.n;
   int64_t Kt = info.K / tile.k;
 
   // 2D memref types (for ObjectFIFO acquire/release).
@@ -1027,14 +1037,14 @@ std::string GenerateVectorizedMatmulCoreBody(
   absl::StrAppend(&body,
       "      %pad_f32 = arith.constant 0.0 : f32\n"
       "      %pad_bf16 = arith.constant 0.0 : bf16\n");
-  int64_t total_out_tiles = Mt * Nt;
+  int64_t total_out_tiles = Mt * Nt_per_core;
   absl::StrAppend(&body, absl::StrFormat(
       "      %%n_out_tiles = arith.constant %d : index\n", total_out_tiles));
 
   // Flatten accumulator memref to 1D for vector transfers.
   absl::StrAppend(&body, absl::StrFormat(
-      "      %%flat_acc = memref.collapse_shape %%acc [[0, 1]]"
-      " : %s into %s\n", acc_memref, acc_flat));
+      "      %%flat_acc = memref.collapse_shape %%%s [[0, 1]]"
+      " : %s into %s\n", acc_name, acc_memref, acc_flat));
 
   // Outer loop over output tiles.
   absl::StrAppend(&body,
@@ -1042,8 +1052,8 @@ std::string GenerateVectorizedMatmulCoreBody(
 
   // Acquire C (Produce).
   absl::StrAppend(&body, absl::StrFormat(
-      "        %%subview_c = aie.objectfifo.acquire @outC(Produce, 1) "
-      ": !aie.objectfifosubview<%s>\n", c_memref));
+      "        %%subview_c = aie.objectfifo.acquire @%soutC(Produce, 1) "
+      ": !aie.objectfifosubview<%s>\n", fifo_prefix, c_memref));
   absl::StrAppend(&body, absl::StrFormat(
       "        %%elem_c = aie.objectfifo.subview.access %%subview_c[0] "
       ": !aie.objectfifosubview<%s> -> %s\n", c_memref, c_memref));
@@ -1055,8 +1065,8 @@ std::string GenerateVectorizedMatmulCoreBody(
       "        scf.for %zi = %c0 to %cm step %c1 {\n"
       "          scf.for %zj = %c0 to %cn step %c1 {\n");
   absl::StrAppend(&body, absl::StrFormat(
-      "            memref.store %%pad_f32, %%acc[%%zi, %%zj] : %s\n",
-      acc_memref));
+      "            memref.store %%pad_f32, %%%s[%%zi, %%zj] : %s\n",
+      acc_name, acc_memref));
   absl::StrAppend(&body,
       "          }\n"
       "        }\n");
@@ -1072,8 +1082,8 @@ std::string GenerateVectorizedMatmulCoreBody(
   {
     // Acquire A and B (Consume), flatten to 1D.
     absl::StrAppend(&body, absl::StrFormat(
-        "          %%subview_a = aie.objectfifo.acquire @inA(Consume, 1) "
-        ": !aie.objectfifosubview<%s>\n", a_memref));
+        "          %%subview_a = aie.objectfifo.acquire @%sinA(Consume, 1) "
+        ": !aie.objectfifosubview<%s>\n", fifo_prefix, a_memref));
     absl::StrAppend(&body, absl::StrFormat(
         "          %%elem_a = aie.objectfifo.subview.access %%subview_a[0] "
         ": !aie.objectfifosubview<%s> -> %s\n", a_memref, a_memref));
@@ -1081,8 +1091,8 @@ std::string GenerateVectorizedMatmulCoreBody(
         "          %%flat_a = memref.collapse_shape %%elem_a [[0, 1]]"
         " : %s into %s\n", a_memref, a_flat));
     absl::StrAppend(&body, absl::StrFormat(
-        "          %%subview_b = aie.objectfifo.acquire @inB(Consume, 1) "
-        ": !aie.objectfifosubview<%s>\n", b_memref));
+        "          %%subview_b = aie.objectfifo.acquire @%sinB(Consume, 1) "
+        ": !aie.objectfifosubview<%s>\n", fifo_prefix, b_memref));
     absl::StrAppend(&body, absl::StrFormat(
         "          %%elem_b = aie.objectfifo.subview.access %%subview_b[0] "
         ": !aie.objectfifosubview<%s> -> %s\n", b_memref, b_memref));
@@ -1151,9 +1161,10 @@ std::string GenerateVectorizedMatmulCoreBody(
         "          }\n");
 
     // Release A and B.
-    absl::StrAppend(&body,
-        "          aie.objectfifo.release @inA(Consume, 1)\n"
-        "          aie.objectfifo.release @inB(Consume, 1)\n");
+    absl::StrAppend(&body, absl::StrFormat(
+        "          aie.objectfifo.release @%sinA(Consume, 1)\n"
+        "          aie.objectfifo.release @%sinB(Consume, 1)\n",
+        fifo_prefix, fifo_prefix));
   }
 
   // Close K-tile loop.
@@ -1167,8 +1178,8 @@ std::string GenerateVectorizedMatmulCoreBody(
       "        scf.for %ci = %c0 to %cm step %c1 {\n"
       "          scf.for %cj = %c0 to %cn step %c1 {\n");
   absl::StrAppend(&body, absl::StrFormat(
-      "            %%acc_val = memref.load %%acc[%%ci, %%cj] : %s\n",
-      acc_memref));
+      "            %%acc_val = memref.load %%%s[%%ci, %%cj] : %s\n",
+      acc_name, acc_memref));
   absl::StrAppend(&body,
       "            %bf16_val = arith.truncf %acc_val : f32 to bf16\n");
   absl::StrAppend(&body, absl::StrFormat(
@@ -1179,8 +1190,8 @@ std::string GenerateVectorizedMatmulCoreBody(
       "        }\n");
 
   // Release C.
-  absl::StrAppend(&body,
-      "        aie.objectfifo.release @outC(Produce, 1)\n");
+  absl::StrAppend(&body, absl::StrFormat(
+      "        aie.objectfifo.release @%soutC(Produce, 1)\n", fifo_prefix));
 
   // Close output tile loop.
   absl::StrAppend(&body,
@@ -1194,13 +1205,14 @@ std::string GenerateVectorizedMatmulCoreBody(
 //   acquire C → zero accumulator → for kt in K/k: acquire A,B → MAC → release
 //   → [bf16: truncate acc→C] → release C
 std::string GenerateMatmulCoreBody(
-    const MatmulProgramInfo& info, const MatmulTileConfig& tile) {
+    const MatmulProgramInfo& info, const MatmulTileConfig& tile,
+    int64_t Nt_per_core, const std::string& fifo_prefix,
+    const std::string& acc_name) {
   std::string body;
   const std::string& ty = info.element_type;
   bool is_bf16 = (ty == "bf16");
 
   int64_t Mt = info.M / tile.m;
-  int64_t Nt = info.N / tile.n;
   int64_t Kt = info.K / tile.k;
 
   std::string a_memref = absl::StrFormat("memref<%dx%dx%s>", tile.m, tile.k, ty);
@@ -1226,7 +1238,7 @@ std::string GenerateMatmulCoreBody(
         "      %%zero_%s = arith.constant 0.0 : %s\n", ty, ty));
   }
 
-  int64_t total_out_tiles = Mt * Nt;
+  int64_t total_out_tiles = Mt * Nt_per_core;
   absl::StrAppend(&body, absl::StrFormat(
       "      %%n_out_tiles = arith.constant %d : index\n", total_out_tiles));
   absl::StrAppend(&body, absl::StrFormat(
@@ -1238,8 +1250,8 @@ std::string GenerateMatmulCoreBody(
 
   // Acquire C (Produce).
   absl::StrAppend(&body, absl::StrFormat(
-      "        %%subview_c = aie.objectfifo.acquire @outC(Produce, 1) "
-      ": !aie.objectfifosubview<%s>\n", c_memref));
+      "        %%subview_c = aie.objectfifo.acquire @%soutC(Produce, 1) "
+      ": !aie.objectfifosubview<%s>\n", fifo_prefix, c_memref));
   absl::StrAppend(&body, absl::StrFormat(
       "        %%elem_c = aie.objectfifo.subview.access %%subview_c[0] "
       ": !aie.objectfifosubview<%s> -> %s\n", c_memref, c_memref));
@@ -1251,8 +1263,8 @@ std::string GenerateMatmulCoreBody(
         "        scf.for %zi = %c0 to %cm step %c1 {\n"
         "          scf.for %zj = %c0 to %cn step %c1 {\n");
     absl::StrAppend(&body, absl::StrFormat(
-        "            memref.store %%zero_f32, %%acc[%%zi, %%zj] : %s\n",
-        acc_memref));
+        "            memref.store %%zero_f32, %%%s[%%zi, %%zj] : %s\n",
+        acc_name, acc_memref));
     absl::StrAppend(&body,
         "          }\n"
         "        }\n");
@@ -1275,14 +1287,14 @@ std::string GenerateMatmulCoreBody(
 
   // Acquire A and B (Consume).
   absl::StrAppend(&body, absl::StrFormat(
-      "          %%subview_a = aie.objectfifo.acquire @inA(Consume, 1) "
-      ": !aie.objectfifosubview<%s>\n", a_memref));
+      "          %%subview_a = aie.objectfifo.acquire @%sinA(Consume, 1) "
+      ": !aie.objectfifosubview<%s>\n", fifo_prefix, a_memref));
   absl::StrAppend(&body, absl::StrFormat(
       "          %%elem_a = aie.objectfifo.subview.access %%subview_a[0] "
       ": !aie.objectfifosubview<%s> -> %s\n", a_memref, a_memref));
   absl::StrAppend(&body, absl::StrFormat(
-      "          %%subview_b = aie.objectfifo.acquire @inB(Consume, 1) "
-      ": !aie.objectfifosubview<%s>\n", b_memref));
+      "          %%subview_b = aie.objectfifo.acquire @%sinB(Consume, 1) "
+      ": !aie.objectfifosubview<%s>\n", fifo_prefix, b_memref));
   absl::StrAppend(&body, absl::StrFormat(
       "          %%elem_b = aie.objectfifo.subview.access %%subview_b[0] "
       ": !aie.objectfifosubview<%s> -> %s\n", b_memref, b_memref));
@@ -1305,13 +1317,13 @@ std::string GenerateMatmulCoreBody(
         "                %prod_bf = arith.mulf %a_val, %b_val : bf16\n"
         "                %prod_f32 = arith.extf %prod_bf : bf16 to f32\n");
     absl::StrAppend(&body, absl::StrFormat(
-        "                %%c_old = memref.load %%acc[%%i, %%j] : %s\n",
-        acc_memref));
+        "                %%c_old = memref.load %%%s[%%i, %%j] : %s\n",
+        acc_name, acc_memref));
     absl::StrAppend(&body,
         "                %c_new = arith.addf %c_old, %prod_f32 : f32\n");
     absl::StrAppend(&body, absl::StrFormat(
-        "                memref.store %%c_new, %%acc[%%i, %%j] : %s\n",
-        acc_memref));
+        "                memref.store %%c_new, %%%s[%%i, %%j] : %s\n",
+        acc_name, acc_memref));
   } else {
     // f32: truncate→bf16 multiply→extend workaround, accumulate in C.
     absl::StrAppend(&body, absl::StrFormat(
@@ -1342,9 +1354,10 @@ std::string GenerateMatmulCoreBody(
       "          }\n");
 
   // Release A and B.
-  absl::StrAppend(&body,
-      "          aie.objectfifo.release @inA(Consume, 1)\n"
-      "          aie.objectfifo.release @inB(Consume, 1)\n");
+  absl::StrAppend(&body, absl::StrFormat(
+      "          aie.objectfifo.release @%sinA(Consume, 1)\n"
+      "          aie.objectfifo.release @%sinB(Consume, 1)\n",
+      fifo_prefix, fifo_prefix));
 
   // Close K-tile loop.
   absl::StrAppend(&body,
@@ -1356,8 +1369,8 @@ std::string GenerateMatmulCoreBody(
         "        scf.for %ci = %c0 to %cm step %c1 {\n"
         "          scf.for %cj = %c0 to %cn step %c1 {\n");
     absl::StrAppend(&body, absl::StrFormat(
-        "            %%acc_val = memref.load %%acc[%%ci, %%cj] : %s\n",
-        acc_memref));
+        "            %%acc_val = memref.load %%%s[%%ci, %%cj] : %s\n",
+        acc_name, acc_memref));
     absl::StrAppend(&body,
         "            %acc_bf = arith.truncf %acc_val : f32 to bf16\n");
     absl::StrAppend(&body, absl::StrFormat(
@@ -1369,8 +1382,8 @@ std::string GenerateMatmulCoreBody(
   }
 
   // Release C.
-  absl::StrAppend(&body,
-      "        aie.objectfifo.release @outC(Produce, 1)\n");
+  absl::StrAppend(&body, absl::StrFormat(
+      "        aie.objectfifo.release @%soutC(Produce, 1)\n", fifo_prefix));
 
   // Close output tile loop.
   absl::StrAppend(&body,
@@ -1399,11 +1412,12 @@ std::string GenerateMatmulCoreBody(
 // DMA must deliver tiles in exactly this order.
 absl::StatusOr<std::string> GenerateMatmulNpuSequence(
     const MatmulProgramInfo& info, const MatmulTileConfig& tile,
-    const TargetCaps& caps) {
+    const TargetCaps& caps, int num_cores) {
   const std::string& ty = info.element_type;
   int64_t Mt = info.M / tile.m;
   int64_t Nt = info.N / tile.n;
   int64_t Kt = info.K / tile.k;
+  int64_t Nt_per_core = Nt / num_cores;
 
   int element_bytes = (ty == "bf16") ? 2 : 4;
 
@@ -1414,122 +1428,146 @@ absl::StatusOr<std::string> GenerateMatmulNpuSequence(
   std::string c_host_memref = absl::StrFormat("memref<%dx%s>",
       info.M * info.N, ty);
 
+  // FIFO name helper: multi-core uses "c{col}_" prefix, single-core uses "".
+  auto fifo_name = [&](int c, const std::string& base) -> std::string {
+    return num_cores > 1 ? absl::StrFormat("c%d_%s", c, base) : base;
+  };
+
   std::string seq;
   absl::StrAppend(&seq, absl::StrFormat(
       "    aie.runtime_sequence(%%arg0: %s, %%arg1: %s, %%arg2: %s) {\n",
       a_host_memref, b_host_memref, c_host_memref));
 
-  int dma_id = 0;
+  // DMA limit checks (same for all cores — tile sizes are identical).
+  int64_t a_d0_words = tile.k * element_bytes / 4;
+  int64_t a_d1 = tile.m;
+  if (a_d0_words > kMaxBdWords || a_d1 > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Matmul A DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
+        a_d0_words, a_d1));
+  }
+  int64_t b_d0_words = tile.n * element_bytes / 4;
+  int64_t b_d1 = tile.k;
+  if (b_d0_words > kMaxBdWords || b_d1 > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Matmul B DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
+        b_d0_words, b_d1));
+  }
+  int64_t c_d0_words = tile.n * element_bytes / 4;
+  int64_t c_d1 = tile.m;
+  if (c_d0_words > kMaxBdWords || c_d1 > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Matmul C DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
+        c_d0_words, c_d1));
+  }
+  if (Nt_per_core > 64) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Matmul DMA d3=%d exceeds limit 64", Nt_per_core));
+  }
 
   for (int64_t mt = 0; mt < Mt; mt++) {
-    // For this mt row, the core will process N/n output columns.
-    // For each (mt, nt) pair, it needs K/k A tiles and K/k B tiles.
-    //
-    // A tiles needed: for each nt in [0, Nt), for each kt in [0, Kt):
-    //   A[mt*m:(mt+1)*m, kt*k:(kt+1)*k]
-    //   Since A doesn't depend on nt, we need Nt repetitions of the
-    //   same K/k A tiles.
-    //
-    // 4D DMA for A: [Nt, Kt, m, k] with strides [0, k, K, 1]
-    //   d3=Nt: repeat for each N-tile (stride 0 = broadcast)
-    //   d2=Kt: iterate over K-tiles (stride k elements)
-    //   d1=m: rows of tile (stride K = row stride in A)
-    //   d0=k: elements per row (stride 1)
-    int64_t a_offset = mt * tile.m * info.K;
-    // Check DMA limits: d0 and d1 are in 32-bit words, max 1023.
-    int64_t a_d0_words = tile.k * element_bytes / 4;
-    int64_t a_d1 = tile.m;
-    if (a_d0_words > kMaxBdWords || a_d1 > kMaxBdWords) {
-      return absl::InvalidArgumentError(absl::StrFormat(
-          "Matmul A DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
-          a_d0_words, a_d1));
-    }
-    absl::StrAppend(&seq, absl::StrFormat(
-        "      aiex.npu.dma_memcpy_nd(%%arg0"
-        "[0, 0, 0, %d][%d, %d, %d, %d][0, %d, %d, 1]) "
-        "{id = %d : i64, metadata = @inA_L2, issue_token = true} : %s\n",
-        a_offset,
-        Nt, Kt, tile.m, tile.k,
-        tile.k, info.K,
-        dma_id++, a_host_memref));
+    // Reset BD IDs each mt block. After the dma_wait barrier at the end of
+    // each block, all BDs are complete and their slots can be reused.
+    // The hardware has only 16 BD slots (4-bit ID field: 0-15).
+    int dma_id = 0;
 
-    // B tiles needed: for each nt in [0, Nt), for each kt in [0, Kt):
-    //   B[kt*k:(kt+1)*k, nt*n:(nt+1)*n]
-    //
-    // 4D DMA for B: [Nt, Kt, k, n] with strides [n, k*N, N, 1]
-    //   d3=Nt: iterate over N-tiles (stride n)
-    //   d2=Kt: iterate over K-tiles (stride k*N)
-    //   d1=k: rows of tile (stride N = row stride in B)
-    //   d0=n: elements per row (stride 1)
-    int64_t b_d0_words = tile.n * element_bytes / 4;
-    int64_t b_d1 = tile.k;
-    if (b_d0_words > kMaxBdWords || b_d1 > kMaxBdWords) {
-      return absl::InvalidArgumentError(absl::StrFormat(
-          "Matmul B DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
-          b_d0_words, b_d1));
-    }
-    if (Nt > 64) {
-      return absl::InvalidArgumentError(absl::StrFormat(
-          "Matmul B DMA d3=%d exceeds limit 64", Nt));
-    }
-    absl::StrAppend(&seq, absl::StrFormat(
-        "      aiex.npu.dma_memcpy_nd(%%arg1"
-        "[0, 0, 0, 0][%d, %d, %d, %d][%d, %d, %d, 1]) "
-        "{id = %d : i64, metadata = @inB_L2, issue_token = true} : %s\n",
-        Nt, Kt, tile.k, tile.n,
-        tile.n, tile.k * info.N, info.N,
-        dma_id++, b_host_memref));
+    // Per-core DMAs for this M-tile row.
+    // A is broadcast (same rows for all cores), B and C are column-partitioned.
+    for (int c = 0; c < num_cores; c++) {
+      // A DMA: [Nt_per_core, Kt, m, k] strides [0, k, K, 1]
+      //   d3=Nt_per_core: repeat for each N-tile (stride 0 = broadcast)
+      //   d2=Kt: iterate over K-tiles (stride k elements)
+      //   d1=m: rows of tile (stride K = row stride in A)
+      //   d0=k: elements per row (stride 1)
+      int64_t a_offset = mt * tile.m * info.K;
+      absl::StrAppend(&seq, absl::StrFormat(
+          "      aiex.npu.dma_memcpy_nd(%%arg0"
+          "[0, 0, 0, %d][%d, %d, %d, %d][0, %d, %d, 1]) "
+          "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+          a_offset,
+          Nt_per_core, Kt, tile.m, tile.k,
+          tile.k, info.K,
+          dma_id++, fifo_name(c, "inA_L2"), a_host_memref));
 
-    // C tiles: for each nt in [0, Nt):
-    //   C[mt*m:(mt+1)*m, nt*n:(nt+1)*n]
-    //
-    // 4D DMA for C: [1, Nt, m, n] with strides [0, n, N, 1]
-    int64_t c_offset = mt * tile.m * info.N;
-    int64_t c_d0_words = tile.n * element_bytes / 4;
-    int64_t c_d1 = tile.m;
-    if (c_d0_words > kMaxBdWords || c_d1 > kMaxBdWords) {
-      return absl::InvalidArgumentError(absl::StrFormat(
-          "Matmul C DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
-          c_d0_words, c_d1));
+      // B DMA: [Nt_per_core, Kt, k, n] strides [n, k*N, N, 1]
+      //   d3=Nt_per_core: iterate over N-tiles (stride n)
+      //   d2=Kt: iterate over K-tiles (stride k*N)
+      //   d1=k: rows of tile (stride N = row stride in B)
+      //   d0=n: elements per row (stride 1)
+      // Each core reads a different column slice of B.
+      int64_t b_offset = c * Nt_per_core * tile.n;
+      absl::StrAppend(&seq, absl::StrFormat(
+          "      aiex.npu.dma_memcpy_nd(%%arg1"
+          "[0, 0, 0, %d][%d, %d, %d, %d][%d, %d, %d, 1]) "
+          "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+          b_offset,
+          Nt_per_core, Kt, tile.k, tile.n,
+          tile.n, tile.k * info.N, info.N,
+          dma_id++, fifo_name(c, "inB_L2"), b_host_memref));
+
+      // C DMA: [1, Nt_per_core, m, n] strides [0, n, N, 1]
+      // Each core writes a different column slice of C.
+      int64_t c_offset = mt * tile.m * info.N + c * Nt_per_core * tile.n;
+      absl::StrAppend(&seq, absl::StrFormat(
+          "      aiex.npu.dma_memcpy_nd(%%arg2"
+          "[0, 0, 0, %d][1, %d, %d, %d][0, %d, %d, 1]) "
+          "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+          c_offset,
+          Nt_per_core, tile.m, tile.n,
+          tile.n, info.N,
+          dma_id++, fifo_name(c, "outC_L2"), c_host_memref));
     }
-    // Add issue_token on ALL DMAs and dma_wait for ALL channels after
-    // each mt block. This ensures all DMA channel states are fully reset
-    // before the next block's BDs are submitted. Without A/B waits, the
-    // shim DMA channels may not be in a clean state when new BDs arrive,
-    // causing timeouts on larger matrices (e.g. 64x64 with Mt=2).
-    absl::StrAppend(&seq, absl::StrFormat(
-        "      aiex.npu.dma_memcpy_nd(%%arg2"
-        "[0, 0, 0, %d][1, %d, %d, %d][0, %d, %d, 1]) "
-        "{id = %d : i64, metadata = @outC_L2, issue_token = true} : %s\n",
-        c_offset,
-        Nt, tile.m, tile.n,
-        tile.n, info.N,
-        dma_id++, c_host_memref));
-    // Wait for C first (completes last), then A and B (already done).
-    absl::StrAppend(&seq,
-        "      aiex.npu.dma_wait { symbol = @outC_L2 }\n"
-        "      aiex.npu.dma_wait { symbol = @inA_L2 }\n"
-        "      aiex.npu.dma_wait { symbol = @inB_L2 }\n");
+
+    // Wait for ALL cores' DMAs before next mt block.
+    // This ensures all DMA channel states are fully reset before the
+    // next block's BDs are submitted.
+    for (int c = 0; c < num_cores; c++) {
+      absl::StrAppend(&seq, absl::StrFormat(
+          "      aiex.npu.dma_wait { symbol = @%s }\n",
+          fifo_name(c, "outC_L2")));
+      absl::StrAppend(&seq, absl::StrFormat(
+          "      aiex.npu.dma_wait { symbol = @%s }\n",
+          fifo_name(c, "inA_L2")));
+      absl::StrAppend(&seq, absl::StrFormat(
+          "      aiex.npu.dma_wait { symbol = @%s }\n",
+          fifo_name(c, "inB_L2")));
+    }
   }
   absl::StrAppend(&seq, "    }\n");
 
   return seq;
 }
 
-// Lowers a matmul to AIE dialect MLIR (single-core, scalar kernel).
+// Lowers a matmul to AIE dialect MLIR (multi-core parallel on N dimension).
 absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
-    const MatmulProgramInfo& info, const TargetCaps& caps) {
-  // Select tile sizes.
-  auto tile_or = SelectMatmulTiles(info, caps);
-  if (!tile_or.ok()) return tile_or.status();
-  MatmulTileConfig tile = *tile_or;
+    const MatmulProgramInfo& info, const TargetCaps& caps,
+    int max_columns) {
+  // Auto-scale number of cores. max_columns is already clamped by the
+  // compiler (respects XDNA_NUM_CORES env var and caps.num_columns).
+  int max_cores = max_columns;
+
+  int num_cores = max_cores;
+  MatmulTileConfig tile;
+  while (num_cores >= 1) {
+    auto tile_or = SelectMatmulTiles(info, caps, num_cores);
+    if (tile_or.ok()) { tile = *tile_or; break; }
+    num_cores--;
+  }
+  if (num_cores < 1) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Cannot tile matmul [%d,%d]@[%d,%d] %s for any core count 1-%d",
+        info.M, info.K, info.K, info.N, info.element_type, max_cores));
+  }
 
   bool is_bf16 = (info.element_type == "bf16");
   bool use_vectorized = is_bf16 && tile.k == 8;
+  int64_t Nt = info.N / tile.n;
+  int64_t Nt_per_core = Nt / num_cores;
   LOG(INFO) << "XDNA matmul lowering: tiles m=" << tile.m << " k=" << tile.k
             << " n=" << tile.n << " (M=" << info.M << " K=" << info.K
             << " N=" << info.N << " " << info.element_type
-            << (use_vectorized ? " VECTORIZED" : " scalar") << ")";
+            << (use_vectorized ? " VECTORIZED" : " scalar")
+            << ") using " << num_cores << " core(s)";
   const std::string& ty = info.element_type;
   int start_col = caps.partition_start_column;
   int shim_row = caps.shim_row;
@@ -1539,78 +1577,117 @@ absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
   std::string b_memref = absl::StrFormat("memref<%dx%dx%s>", tile.k, tile.n, ty);
   std::string c_memref = absl::StrFormat("memref<%dx%dx%s>", tile.m, tile.n, ty);
 
+  // FIFO name helper: multi-core uses "c{col}_" prefix, single-core uses "".
+  auto fifo_name = [&](int c, const std::string& base) -> std::string {
+    return num_cores > 1 ? absl::StrFormat("c%d_%s", c, base) : base;
+  };
+  auto fifo_prefix = [&](int c) -> std::string {
+    return num_cores > 1 ? absl::StrFormat("c%d_", c) : "";
+  };
+  auto acc_name = [&](int c) -> std::string {
+    return num_cores > 1 ? absl::StrFormat("acc_%d", c) : "acc";
+  };
+
+  int fifo_depth = 2;
+
   std::string aie_mlir;
   absl::StrAppend(&aie_mlir, "module {\n");
   absl::StrAppend(&aie_mlir,
       absl::StrFormat("  aie.device(%s) {\n", caps.device_name));
 
-  // Tile declarations.
-  int col = start_col;
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, shim_row, col, shim_row));
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, caps.mem_tile_row,
-      col, caps.mem_tile_row));
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, compute_row,
-      col, compute_row));
-
-  std::string shim_tile = absl::StrFormat("tile_%d_%d", col, shim_row);
-  std::string mem_tile = absl::StrFormat("tile_%d_%d", col, caps.mem_tile_row);
-  std::string compute_tile = absl::StrFormat("tile_%d_%d", col, compute_row);
-
-  int fifo_depth = 2;
-
-  // ObjectFIFOs: shim ↔ mem tile (L2).
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @inA_L2(%%%s, {%%%s}, %d : i32) "
-      ": !aie.objectfifo<%s>\n", shim_tile, mem_tile, fifo_depth, a_memref));
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @inB_L2(%%%s, {%%%s}, %d : i32) "
-      ": !aie.objectfifo<%s>\n", shim_tile, mem_tile, fifo_depth, b_memref));
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @outC_L2(%%%s, {%%%s}, %d : i32) "
-      ": !aie.objectfifo<%s>\n", mem_tile, shim_tile, fifo_depth, c_memref));
-
-  // ObjectFIFOs: mem tile ↔ compute (L1).
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @inA(%%%s, {%%%s}, %d : i32) "
-      ": !aie.objectfifo<%s>\n", mem_tile, compute_tile, fifo_depth, a_memref));
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @inB(%%%s, {%%%s}, %d : i32) "
-      ": !aie.objectfifo<%s>\n", mem_tile, compute_tile, fifo_depth, b_memref));
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    aie.objectfifo @outC(%%%s, {%%%s}, %d : i32) "
-      ": !aie.objectfifo<%s>\n", compute_tile, mem_tile, fifo_depth, c_memref));
-
-  // Links through memory tile.
-  absl::StrAppend(&aie_mlir,
-      "    aie.objectfifo.link [@inA_L2] -> [@inA] ([] [])\n"
-      "    aie.objectfifo.link [@inB_L2] -> [@inB] ([] [])\n"
-      "    aie.objectfifo.link [@outC] -> [@outC_L2] ([] [])\n");
-
-  // Local accumulator buffer (bf16 only).
-  if (is_bf16) {
+  // Pass 1: All tile declarations.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
     absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "    %%acc = aie.buffer(%%%s) {sym_name = \"acc\"} "
-        ": memref<%dx%dxf32>\n", compute_tile, tile.m, tile.n));
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, shim_row, col, shim_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, caps.mem_tile_row, col, caps.mem_tile_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, compute_row, col, compute_row));
   }
 
-  // Core body.
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    %%core_%d_%d = aie.core(%%%s) {\n", col, compute_row,
-      compute_tile));
-  if (use_vectorized) {
-    absl::StrAppend(&aie_mlir, GenerateVectorizedMatmulCoreBody(info, tile));
-  } else {
-    absl::StrAppend(&aie_mlir, GenerateMatmulCoreBody(info, tile));
+  // Pass 2: All ObjectFIFOs, links, and accumulator buffers.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string shim_tile = absl::StrFormat("tile_%d_%d", col, shim_row);
+    std::string mem_tile = absl::StrFormat("tile_%d_%d", col, caps.mem_tile_row);
+    std::string compute_tile = absl::StrFormat("tile_%d_%d", col, compute_row);
+
+    // ObjectFIFOs: shim ↔ mem tile (L2).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "inA_L2"), shim_tile, mem_tile, fifo_depth, a_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "inB_L2"), shim_tile, mem_tile, fifo_depth, b_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "outC_L2"), mem_tile, shim_tile, fifo_depth, c_memref));
+
+    // ObjectFIFOs: mem tile ↔ compute (L1).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "inA"), mem_tile, compute_tile, fifo_depth, a_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "inB"), mem_tile, compute_tile, fifo_depth, b_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "outC"), compute_tile, mem_tile, fifo_depth, c_memref));
+
+    // Links through memory tile.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "inA_L2"), fifo_name(c, "inA")));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "inB_L2"), fifo_name(c, "inB")));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "outC"), fifo_name(c, "outC_L2")));
+
+    // Local accumulator buffer (bf16 only).
+    if (is_bf16) {
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "    %%%s = aie.buffer(%%%s) {sym_name = \"%s\"} "
+          ": memref<%dx%dxf32>\n",
+          acc_name(c), compute_tile, acc_name(c), tile.m, tile.n));
+    }
   }
-  absl::StrAppend(&aie_mlir,
-      "      aie.end\n"
-      "    }\n");
+
+  // Pass 3: All core bodies.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string compute_tile = absl::StrFormat("tile_%d_%d", col, compute_row);
+
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%core_%d_%d = aie.core(%%%s) {\n", col, compute_row,
+        compute_tile));
+    if (use_vectorized) {
+      absl::StrAppend(&aie_mlir,
+          GenerateVectorizedMatmulCoreBody(info, tile, Nt_per_core,
+                                           fifo_prefix(c), acc_name(c)));
+    } else {
+      absl::StrAppend(&aie_mlir,
+          GenerateMatmulCoreBody(info, tile, Nt_per_core,
+                                 fifo_prefix(c), acc_name(c)));
+    }
+    absl::StrAppend(&aie_mlir,
+        "      aie.end\n"
+        "    }\n");
+  }
 
   // NPU DMA sequence.
-  auto npu_seq_or = GenerateMatmulNpuSequence(info, tile, caps);
+  auto npu_seq_or = GenerateMatmulNpuSequence(info, tile, caps, num_cores);
   if (!npu_seq_or.ok()) return npu_seq_or.status();
   absl::StrAppend(&aie_mlir, *npu_seq_or);
 
@@ -1619,7 +1696,7 @@ absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
 
   LOG(INFO) << "XDNA matmul lowering: generated AIE MLIR:\n" << aie_mlir;
 
-  return AieLoweringResult{aie_mlir, /*num_cores=*/1,
+  return AieLoweringResult{aie_mlir, num_cores,
                            /*use_aievec=*/use_vectorized};
 }
 
@@ -1731,7 +1808,7 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
     LOG(INFO) << "XDNA AIE lowering: detected matmul [" << matmul_info->M
               << "," << matmul_info->K << "]@[" << matmul_info->K << ","
               << matmul_info->N << "] " << matmul_info->element_type;
-    return LowerMatmulToAieInternal(*matmul_info, caps);
+    return LowerMatmulToAieInternal(*matmul_info, caps, config.num_columns);
   }
 
   // Step 1: Analyze the linalg module (elementwise path).

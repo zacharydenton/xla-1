@@ -282,6 +282,8 @@ XdnaPjrtClient::CompileInternal(
     std::string cache_input = hlo_module->entry_computation()->ToString();
     const char* nc = std::getenv("XDNA_NUM_CORES");
     if (nc) absl::StrAppend(&cache_input, ":cores=", nc);
+    const char* l1 = std::getenv("XDNA_L1_LIMIT_BYTES");
+    if (l1) absl::StrAppend(&cache_input, ":l1=", l1);
     cache_key = tsl::Fingerprint64(cache_input);
 
     auto it = compilation_cache_.find(cache_key);
