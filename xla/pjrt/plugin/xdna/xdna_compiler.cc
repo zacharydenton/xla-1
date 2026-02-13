@@ -123,6 +123,7 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
                       GenerateXclbinFromAie(lowering.aie_mlir, num_data_args,
                                             caps, lowering.num_cores,
                                             lowering.use_aievec,
+                                            lowering.convert_vector_to_aievec,
                                             lowering.needs_softfloat_stubs));
 
   LOG(INFO) << "XDNA compiler: xclbin generated, "

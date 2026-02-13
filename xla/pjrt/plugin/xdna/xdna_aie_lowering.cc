@@ -82,6 +82,11 @@ int GetNumInputs(llvm::StringRef op_name) {
 // It CANNOT legalize: fadd/fsub/fneg on any float vector, any integer mul
 // on vectors, fptrunc/fpext on vectors, or any f32 vector float op.
 // We work around fneg by XOR with the sign bit (bitcast float→int, xor).
+//
+// For maximumf/minimumf: mlir-aie's --convert-vector-to-aievec lowers
+// arith.maximumf/minimumf on 512-bit vectors to aievec.max/min → LLVM
+// intrinsics (VectorMaxLtBf16, VectorMaxLt32, etc.). This bypasses Peano's
+// GlobalISel entirely. AIE2p supports bf16 (32-wide) but NOT f32 max/min.
 int GetVectorWidth(const std::string& element_type,
                    const std::string& kernel_op) {
   // Float multiply: bf16 and f16 have native 32-wide fmul.
@@ -92,6 +97,10 @@ int GetVectorWidth(const std::string& element_type,
   if (element_type == "bf16" && kernel_op == "arith.negf") return 32;
   if (element_type == "f16" && kernel_op == "arith.negf") return 32;
   if (element_type == "f32" && kernel_op == "arith.negf") return 16;
+  // Float max/min: bf16 has native 32-wide via aievec (no f32 intrinsic).
+  if (element_type == "bf16" &&
+      (kernel_op == "arith.maximumf" || kernel_op == "arith.minimumf"))
+    return 32;
   // Integer add/sub: native vector support (512-bit register).
   if (element_type == "i8" &&
       (kernel_op == "arith.addi" || kernel_op == "arith.subi"))
@@ -103,6 +112,12 @@ int GetVectorWidth(const std::string& element_type,
       (kernel_op == "arith.addi" || kernel_op == "arith.subi"))
     return 16;
   return 0;
+}
+
+// Returns true if the given kernel_op at this vector width requires the
+// aievec pipeline (--convert-vector-to-aievec + --convert-aievec-to-llvm).
+bool NeedsAievecPipeline(const std::string& kernel_op) {
+  return kernel_op == "arith.maximumf" || kernel_op == "arith.minimumf";
 }
 
 // Describes a linalg operation extracted from the module.
@@ -2024,7 +2039,8 @@ absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
   LOG(INFO) << "XDNA matmul lowering: generated AIE MLIR:\n" << aie_mlir;
 
   return AieLoweringResult{aie_mlir, num_cores,
-                           /*use_aievec=*/use_vectorized};
+                           /*use_aievec=*/use_vectorized,
+                           /*convert_vector_to_aievec=*/false};
 }
 
 }  // namespace
@@ -2354,21 +2370,28 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
 
   LOG(INFO) << "XDNA AIE lowering: generated AIE MLIR:\n" << aie_mlir;
 
-  // Detect if kernel uses float comparison ops that need soft-float stubs.
-  // This applies to both single-op and multi-op paths: arith.maximumf/minimumf
-  // are lowered to arith.cmpf which requires __gtsf2/__ltsf2 etc. for f32.
-  // Note: f32 single-op uses bitcast comparison (no soft-float needed), but
-  // bf16 single-op uses native cmpf. Multi-op always uses cmpf for float max/min.
+  // Detect if kernel needs aievec pipeline or soft-float stubs.
+  bool use_aievec = false;
+  bool cvt_vector_to_aievec = false;
   bool needs_softfloat = false;
+
   if (program.single_op.has_value()) {
-    const auto& op = program.single_op->kernel_op;
-    // bf16 cmpf is native; f32 uses bitcast. Only need stubs for bf16 cmpf
-    // which is actually native... so single-op doesn't need stubs at all.
-    // But keep the flag for safety in case other paths emit cmpf for f32.
-    needs_softfloat = (op == "arith.maximumf" || op == "arith.minimumf");
+    const auto& info = *program.single_op;
+    // Check if vectorization will use the aievec pipeline.
+    // Same condition as GenerateCoreBody: vector_width > 0, chunk aligned.
+    bool is_vectorized = (vector_width > 0 && chunk_size >= vector_width &&
+                          chunk_size % vector_width == 0);
+    if (is_vectorized && NeedsAievecPipeline(info.kernel_op)) {
+      use_aievec = true;
+      cvt_vector_to_aievec = true;
+    }
+    // Single-op max/min: f32 uses integer bitcast (no soft-float), bf16 scalar
+    // uses native cmpf (no soft-float), bf16 vector uses aievec (no soft-float).
+    // No soft-float stubs needed for single-op max/min.
   }
   if (program.is_multi_op() && program.generic_op) {
-    // Walk multi-op body for float max/min ops that emit arith.cmpf.
+    // Multi-op body may emit arith.maximumf directly (not cmpf+select),
+    // which lowers to llvm.intr.maximum → __unordsf2 for f32.
     for (mlir::Operation& body_op :
          program.generic_op.getRegion().front().without_terminator()) {
       llvm::StringRef bname = body_op.getName().getStringRef();
@@ -2379,8 +2402,8 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
     }
   }
 
-  return AieLoweringResult{aie_mlir, num_cores, /*use_aievec=*/false,
-                           needs_softfloat};
+  return AieLoweringResult{aie_mlir, num_cores, use_aievec,
+                           cvt_vector_to_aievec, needs_softfloat};
 }
 
 }  // namespace xla

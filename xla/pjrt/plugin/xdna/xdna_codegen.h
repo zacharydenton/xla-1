@@ -53,6 +53,7 @@ struct XdnaCodegenResult {
 absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     const std::string& aie_mlir, int num_data_args, const TargetCaps& caps,
     int num_cores, bool use_aievec = false,
+    bool convert_vector_to_aievec = false,
     bool needs_softfloat_stubs = false);
 
 }  // namespace xla

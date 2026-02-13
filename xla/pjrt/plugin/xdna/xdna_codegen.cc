@@ -413,7 +413,8 @@ absl::Status CheckTools(const std::string& aie_opt,
 
 absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     const std::string& aie_mlir, int num_data_args, const TargetCaps& caps,
-    int num_cores, bool use_aievec, bool needs_softfloat_stubs) {
+    int num_cores, bool use_aievec, bool convert_vector_to_aievec,
+    bool needs_softfloat_stubs) {
   // Create a temporary working directory.
   auto tmpdir = std::filesystem::temp_directory_path() / "xdna_codegen_XXXXXX";
   std::string tmpdir_str = tmpdir.string();
@@ -503,18 +504,19 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
                         step++, total_compile_steps, col, row)));
 
     // 3b: Lower to LLVM dialect.
-    // When use_aievec is set, the generated MLIR contains aievec.matmul_aie2p
-    // ops (emitted directly, NOT via convert-vector-to-aievec which also
-    // converts vector.transfer_read into broken half-register aievec.upd loads).
-    // We only need convert-aievec-to-llvm to lower matmul_aie2p → xllvm
-    // intrinsics; vector.transfer_read/write are handled by convert-vector-to-llvm.
+    // aievec pass pipeline:
+    //   --convert-vector-to-aievec: converts arith.maximumf/minimumf on vectors
+    //     to aievec.max/min ops. Safe for elementwise (1D vector.load/store).
+    //     NOT used for matmul (breaks 2D vector.transfer_read → aievec.upd).
+    //   --convert-aievec-to-llvm: lowers aievec ops → xllvm intrinsics.
+    //     Used by both matmul (matmul_aie2p → MAC intrinsics) and elementwise
+    //     (max/min → VectorMaxLtBf16 intrinsics).
     std::string aievec_passes;
-    if (use_aievec) {
-      // convert-aievec-to-llvm lowers matmul_aie2p → xllvm intrinsics + padding
-      // shuffles. It emits ub.poison for padding mask indices (-1).
-      // convert-vector-to-scf decomposes 2D vector.transfer_read/write into 1D
-      // (vectorized matmul uses 2D vectors like vector<4x8xbf16>).
-      // These passes are conditional: elementwise kernels don't use 2D vectors.
+    if (convert_vector_to_aievec) {
+      aievec_passes =
+          " \"--convert-vector-to-aievec=aie-target=aie2p\""
+          " \"--convert-aievec-to-llvm=aie-target=aie2p\"";
+    } else if (use_aievec) {
       aievec_passes =
           " \"--convert-aievec-to-llvm=aie-target=aie2p\"";
     }
