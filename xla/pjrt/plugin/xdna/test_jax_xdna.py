@@ -160,7 +160,7 @@ def test_bf16_multiply():
 
 
 def test_add_f32_256():
-    """Test 8: f32[256] add — scalar path (no f32 vector add in Peano)."""
+    """Test 8: f32[256] add — vectorized via aievec ACC2048 accumulator."""
     a = np.random.randn(256).astype(np.float32)
     b = np.random.randn(256).astype(np.float32)
     result = jax.jit(lambda x, y: x + y)(a, b)
@@ -185,7 +185,7 @@ def test_multiply_f32_256():
 
 
 def test_bf16_add_256():
-    """Test 11: bf16[256] add — scalar path (no bf16 vector add in Peano)."""
+    """Test 11: bf16[256] add — vectorized via aievec UPS/SRS + ACC2048."""
     import ml_dtypes
     a = np.random.randn(256).astype(ml_dtypes.bfloat16)
     b = np.random.randn(256).astype(ml_dtypes.bfloat16)

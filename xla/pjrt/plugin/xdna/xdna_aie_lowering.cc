@@ -87,6 +87,10 @@ int GetNumInputs(llvm::StringRef op_name) {
 // arith.maximumf/minimumf on 512-bit vectors to aievec.max/min → LLVM
 // intrinsics (VectorMaxLtBf16, VectorMaxLt32, etc.). This bypasses Peano's
 // GlobalISel entirely. AIE2p supports bf16 (32-wide) but NOT f32 max/min.
+//
+// For addf/subf: mlir-aie's --convert-vector-to-aievec lowers these to
+// aievec.add_elem/sub_elem → ACC2048 accumulator intrinsics. Both f32 and
+// bf16 use 16-wide vectors (bf16 goes through UPS→f32 add_elem→SRS path).
 int GetVectorWidth(const std::string& element_type,
                    const std::string& kernel_op) {
   // Float multiply: bf16 and f16 have native 32-wide fmul.
@@ -97,6 +101,11 @@ int GetVectorWidth(const std::string& element_type,
   if (element_type == "bf16" && kernel_op == "arith.negf") return 32;
   if (element_type == "f16" && kernel_op == "arith.negf") return 32;
   if (element_type == "f32" && kernel_op == "arith.negf") return 16;
+  // Float add/sub: 16-wide via aievec ACC2048 accumulator instructions.
+  // bf16 uses UPS(shift=0) → f32 add_elem → SRS(shift=0) path.
+  if ((element_type == "f32" || element_type == "bf16") &&
+      (kernel_op == "arith.addf" || kernel_op == "arith.subf"))
+    return 16;
   // Float max/min: bf16 has native 32-wide via aievec (no f32 intrinsic).
   if (element_type == "bf16" &&
       (kernel_op == "arith.maximumf" || kernel_op == "arith.minimumf"))
@@ -117,7 +126,8 @@ int GetVectorWidth(const std::string& element_type,
 // Returns true if the given kernel_op at this vector width requires the
 // aievec pipeline (--convert-vector-to-aievec + --convert-aievec-to-llvm).
 bool NeedsAievecPipeline(const std::string& kernel_op) {
-  return kernel_op == "arith.maximumf" || kernel_op == "arith.minimumf";
+  return kernel_op == "arith.maximumf" || kernel_op == "arith.minimumf" ||
+         kernel_op == "arith.addf" || kernel_op == "arith.subf";
 }
 
 // Describes a linalg operation extracted from the module.

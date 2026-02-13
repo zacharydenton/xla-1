@@ -728,11 +728,17 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
           std::string src = line.substr(sv_end, comma1 - sv_end);
           while (!src.empty() && src.back() == ' ') src.pop_back();
 
-          // Build new indices: [0, 1, ..., N-1, N, N+1, ..., 2N-1].
+          // Build new indices: [0..N-1] from data, rest from zero operand.
+          // Clamp indices >= 2*N to valid second-operand positions to avoid
+          // out-of-range shufflevector masks (e.g., ACC2048 widening 8→32).
           std::string new_indices;
           for (int i = 0; i < total; i++) {
             if (i > 0) absl::StrAppend(&new_indices, ", ");
-            absl::StrAppend(&new_indices, i);
+            int idx = i;
+            if (idx >= 2 * n_real) {
+              idx = (idx % n_real) + n_real;
+            }
+            absl::StrAppend(&new_indices, idx);
           }
 
           // Build zero constant and new shufflevector.
