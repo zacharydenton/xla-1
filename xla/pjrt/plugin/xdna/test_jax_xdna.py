@@ -498,6 +498,21 @@ def test_relu_f32_1024():
     np.testing.assert_allclose(np.array(result), expected, rtol=1e-5)
 
 
+def test_relu_bf16_1024():
+    """ReLU: bf16[1024] — multicore vectorized aievec relu (4 cores × 256).
+
+    Regression test for needs_matmul_workarounds split: exercises the aievec
+    vmax.ltbf16 path with multiple cores, verifying that codegen does NOT
+    apply matmul-specific workarounds (--aie-loop-aware=false, __muldi3 stub)
+    to vectorized elementwise ops."""
+    import ml_dtypes
+    rng = np.random.RandomState(102)
+    a = rng.randn(1024).astype(ml_dtypes.bfloat16)
+    result = jax.jit(jax.nn.relu)(a)
+    expected = np.maximum(a.astype(np.float32), 0.0)
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
+
+
 def test_unsupported_reshape():
     """Unsupported: reshape should fail with a clear error, not crash."""
     a = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
@@ -608,6 +623,7 @@ def main():
         ("relu bf16[256]", test_relu_bf16_256),
         ("relu f32 NaN", test_relu_f32_nan),
         ("relu f32[1024] multicore", test_relu_f32_1024),
+        ("relu bf16[1024] multicore", test_relu_bf16_1024),
     ] + [
         ("multicore auto-reduce f32[1006]", test_multicore_auto_reduce),
         ("multicore single fallback f32[7]", test_multicore_single_fallback),

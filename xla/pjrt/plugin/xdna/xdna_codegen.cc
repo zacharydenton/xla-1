@@ -414,7 +414,7 @@ absl::Status CheckTools(const std::string& aie_opt,
 absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     const std::string& aie_mlir, int num_data_args, const TargetCaps& caps,
     int num_cores, bool use_aievec, bool convert_vector_to_aievec,
-    bool needs_softfloat_stubs) {
+    bool needs_matmul_workarounds, bool needs_softfloat_stubs) {
   // Create a temporary working directory.
   auto tmpdir = std::filesystem::temp_directory_path() / "xdna_codegen_XXXXXX";
   std::string tmpdir_str = tmpdir.string();
@@ -454,7 +454,7 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
   //   - assign-buffer-addresses: allocates memory in tile local stores
   // -----------------------------------------------------------------------
   // Step numbering: 1 shared + N per core + 5 shared = total.
-  bool needs_rt_stubs = use_aievec || needs_softfloat_stubs;
+  bool needs_rt_stubs = needs_matmul_workarounds || needs_softfloat_stubs;
   int steps_per_core = needs_rt_stubs ? 8 : 7;  // +1 for rt stubs
   int total_compile_steps = steps_per_core * num_cores + 6;
   int step = 1;
@@ -941,9 +941,10 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     // Disable --aie-loop-aware for vectorized matmul: Peano's iterative loop
     // scheduler (Feb 2026) miscompiles single-block loops containing BFP MAC
     // intrinsics, producing hangs or wrong results depending on trip count.
+    // Not needed for elementwise aievec (vmax.ltbf16 etc.) — simple ops, no loop issue.
     std::string llc_opt = "-O2";
     std::string llc_extra;
-    if (use_aievec) {
+    if (needs_matmul_workarounds) {
       llc_extra = " --aie-loop-aware=false";
     }
     std::string core_obj = absl::StrFormat("%s/%s.o", workdir, core);
@@ -971,7 +972,10 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       std::string rt_src = absl::StrFormat("%s/rt_stubs.c", workdir);
       rt_stubs_obj = absl::StrFormat("%s/rt_stubs.o", workdir);
       std::string rt_code;
-      if (use_aievec) {
+      if (needs_matmul_workarounds) {
+        // __muldi3: 64-bit integer multiply stub needed by vectorized matmul
+        // (MAC intrinsics generate i64 multiplies for address calculation).
+        // Not needed for elementwise aievec ops (vmax, etc.).
         absl::StrAppend(&rt_code,
             "typedef unsigned int su_int;\n"
             "typedef long long di_int;\n"

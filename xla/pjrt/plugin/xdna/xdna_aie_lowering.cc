@@ -2040,7 +2040,8 @@ absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
 
   return AieLoweringResult{aie_mlir, num_cores,
                            /*use_aievec=*/use_vectorized,
-                           /*convert_vector_to_aievec=*/false};
+                           /*convert_vector_to_aievec=*/false,
+                           /*needs_matmul_workarounds=*/use_vectorized};
 }
 
 }  // namespace
@@ -2392,18 +2393,26 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
   if (program.is_multi_op() && program.generic_op) {
     // Multi-op body may emit arith.maximumf directly (not cmpf+select),
     // which lowers to llvm.intr.maximum → __unordsf2 for f32.
+    // bf16 maximumf lowers to native bf16 compare — no soft-float needed.
+    // Check operand type, not storage_type: extf/truncf patterns can have
+    // bf16 storage with internal f32 maximumf.
     for (mlir::Operation& body_op :
          program.generic_op.getRegion().front().without_terminator()) {
       llvm::StringRef bname = body_op.getName().getStringRef();
       if (bname == "arith.maximumf" || bname == "arith.minimumf") {
-        needs_softfloat = true;
-        break;
+        if (body_op.getNumOperands() > 0 &&
+            body_op.getOperand(0).getType().isF32()) {
+          needs_softfloat = true;
+          break;
+        }
       }
     }
   }
 
   return AieLoweringResult{aie_mlir, num_cores, use_aievec,
-                           cvt_vector_to_aievec, needs_softfloat};
+                           cvt_vector_to_aievec,
+                           /*needs_matmul_workarounds=*/false,
+                           needs_softfloat};
 }
 
 }  // namespace xla
