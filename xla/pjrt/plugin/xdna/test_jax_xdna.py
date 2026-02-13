@@ -339,6 +339,85 @@ def test_multicore_override_1():
     assert "override OK" in result.stdout
 
 
+def test_distribute_neg_f32_65536():
+    """Test: neg f32[65536] uses distribute/join (1-input, 4 cores, tiled).
+
+    Runs in a subprocess to capture compiler log. Verifies:
+    1. Distribute/join is used (single shim → N compute via mem tile).
+    2. Computation is correct.
+    """
+    import subprocess
+    script = (
+        "import os; os.environ['JAX_PLATFORMS']='xdna'; "
+        "os.environ['XDNA_NO_CACHE']='1'; "
+        "import sys; sys.path.insert(0,'.'); "
+        "from jax_xdna import initialize; initialize(); "
+        "import jax; import numpy as np; "
+        "a=np.random.RandomState(42).randn(65536).astype(np.float32); "
+        "r=np.array(jax.jit(lambda x:-x)(a)); "
+        "np.testing.assert_allclose(r,-a,rtol=1e-5); "
+        "print('distribute_neg OK')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=120,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+    assert result.returncode == 0, (
+        f"Subprocess failed:\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr[-500:]}"
+    )
+    assert "distribute_neg OK" in result.stdout
+    assert "distribute/join" in result.stderr, (
+        f"Expected 'distribute/join' in compiler log. Got:\n"
+        f"{result.stderr[-500:]}"
+    )
+    print("         Distribute/join confirmed for neg f32[65536].", flush=True)
+
+
+def test_distribute_fallback_add_f32_65536():
+    """Test: add f32[65536] falls back to per-column (2-input, 4 cores, channels > 6).
+
+    Runs in a subprocess to capture compiler log. Verifies:
+    1. Distribute/join is NOT used (DMA channel limit exceeded).
+    2. Computation is still correct via per-column independent path.
+    """
+    import subprocess
+    script = (
+        "import os; os.environ['JAX_PLATFORMS']='xdna'; "
+        "os.environ['XDNA_NO_CACHE']='1'; "
+        "import sys; sys.path.insert(0,'.'); "
+        "from jax_xdna import initialize; initialize(); "
+        "import jax; import numpy as np; "
+        "rng=np.random.RandomState(43); "
+        "a=rng.randn(65536).astype(np.float32); "
+        "b=rng.randn(65536).astype(np.float32); "
+        "r=np.array(jax.jit(lambda x,y:x+y)(a,b)); "
+        "np.testing.assert_allclose(r,a+b,rtol=1e-5); "
+        "print('fallback_add OK')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=120,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+    assert result.returncode == 0, (
+        f"Subprocess failed:\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr[-500:]}"
+    )
+    assert "fallback_add OK" in result.stdout
+    # Should use 4 cores but NOT distribute/join (DMA channel limit exceeded).
+    assert "using 4 core(s)" in result.stderr, (
+        f"Expected 'using 4 core(s)' in compiler log. Got:\n"
+        f"{result.stderr[-500:]}"
+    )
+    assert "distribute/join" not in result.stderr, (
+        f"Expected NO 'distribute/join' for 2-input 4-core (channels > 6). Got:\n"
+        f"{result.stderr[-500:]}"
+    )
+    print("         Per-column fallback confirmed for add f32[65536].", flush=True)
+
+
 def test_matmul_f32_identity():
     """Matmul: f32 [4,4] @ [4,4] identity matrix passthrough."""
     a = np.array([[1, 2, 3, 4],
@@ -628,6 +707,9 @@ def main():
         ("multicore auto-reduce f32[1006]", test_multicore_auto_reduce),
         ("multicore single fallback f32[7]", test_multicore_single_fallback),
         ("multicore override f32[256]", test_multicore_override_1),
+    ] + [
+        ("distribute neg f32[65536]", test_distribute_neg_f32_65536),
+        ("distribute fallback add f32[65536]", test_distribute_fallback_add_f32_65536),
     ] + [
         ("unsupported: reshape", test_unsupported_reshape),
         ("unsupported: reduce_sum", test_unsupported_reduce_sum),

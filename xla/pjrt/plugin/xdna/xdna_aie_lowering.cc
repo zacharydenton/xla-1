@@ -1221,7 +1221,8 @@ std::string GenerateCoreBody(const LinalgProgramInfo& program,
 absl::StatusOr<std::string> GenerateNpuSequence(
     const LinalgProgramInfo& program,
     int64_t per_core_elements, int64_t chunk_size, int64_t num_chunks,
-    bool use_mem_tile, int num_cores, int start_col) {
+    bool use_mem_tile, int num_cores, int start_col,
+    bool use_distribute) {
   const std::string& ty = program.storage_type;
   int64_t total_elements = per_core_elements * num_cores;
   // Runtime sequence args use full tensor memref; ObjectFIFOs use chunk memref.
@@ -1250,11 +1251,6 @@ absl::StatusOr<std::string> GenerateNpuSequence(
     }
   }
 
-  // Strides: set to 0 when the corresponding dim has size 1 (unused),
-  // to satisfy the aie-opt verifier on rank-1 memrefs.
-  int64_t s1 = (d0_reps > 1) ? d0_size : 0;
-  int64_t s2 = (num_chunks > 1) ? chunk_size : 0;
-
   // Metadata names for shim-side ObjectFIFOs.
   // With mem tile routing, shim connects to @in*_L2 / @out0_L2.
   std::string l2 = use_mem_tile ? "_L2" : "";
@@ -1277,53 +1273,108 @@ absl::StatusOr<std::string> GenerateNpuSequence(
       "    aie.runtime_sequence(%s) {\n",
       absl::StrJoin(arg_types, ", ")));
 
-  // DMA transfers for each column.
-  // 4D addressing: [1, num_chunks, d0_reps, d0_size]
-  //   d0: innermost contiguous transfer (≤ 1023 32-bit words)
-  //   d1: sub-chunks within a tile chunk (stride = d0_size)
-  //   d2: tile chunks (stride = chunk_size)
-  // Each column's DMA starts at offset c * per_core_elements into the
-  // host buffer, selecting that core's slice of the tensor.
-  for (int c = 0; c < num_cores; c++) {
-    int col = start_col + c;
-    int64_t offset = c * per_core_elements;
+  if (use_distribute) {
+    // Distribute/join: single DMA per input/output with ND gather/scatter.
+    // Host memory layout: [core0_all | core1_all | ... | coreN_all]
+    // Distribute expects interleaved: [core0_chunk0 | core1_chunk0 | ...]
+    //
+    // When d0_reps == 1 (chunk fits in d0):
+    //   [1, num_chunks, num_cores, chunk_size]
+    //   strides: [0, chunk_size, per_core_elements, 1]
+    //
+    // When d0_reps > 1 (chunk needs d0/d1 split):
+    //   [num_chunks, num_cores, d0_reps, d0_size]
+    //   strides: [chunk_size, per_core_elements, d0_size, 1]
 
-    // Input DMAs for this column.
-    // BD IDs are per-core (0..num_inputs), not global. Each column's shim
-    // has its own BD space, so different columns can reuse the same IDs.
-    // The hardware has 16 BDs per shim (4-bit ID field: 0-15).
+    int64_t ds3, ds2, ds1, ds0;  // sizes
+    int64_t st3, st2, st1;        // strides (st0 = 1 always)
+    if (d0_reps == 1) {
+      ds3 = 1;             ds2 = num_chunks;          ds1 = num_cores;
+      ds0 = chunk_size;
+      st3 = 0;             st2 = chunk_size;           st1 = per_core_elements;
+    } else {
+      ds3 = num_chunks;    ds2 = num_cores;            ds1 = d0_reps;
+      ds0 = d0_size;
+      st3 = chunk_size;    st2 = per_core_elements;    st1 = d0_size;
+    }
+
+    // Input DMAs: one per input, all through single shim's BD space.
     for (int i = 0; i < program.num_inputs; i++) {
-      int dma_id = i;
-      std::string meta = fifo_name(c, absl::StrFormat("in%d%s", i, l2));
+      absl::StrAppend(&seq, absl::StrFormat(
+          "      aiex.npu.dma_memcpy_nd(%%arg%d[0, 0, 0, 0]"
+          "[%d, %d, %d, %d][%d, %d, %d, 1]) "
+          "{id = %d : i64, metadata = @in%d_L2} : %s\n",
+          i,
+          ds3, ds2, ds1, ds0,
+          st3, st2, st1,
+          i, i, host_memref_ty));
+    }
+
+    // Output DMA with issue_token for completion tracking.
+    int out_arg = program.num_inputs;
+    absl::StrAppend(&seq, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg%d[0, 0, 0, 0]"
+        "[%d, %d, %d, %d][%d, %d, %d, 1]) "
+        "{id = %d : i64, metadata = @out0_L2, issue_token = true} : %s\n",
+        out_arg,
+        ds3, ds2, ds1, ds0,
+        st3, st2, st1,
+        program.num_inputs, host_memref_ty));
+
+    // Single dma_wait for the one output FIFO.
+    absl::StrAppend(&seq, "      aiex.npu.dma_wait { symbol = @out0_L2 }\n");
+  } else {
+    // Per-column independent: each column gets its own DMA commands.
+    // Strides: set to 0 when the corresponding dim has size 1 (unused),
+    // to satisfy the aie-opt verifier on rank-1 memrefs.
+    int64_t s1 = (d0_reps > 1) ? d0_size : 0;
+    int64_t s2 = (num_chunks > 1) ? chunk_size : 0;
+
+    // 4D addressing: [1, num_chunks, d0_reps, d0_size]
+    //   d0: innermost contiguous transfer (≤ 1023 32-bit words)
+    //   d1: sub-chunks within a tile chunk (stride = d0_size)
+    //   d2: tile chunks (stride = chunk_size)
+    // Each column's DMA starts at offset c * per_core_elements into the
+    // host buffer, selecting that core's slice of the tensor.
+    for (int c = 0; c < num_cores; c++) {
+      int64_t offset = c * per_core_elements;
+
+      // Input DMAs for this column.
+      // BD IDs are per-core (0..num_inputs), not global. Each column's shim
+      // has its own BD space, so different columns can reuse the same IDs.
+      for (int i = 0; i < program.num_inputs; i++) {
+        int dma_id = i;
+        std::string meta = fifo_name(c, absl::StrFormat("in%d%s", i, l2));
+        absl::StrAppend(&seq, absl::StrFormat(
+            "      aiex.npu.dma_memcpy_nd(%%arg%d[0, 0, 0, %d]"
+            "[1, %d, %d, %d][0, %d, %d, 1]) "
+            "{id = %d : i64, metadata = @%s} : %s\n",
+            i, offset,
+            num_chunks, d0_reps, d0_size,
+            s2, s1,
+            dma_id, meta, host_memref_ty));
+      }
+
+      // Output DMA for this column with issue_token for completion tracking.
+      int out_arg = program.num_inputs;
+      int out_dma_id = program.num_inputs;
+      std::string out_meta = fifo_name(c, absl::StrFormat("out0%s", l2));
       absl::StrAppend(&seq, absl::StrFormat(
           "      aiex.npu.dma_memcpy_nd(%%arg%d[0, 0, 0, %d]"
           "[1, %d, %d, %d][0, %d, %d, 1]) "
-          "{id = %d : i64, metadata = @%s} : %s\n",
-          i, offset,
+          "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+          out_arg, offset,
           num_chunks, d0_reps, d0_size,
           s2, s1,
-          dma_id, meta, host_memref_ty));
+          out_dma_id, out_meta, host_memref_ty));
     }
 
-    // Output DMA for this column with issue_token for completion tracking.
-    int out_arg = program.num_inputs;
-    int out_dma_id = program.num_inputs;
-    std::string out_meta = fifo_name(c, absl::StrFormat("out0%s", l2));
-    absl::StrAppend(&seq, absl::StrFormat(
-        "      aiex.npu.dma_memcpy_nd(%%arg%d[0, 0, 0, %d]"
-        "[1, %d, %d, %d][0, %d, %d, 1]) "
-        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
-        out_arg, offset,
-        num_chunks, d0_reps, d0_size,
-        s2, s1,
-        out_dma_id, out_meta, host_memref_ty));
-  }
-
-  // Wait for ALL columns' output DMA completion.
-  for (int c = 0; c < num_cores; c++) {
-    std::string out_meta = fifo_name(c, absl::StrFormat("out0%s", l2));
-    absl::StrAppend(&seq, absl::StrFormat(
-        "      aiex.npu.dma_wait { symbol = @%s }\n", out_meta));
+    // Wait for ALL columns' output DMA completion.
+    for (int c = 0; c < num_cores; c++) {
+      std::string out_meta = fifo_name(c, absl::StrFormat("out0%s", l2));
+      absl::StrAppend(&seq, absl::StrFormat(
+          "      aiex.npu.dma_wait { symbol = @%s }\n", out_meta));
+    }
   }
 
   absl::StrAppend(&seq, "    }\n");
@@ -2237,10 +2288,33 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
   }
 
   bool use_mem_tile = (num_chunks > 1);
+
+  // Early d0/d1 split computation for use_distribute decision.
+  int64_t d0_size_early = chunk_size;
+  int64_t d0_reps_early = 1;
+  if (use_mem_tile) {
+    FindDmaSplit(chunk_size, element_bytes, d0_size_early, d0_reps_early);
+  }
+
+  // Distribute/join: use a single shim→mem FIFO that fans out to N compute
+  // tiles via objectfifo.link, instead of N independent per-column FIFOs.
+  // Requires: multi-core, mem tile (tiled), DMA dimensions fit, and
+  // mem tile DMA channels sufficient:
+  //   MM2S (output from mem): num_cores * num_inputs (L1 FIFOs) + 1 (L2 out)
+  //   S2MM (input to mem):    num_inputs (L2 FIFOs) + num_cores (L1 out FIFOs)
+  int mem_mm2s = num_cores * program.num_inputs + 1;
+  int mem_s2mm = program.num_inputs + num_cores;
+  bool channels_fit = (mem_mm2s <= caps.mem_tile_dma_channels &&
+                        mem_s2mm <= caps.mem_tile_dma_channels);
+  bool use_distribute = (num_cores > 1 && use_mem_tile && channels_fit &&
+                          (d0_reps_early == 1 ||
+                           num_chunks <= caps.shim_dma_max_d3));
+
   LOG(INFO) << "XDNA AIE lowering: tiling " << per_core_elements
             << " elements/core into " << num_chunks << " chunk(s) of "
             << chunk_size << " (L1 budget: " << l1_limit << "B"
-            << (use_mem_tile ? ", mem tile staging" : ", direct") << ")";
+            << (use_mem_tile ? ", mem tile staging" : ", direct")
+            << (use_distribute ? ", distribute/join" : "") << ")";
 
   // Step 2: Generate AIE dialect MLIR text.
   //
@@ -2278,79 +2352,166 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
   // Split generation into 3 passes: tiles, ObjectFIFOs, cores.
 
   // Pass 1: All tile declarations.
-  for (int c = 0; c < num_cores; c++) {
-    int col = start_col + c;
+  if (use_distribute) {
+    // Distribute: one shim + one mem tile, N compute tiles across columns.
     absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, shim_row, col, shim_row));
-    if (use_mem_tile) {
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        start_col, shim_row, start_col, shim_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        start_col, caps.mem_tile_row, start_col, caps.mem_tile_row));
+    for (int c = 0; c < num_cores; c++) {
+      int col = start_col + c;
       absl::StrAppend(&aie_mlir, absl::StrFormat(
-          "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, caps.mem_tile_row,
-          col, caps.mem_tile_row));
+          "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+          col, compute_row, col, compute_row));
     }
-    absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, compute_row,
-        col, compute_row));
+  } else {
+    // Per-column independent: each column has its own shim/mem/compute.
+    for (int c = 0; c < num_cores; c++) {
+      int col = start_col + c;
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+          col, shim_row, col, shim_row));
+      if (use_mem_tile) {
+        absl::StrAppend(&aie_mlir, absl::StrFormat(
+            "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, caps.mem_tile_row,
+            col, caps.mem_tile_row));
+      }
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+          col, compute_row, col, compute_row));
+    }
   }
 
   // Pass 2: All ObjectFIFOs and links.
-  for (int c = 0; c < num_cores; c++) {
-    int col = start_col + c;
-    std::string shim_tile = absl::StrFormat("tile_%d_%d", col, shim_row);
-    std::string compute_tile = absl::StrFormat("tile_%d_%d", col, compute_row);
-    std::string mem_tile_str = absl::StrFormat("tile_%d_%d", col,
+  if (use_distribute) {
+    // Distribute/join: one L2 FIFO fans out to N L1 FIFOs via mem tile.
+    std::string shim_tile = absl::StrFormat("tile_%d_%d", start_col, shim_row);
+    std::string mem_tile_str = absl::StrFormat("tile_%d_%d", start_col,
                                                 caps.mem_tile_row);
+    // L2 element = num_cores * chunk_size (combined chunk for all cores).
+    std::string l2_memref_ty = absl::StrFormat("memref<%dx%s>",
+        num_cores * chunk_size, ty);
 
-    if (use_mem_tile) {
-      // Route through memory tile (L2 staging) for tiled execution.
+    // Input L2 FIFOs: shim → mem (one per input, combined element size).
+    for (int i = 0; i < program.num_inputs; i++) {
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "    aie.objectfifo @in%d_L2(%%%s, {%%%s}, 2 : i32) "
+          ": !aie.objectfifo<%s>\n",
+          i, shim_tile, mem_tile_str, l2_memref_ty));
+    }
+    // Output L2 FIFO: mem → shim (combined element size).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @out0_L2(%%%s, {%%%s}, 2 : i32) "
+        ": !aie.objectfifo<%s>\n",
+        mem_tile_str, shim_tile, l2_memref_ty));
+
+    // Per-core L1 input FIFOs: mem → compute (chunk_size per core).
+    for (int c = 0; c < num_cores; c++) {
+      int col = start_col + c;
+      std::string compute_tile =
+          absl::StrFormat("tile_%d_%d", col, compute_row);
       for (int i = 0; i < program.num_inputs; i++) {
+        absl::StrAppend(&aie_mlir, absl::StrFormat(
+            "    aie.objectfifo @c%d_in%d(%%%s, {%%%s}, 2 : i32) "
+            ": !aie.objectfifo<%s>\n",
+            c, i, mem_tile_str, compute_tile, memref_ty));
+      }
+    }
+    // Per-core L1 output FIFOs: compute → mem (chunk_size per core).
+    for (int c = 0; c < num_cores; c++) {
+      int col = start_col + c;
+      std::string compute_tile =
+          absl::StrFormat("tile_%d_%d", col, compute_row);
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "    aie.objectfifo @c%d_out0(%%%s, {%%%s}, 2 : i32) "
+          ": !aie.objectfifo<%s>\n",
+          c, compute_tile, mem_tile_str, memref_ty));
+    }
+
+    // Distribute links: L2 input → per-core L1 inputs.
+    for (int i = 0; i < program.num_inputs; i++) {
+      std::string consumers, offsets;
+      for (int c = 0; c < num_cores; c++) {
+        if (c > 0) { consumers += ", "; offsets += ", "; }
+        absl::StrAppendFormat(&consumers, "@c%d_in%d", c, i);
+        absl::StrAppendFormat(&offsets, "%d", c * chunk_size);
+      }
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "    aie.objectfifo.link [@in%d_L2] -> [%s] ([] [%s])\n",
+          i, consumers, offsets));
+    }
+    // Join link: per-core L1 outputs → L2 output.
+    {
+      std::string producers, offsets;
+      for (int c = 0; c < num_cores; c++) {
+        if (c > 0) { producers += ", "; offsets += ", "; }
+        absl::StrAppendFormat(&producers, "@c%d_out0", c);
+        absl::StrAppendFormat(&offsets, "%d", c * chunk_size);
+      }
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "    aie.objectfifo.link [%s] -> [@out0_L2] ([%s] [])\n",
+          producers, offsets));
+    }
+  } else {
+    // Per-column independent: each column has its own FIFO chain.
+    for (int c = 0; c < num_cores; c++) {
+      int col = start_col + c;
+      std::string shim_tile = absl::StrFormat("tile_%d_%d", col, shim_row);
+      std::string compute_tile =
+          absl::StrFormat("tile_%d_%d", col, compute_row);
+      std::string mem_tile_str = absl::StrFormat("tile_%d_%d", col,
+                                                  caps.mem_tile_row);
+
+      if (use_mem_tile) {
+        for (int i = 0; i < program.num_inputs; i++) {
+          absl::StrAppend(&aie_mlir, absl::StrFormat(
+              "    aie.objectfifo @%s(%%%s, {%%%s}, 2 : i32) "
+              ": !aie.objectfifo<%s>\n",
+              fifo_name(c, absl::StrFormat("in%d_L2", i)),
+              shim_tile, mem_tile_str, memref_ty));
+        }
         absl::StrAppend(&aie_mlir, absl::StrFormat(
             "    aie.objectfifo @%s(%%%s, {%%%s}, 2 : i32) "
             ": !aie.objectfifo<%s>\n",
-            fifo_name(c, absl::StrFormat("in%d_L2", i)),
-            shim_tile, mem_tile_str, memref_ty));
-      }
-      absl::StrAppend(&aie_mlir, absl::StrFormat(
-          "    aie.objectfifo @%s(%%%s, {%%%s}, 2 : i32) "
-          ": !aie.objectfifo<%s>\n",
-          fifo_name(c, "out0_L2"),
-          mem_tile_str, shim_tile, memref_ty));
-      // L1 ObjectFIFOs: mem tile ↔ compute.
-      for (int i = 0; i < program.num_inputs; i++) {
+            fifo_name(c, "out0_L2"),
+            mem_tile_str, shim_tile, memref_ty));
+        for (int i = 0; i < program.num_inputs; i++) {
+          absl::StrAppend(&aie_mlir, absl::StrFormat(
+              "    aie.objectfifo @%s(%%%s, {%%%s}, 2 : i32) "
+              ": !aie.objectfifo<%s>\n",
+              fifo_name(c, absl::StrFormat("in%d", i)),
+              mem_tile_str, compute_tile, memref_ty));
+        }
         absl::StrAppend(&aie_mlir, absl::StrFormat(
             "    aie.objectfifo @%s(%%%s, {%%%s}, 2 : i32) "
             ": !aie.objectfifo<%s>\n",
-            fifo_name(c, absl::StrFormat("in%d", i)),
-            mem_tile_str, compute_tile, memref_ty));
-      }
-      absl::StrAppend(&aie_mlir, absl::StrFormat(
-          "    aie.objectfifo @%s(%%%s, {%%%s}, 2 : i32) "
-          ": !aie.objectfifo<%s>\n",
-          fifo_name(c, "out0"),
-          compute_tile, mem_tile_str, memref_ty));
-      // Link L2 ↔ L1 ObjectFIFOs through memory tile.
-      for (int i = 0; i < program.num_inputs; i++) {
+            fifo_name(c, "out0"),
+            compute_tile, mem_tile_str, memref_ty));
+        for (int i = 0; i < program.num_inputs; i++) {
+          absl::StrAppend(&aie_mlir, absl::StrFormat(
+              "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+              fifo_name(c, absl::StrFormat("in%d_L2", i)),
+              fifo_name(c, absl::StrFormat("in%d", i))));
+        }
         absl::StrAppend(&aie_mlir, absl::StrFormat(
             "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
-            fifo_name(c, absl::StrFormat("in%d_L2", i)),
-            fifo_name(c, absl::StrFormat("in%d", i))));
-      }
-      absl::StrAppend(&aie_mlir, absl::StrFormat(
-          "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
-          fifo_name(c, "out0"), fifo_name(c, "out0_L2")));
-    } else {
-      // Direct shim ↔ compute (no memory tile for single-chunk execution).
-      for (int i = 0; i < program.num_inputs; i++) {
+            fifo_name(c, "out0"), fifo_name(c, "out0_L2")));
+      } else {
+        for (int i = 0; i < program.num_inputs; i++) {
+          absl::StrAppend(&aie_mlir, absl::StrFormat(
+              "    aie.objectfifo @%s(%%%s, {%%%s}, 2 : i32) "
+              ": !aie.objectfifo<%s>\n",
+              fifo_name(c, absl::StrFormat("in%d", i)),
+              shim_tile, compute_tile, memref_ty));
+        }
         absl::StrAppend(&aie_mlir, absl::StrFormat(
             "    aie.objectfifo @%s(%%%s, {%%%s}, 2 : i32) "
             ": !aie.objectfifo<%s>\n",
-            fifo_name(c, absl::StrFormat("in%d", i)),
-            shim_tile, compute_tile, memref_ty));
+            fifo_name(c, "out0"),
+            compute_tile, shim_tile, memref_ty));
       }
-      absl::StrAppend(&aie_mlir, absl::StrFormat(
-          "    aie.objectfifo @%s(%%%s, {%%%s}, 2 : i32) "
-          ": !aie.objectfifo<%s>\n",
-          fifo_name(c, "out0"),
-          compute_tile, shim_tile, memref_ty));
     }
   }
 
@@ -2372,7 +2533,8 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
   // NPU instruction sequence.
   auto npu_seq_or = GenerateNpuSequence(program, per_core_elements,
                                          chunk_size, num_chunks,
-                                         use_mem_tile, num_cores, start_col);
+                                         use_mem_tile, num_cores, start_col,
+                                         use_distribute);
   if (!npu_seq_or.ok()) return npu_seq_or.status();
   absl::StrAppend(&aie_mlir, *npu_seq_or);
 
@@ -2422,7 +2584,7 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
   return AieLoweringResult{aie_mlir, num_cores, use_aievec,
                            cvt_vector_to_aievec,
                            /*needs_matmul_workarounds=*/false,
-                           needs_softfloat};
+                           needs_softfloat, use_distribute};
 }
 
 }  // namespace xla

@@ -44,6 +44,7 @@ struct AieLoweringResult {
   bool convert_vector_to_aievec = false;  // Enable --convert-vector-to-aievec pass.
   bool needs_matmul_workarounds = false;  // Matmul MAC: --aie-loop-aware=false + __muldi3.
   bool needs_softfloat_stubs = false;  // Kernel uses soft-float comparisons.
+  bool use_distribute = false;  // Elementwise uses distribute/join ObjectFIFO pattern.
 };
 
 // Lowers a linalg-on-tensors MLIR module to AIE dialect MLIR text.

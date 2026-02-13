@@ -41,6 +41,13 @@ struct TargetCaps {
   int shim_row = 0;
   int mem_tile_row = 1;
   int first_compute_row = 2;
+  // Memory tile DMA channels per direction (MM2S and S2MM).
+  // NPU2 mem tile has 6 channels per direction. Used to decide whether
+  // distribute/join can route all FIFOs through a single mem tile.
+  int mem_tile_dma_channels = 6;
+  // Shim DMA BD d3 dimension max (outermost wrap count). Hardware limit
+  // on the number of outermost iterations in a single BD descriptor.
+  int shim_dma_max_d3 = 64;
   // xclbin partition metadata.
   int partition_column_width = 8;
   int partition_start_column = 0;

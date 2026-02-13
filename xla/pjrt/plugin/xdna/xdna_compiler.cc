@@ -102,11 +102,13 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
 
   LOG(INFO) << "XDNA compiler: linalg → AIE lowering succeeded ("
             << lowering.num_cores << " core(s)).";
-  // Write to stderr directly so subprocess tests can observe core count.
+  // Write to stderr directly so subprocess tests can observe core count
+  // and distribute mode.
   {
-    char buf[80];
-    int n = snprintf(buf, sizeof(buf), "XDNA: using %d core(s)\n",
-                     lowering.num_cores);
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "XDNA: using %d core(s)%s\n",
+                     lowering.num_cores,
+                     lowering.use_distribute ? ", distribute/join" : "");
     (void)write(STDERR_FILENO, buf, n);
   }
 
