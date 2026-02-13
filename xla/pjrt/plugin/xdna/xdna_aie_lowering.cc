@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/pjrt/plugin/xdna/xdna_aie_lowering.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -583,6 +584,8 @@ absl::StatusOr<LinalgProgramInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
     if (name == "linalg.generic") return;
     // Skip linalg.fill — used for zero-init before matmul.
     if (name == "linalg.fill") return;
+    // Skip linalg.yield — it's a block terminator, not an op.
+    if (name == "linalg.yield") return;
 
     int num_inputs = GetNumInputs(name);
     if (num_inputs < 0) {
@@ -650,20 +653,25 @@ absl::StatusOr<LinalgProgramInfo> AnalyzeLinalgModule(mlir::ModuleOp module) {
     // Build descriptive error message with unsupported ops.
     std::string unsupported_str;
     if (!unsupported_ops.empty()) {
+      // Deduplicate unsupported ops.
+      std::sort(unsupported_ops.begin(), unsupported_ops.end());
+      unsupported_ops.erase(
+          std::unique(unsupported_ops.begin(), unsupported_ops.end()),
+          unsupported_ops.end());
       unsupported_str = absl::StrCat(
-          " Unsupported ops found: ", absl::StrJoin(unsupported_ops, ", "),
+          " Unsupported ops: ", absl::StrJoin(unsupported_ops, ", "),
           ".");
     }
-    // Print the module for debugging.
+    // Log the full module IR for debugging (visible via LOG(INFO)).
     std::string module_str;
     llvm::raw_string_ostream os(module_str);
     module.print(os);
+    LOG(INFO) << "XDNA: unsupported module IR:\n" << module_str;
     return absl::UnimplementedError(absl::StrCat(
-        "No supported linalg operation found in module.",
+        "XDNA cannot compile this operation.",
         unsupported_str,
-        " Currently supported: elementwise (add, sub, mul, neg, max, min),"
-        " matmul (dot product). "
-        "Module IR:\n", module_str));
+        " Supported: elementwise (add, sub, mul, neg, max, min),"
+        " matmul. Use jax.jit(fn, backend='cpu') for unsupported ops."));
   }
 
   if (program.single_op.has_value()) {

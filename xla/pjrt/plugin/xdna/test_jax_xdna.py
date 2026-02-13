@@ -498,6 +498,48 @@ def test_relu_f32_1024():
     np.testing.assert_allclose(np.array(result), expected, rtol=1e-5)
 
 
+def test_unsupported_reshape():
+    """Unsupported: reshape should fail with a clear error, not crash."""
+    a = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    try:
+        result = jax.jit(lambda x: x.reshape(4))(a)
+        # If it somehow succeeds (e.g., future support), just verify result.
+        np.testing.assert_allclose(np.array(result), [1.0, 2.0, 3.0, 4.0], rtol=1e-5)
+    except Exception as e:
+        msg = str(e)
+        assert "XDNA cannot compile" in msg or "UNIMPLEMENTED" in msg or "Unsupported" in msg, \
+            f"Expected clear error message, got: {msg[:200]}"
+        print(f"         Error (expected): {msg[:120]}", flush=True)
+
+
+def test_unsupported_reduce_sum():
+    """Unsupported: reduce_sum should fail with a clear error, not crash."""
+    a = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    try:
+        result = jax.jit(jnp.sum)(a)
+        # If it somehow succeeds, verify.
+        np.testing.assert_allclose(float(result), 10.0, rtol=1e-5)
+    except Exception as e:
+        msg = str(e)
+        assert "XDNA cannot compile" in msg or "UNIMPLEMENTED" in msg or "Unsupported" in msg \
+            or "single-op" in msg, \
+            f"Expected clear error message, got: {msg[:200]}"
+        print(f"         Error (expected): {msg[:120]}", flush=True)
+
+
+def test_unsupported_transpose():
+    """Unsupported: transpose should fail with a clear error, not crash."""
+    a = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    try:
+        result = jax.jit(lambda x: x.T)(a)
+        np.testing.assert_allclose(np.array(result), a.T, rtol=1e-5)
+    except Exception as e:
+        msg = str(e)
+        assert "XDNA cannot compile" in msg or "UNIMPLEMENTED" in msg or "Unsupported" in msg, \
+            f"Expected clear error message, got: {msg[:200]}"
+        print(f"         Error (expected): {msg[:120]}", flush=True)
+
+
 def test_cache_hit():
     """Test 8: Second compilation of same HLO hits XDNA cache.
 
@@ -570,6 +612,11 @@ def main():
         ("multicore auto-reduce f32[1006]", test_multicore_auto_reduce),
         ("multicore single fallback f32[7]", test_multicore_single_fallback),
         ("multicore override f32[256]", test_multicore_override_1),
+    ] + [
+        ("unsupported: reshape", test_unsupported_reshape),
+        ("unsupported: reduce_sum", test_unsupported_reduce_sum),
+        ("unsupported: transpose", test_unsupported_transpose),
+    ] + [
         ("cache hit", test_cache_hit),
     ]
 
