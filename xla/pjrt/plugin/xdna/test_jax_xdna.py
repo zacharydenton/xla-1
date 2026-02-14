@@ -375,12 +375,12 @@ def test_distribute_neg_f32_65536():
     print("         Distribute/join confirmed for neg f32[65536].", flush=True)
 
 
-def test_distribute_fallback_add_f32_65536():
-    """Test: add f32[65536] falls back to per-column (2-input, 4 cores, channels > 6).
+def test_distribute_add_f32_65536():
+    """Test: add f32[65536] uses distribute/join with auto-reduced cores.
 
-    Runs in a subprocess to capture compiler log. Verifies:
-    1. Distribute/join is NOT used (DMA channel limit exceeded).
-    2. Computation is still correct via per-column independent path.
+    With 4 cores and 2 inputs, DMA channels exceed the mem tile limit (9 > 6).
+    The compiler auto-reduces to 2 cores where channels fit (5 <= 6), enabling
+    distribute/join instead of falling back to per-column independent DMA.
     """
     import subprocess
     script = (
@@ -394,7 +394,7 @@ def test_distribute_fallback_add_f32_65536():
         "b=rng.randn(65536).astype(np.float32); "
         "r=np.array(jax.jit(lambda x,y:x+y)(a,b)); "
         "np.testing.assert_allclose(r,a+b,rtol=1e-5); "
-        "print('fallback_add OK')"
+        "print('distribute_add OK')"
     )
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -405,17 +405,65 @@ def test_distribute_fallback_add_f32_65536():
         f"Subprocess failed:\nstdout: {result.stdout}\n"
         f"stderr: {result.stderr[-500:]}"
     )
-    assert "fallback_add OK" in result.stdout
-    # Should use 4 cores but NOT distribute/join (DMA channel limit exceeded).
+    assert "distribute_add OK" in result.stdout
+    # Should auto-reduce cores and use distribute/join. At 4 cores with 2 inputs,
+    # channels exceed limit (9 > 6), so the compiler reduces until it fits.
+    assert "distribute/join" in result.stderr, (
+        f"Expected 'distribute/join' for 2-input auto-reduced cores. Got:\n"
+        f"{result.stderr[-500:]}"
+    )
+    # Verify cores were actually reduced (not still at the default 4).
+    import re
+    m = re.search(r'using (\d+) core', result.stderr)
+    assert m and int(m.group(1)) < 4, (
+        f"Expected auto-reduced core count < 4. Got:\n"
+        f"{result.stderr[-500:]}"
+    )
+    print(f"         Distribute/join confirmed for add f32[65536] "
+          f"({m.group(1)} cores).", flush=True)
+
+
+def test_distribute_fallback_mul_f32_65536():
+    """Test: mul f32[65536] falls back to per-column (scalar, no auto-reduce).
+
+    f32 multiply is scalar (vector_width=0), so the auto-reduce heuristic
+    does not apply. With 4 cores and 2 inputs, DMA channels exceed the mem
+    tile limit (9 > 6), falling back to per-column independent DMA.
+    """
+    import subprocess
+    script = (
+        "import os; os.environ['JAX_PLATFORMS']='xdna'; "
+        "os.environ['XDNA_NO_CACHE']='1'; "
+        "import sys; sys.path.insert(0,'.'); "
+        "from jax_xdna import initialize; initialize(); "
+        "import jax; import numpy as np; "
+        "rng=np.random.RandomState(44); "
+        "a=rng.randn(65536).astype(np.float32); "
+        "b=rng.randn(65536).astype(np.float32); "
+        "r=np.array(jax.jit(lambda x,y:x*y)(a,b)); "
+        "np.testing.assert_allclose(r,a*b,rtol=2e-2); "
+        "print('fallback_mul OK')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=120,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+    assert result.returncode == 0, (
+        f"Subprocess failed:\nstdout: {result.stdout}\n"
+        f"stderr: {result.stderr[-500:]}"
+    )
+    assert "fallback_mul OK" in result.stdout
+    # Should use 4 cores but NOT distribute/join (scalar, no auto-reduce).
     assert "using 4 core(s)" in result.stderr, (
         f"Expected 'using 4 core(s)' in compiler log. Got:\n"
         f"{result.stderr[-500:]}"
     )
     assert "distribute/join" not in result.stderr, (
-        f"Expected NO 'distribute/join' for 2-input 4-core (channels > 6). Got:\n"
+        f"Expected NO 'distribute/join' for scalar 2-input 4-core. Got:\n"
         f"{result.stderr[-500:]}"
     )
-    print("         Per-column fallback confirmed for add f32[65536].", flush=True)
+    print("         Per-column fallback confirmed for mul f32[65536].", flush=True)
 
 
 def test_matmul_f32_identity():
@@ -709,7 +757,8 @@ def main():
         ("multicore override f32[256]", test_multicore_override_1),
     ] + [
         ("distribute neg f32[65536]", test_distribute_neg_f32_65536),
-        ("distribute fallback add f32[65536]", test_distribute_fallback_add_f32_65536),
+        ("distribute add f32[65536] (auto-reduce)", test_distribute_add_f32_65536),
+        ("distribute fallback mul f32[65536]", test_distribute_fallback_mul_f32_65536),
     ] + [
         ("unsupported: reshape", test_unsupported_reshape),
         ("unsupported: reduce_sum", test_unsupported_reduce_sum),

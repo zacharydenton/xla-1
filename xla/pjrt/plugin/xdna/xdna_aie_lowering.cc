@@ -2310,6 +2310,54 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
                           (d0_reps_early == 1 ||
                            num_chunks <= caps.shim_dma_max_d3));
 
+  // If distribute doesn't fit at current num_cores, try fewer cores.
+  // Limited to add/sub where compute is a single accumulator op per vector
+  // and DMA overhead dominates. Don't reduce below half the original count.
+  bool is_addsub = program.single_op.has_value() &&
+      (program.single_op->kernel_op == "arith.addf" ||
+       program.single_op->kernel_op == "arith.subf" ||
+       program.single_op->kernel_op == "arith.addi" ||
+       program.single_op->kernel_op == "arith.subi");
+  if (!use_distribute && num_cores > 1 && use_mem_tile && is_addsub) {
+    int min_try = std::max(2, (num_cores + 1) / 2);
+    for (int try_cores = num_cores - 1; try_cores >= min_try; try_cores--) {
+      if (program.num_elements % try_cores != 0) continue;
+      int64_t try_per_core = program.num_elements / try_cores;
+      if (try_per_core < min_per_core) continue;
+      if (try_per_core % min_dma_elements != 0) continue;
+      int64_t try_chunk, try_num_chunks;
+      if (try_per_core <= max_chunk) {
+        try_chunk = try_per_core;
+        try_num_chunks = 1;
+      } else {
+        try_chunk = ComputeChunkSize(try_per_core, max_chunk,
+                                      vector_width, element_bytes);
+        if (try_chunk <= 0) continue;
+        try_num_chunks = try_per_core / try_chunk;
+      }
+      if (try_num_chunks <= 1) continue;  // Need mem tile for distribute.
+      int64_t try_d0 = try_chunk, try_d0r = 1;
+      FindDmaSplit(try_chunk, element_bytes, try_d0, try_d0r);
+      int try_mm2s = try_cores * program.num_inputs + 1;
+      int try_s2mm = program.num_inputs + try_cores;
+      if (try_mm2s > caps.mem_tile_dma_channels ||
+          try_s2mm > caps.mem_tile_dma_channels) continue;
+      if (try_d0r > 1 && try_num_chunks > caps.shim_dma_max_d3) continue;
+      // Viable: adopt this configuration.
+      LOG(INFO) << "XDNA AIE lowering: reduced " << num_cores << " → "
+                << try_cores << " core(s) to enable distribute/join";
+      num_cores = try_cores;
+      per_core_elements = try_per_core;
+      chunk_size = try_chunk;
+      num_chunks = try_num_chunks;
+      d0_size_early = try_d0;
+      d0_reps_early = try_d0r;
+      channels_fit = true;
+      use_distribute = true;
+      break;
+    }
+  }
+
   LOG(INFO) << "XDNA AIE lowering: tiling " << per_core_elements
             << " elements/core into " << num_chunks << " chunk(s) of "
             << chunk_size << " (L1 budget: " << l1_limit << "B"
