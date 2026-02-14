@@ -127,7 +127,8 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
                                             lowering.use_aievec,
                                             lowering.convert_vector_to_aievec,
                                             lowering.needs_matmul_workarounds,
-                                            lowering.needs_softfloat_stubs));
+                                            lowering.needs_softfloat_stubs,
+                                            lowering.needs_softmax_kernel));
 
   LOG(INFO) << "XDNA compiler: xclbin generated, "
             << result.xclbin_bytes.size() << " bytes.";

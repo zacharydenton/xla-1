@@ -45,6 +45,7 @@ struct AieLoweringResult {
   bool needs_matmul_workarounds = false;  // Matmul MAC: --aie-loop-aware=false + __muldi3.
   bool needs_softfloat_stubs = false;  // Kernel uses soft-float comparisons.
   bool use_distribute = false;  // Elementwise uses distribute/join ObjectFIFO pattern.
+  bool needs_softmax_kernel = false;  // Softmax: compile AIE API C++ kernel.
 };
 
 // Lowers a linalg-on-tensors MLIR module to AIE dialect MLIR text.

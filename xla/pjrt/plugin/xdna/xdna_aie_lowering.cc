@@ -165,11 +165,19 @@ struct LinalgProgramInfo {
 struct MatmulProgramInfo {
   int64_t M, K, N;
   std::string element_type;  // "f32" or "bf16"
+  bool b_transposed = false;  // B input has transposed host layout (N×K not K×N)
 };
 
 // Matmul tile sizes for L1 tiling.
 struct MatmulTileConfig {
   int64_t m, k, n;  // tile dimensions
+};
+
+// Softmax program description for AIE lowering.
+struct SoftmaxProgramInfo {
+  int64_t num_rows;        // product of all dims except last (batch dims)
+  int64_t row_length;      // last dimension (softmax axis)
+  std::string element_type;  // "bf16"
 };
 
 // Returns true if the given op name is a supported body op for DAG analysis.
@@ -501,7 +509,9 @@ absl::StatusOr<MatmulTileConfig> SelectMatmulTiles(
   static constexpr int64_t kNCandidatesVec[] = {8};
 
   // Use vectorized path for bf16 when K is divisible by 8.
-  bool use_vectorized = is_bf16 && (info.K % 8 == 0);
+  // Transposed B disables vectorization: the MAC expects B in K×N row-major
+  // layout, but transposed B arrives as N×K tiles in L1.
+  bool use_vectorized = is_bf16 && (info.K % 8 == 0) && !info.b_transposed;
 
   auto fits_l1 = [&](int64_t m, int64_t k, int64_t n) -> bool {
     int64_t bytes;
@@ -1618,7 +1628,10 @@ std::string GenerateMatmulCoreBody(
   int64_t Kt = info.K / tile.k;
 
   std::string a_memref = absl::StrFormat("memref<%dx%dx%s>", tile.m, tile.k, ty);
-  std::string b_memref = absl::StrFormat("memref<%dx%dx%s>", tile.k, tile.n, ty);
+  // When b_transposed, DMA transfers B_orig tiles as n×k (not k×n).
+  std::string b_memref = info.b_transposed
+      ? absl::StrFormat("memref<%dx%dx%s>", tile.n, tile.k, ty)
+      : absl::StrFormat("memref<%dx%dx%s>", tile.k, tile.n, ty);
   std::string c_memref = absl::StrFormat("memref<%dx%dx%s>", tile.m, tile.n, ty);
   std::string acc_memref = absl::StrFormat("memref<%dx%dxf32>", tile.m, tile.n);
 
@@ -1707,14 +1720,18 @@ std::string GenerateMatmulCoreBody(
       "            scf.for %j = %c0 to %cn step %c1 {\n"
       "              scf.for %p = %c0 to %ck step %c1 {\n");
 
+  // B access: [%p, %j] for normal, [%j, %p] for transposed (B_orig[N][K] in L1).
+  std::string b_idx0 = info.b_transposed ? "%j" : "%p";
+  std::string b_idx1 = info.b_transposed ? "%p" : "%j";
+
   if (is_bf16) {
     // bf16: native multiply, f32 accumulator.
     absl::StrAppend(&body, absl::StrFormat(
         "                %%a_val = memref.load %%elem_a[%%i, %%p] : %s\n",
         a_memref));
     absl::StrAppend(&body, absl::StrFormat(
-        "                %%b_val = memref.load %%elem_b[%%p, %%j] : %s\n",
-        b_memref));
+        "                %%b_val = memref.load %%elem_b[%s, %s] : %s\n",
+        b_idx0, b_idx1, b_memref));
     absl::StrAppend(&body,
         "                %prod_bf = arith.mulf %a_val, %b_val : bf16\n"
         "                %prod_f32 = arith.extf %prod_bf : bf16 to f32\n");
@@ -1732,8 +1749,8 @@ std::string GenerateMatmulCoreBody(
         "                %%a_val = memref.load %%elem_a[%%i, %%p] : %s\n",
         a_memref));
     absl::StrAppend(&body, absl::StrFormat(
-        "                %%b_val = memref.load %%elem_b[%%p, %%j] : %s\n",
-        b_memref));
+        "                %%b_val = memref.load %%elem_b[%s, %s] : %s\n",
+        b_idx0, b_idx1, b_memref));
     absl::StrAppend(&body,
         "                %a_bf = arith.truncf %a_val : f32 to bf16\n"
         "                %b_bf = arith.truncf %b_val : f32 to bf16\n"
@@ -1848,8 +1865,9 @@ absl::StatusOr<std::string> GenerateMatmulNpuSequence(
         "Matmul A DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
         a_d0_words, a_d1));
   }
-  int64_t b_d0_words = tile.n * element_bytes / 4;
-  int64_t b_d1 = tile.k;
+  // For transposed B, DMA reads tiles as n×k (not k×n).
+  int64_t b_d0_words = (info.b_transposed ? tile.k : tile.n) * element_bytes / 4;
+  int64_t b_d1 = info.b_transposed ? tile.n : tile.k;
   if (b_d0_words > kMaxBdWords || b_d1 > kMaxBdWords) {
     return absl::InvalidArgumentError(absl::StrFormat(
         "Matmul B DMA exceeds BD limits: d0=%d words, d1=%d (max 1023)",
@@ -1891,21 +1909,35 @@ absl::StatusOr<std::string> GenerateMatmulNpuSequence(
           tile.k, info.K,
           dma_id++, fifo_name(c, "inA_L2"), a_host_memref));
 
-      // B DMA: [Nt_per_core, Kt, k, n] strides [n, k*N, N, 1]
-      //   d3=Nt_per_core: iterate over N-tiles (stride n)
-      //   d2=Kt: iterate over K-tiles (stride k*N)
-      //   d1=k: rows of tile (stride N = row stride in B)
-      //   d0=n: elements per row (stride 1)
+      // B DMA: depends on whether B is transposed.
+      // Normal:     B[K,N] row-major → tiles of k×n
+      //   [Nt_per_core, Kt, k, n] strides [n, k*N, N, 1]
+      // Transposed: B_orig[N,K] row-major → tiles of n×k
+      //   [Nt_per_core, Kt, n, k] strides [n*K, k, K, 1]
       // Each core reads a different column slice of B.
-      int64_t b_offset = c * Nt_per_core * tile.n;
-      absl::StrAppend(&seq, absl::StrFormat(
-          "      aiex.npu.dma_memcpy_nd(%%arg1"
-          "[0, 0, 0, %d][%d, %d, %d, %d][%d, %d, %d, 1]) "
-          "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
-          b_offset,
-          Nt_per_core, Kt, tile.k, tile.n,
-          tile.n, tile.k * info.N, info.N,
-          dma_id++, fifo_name(c, "inB_L2"), b_host_memref));
+      if (info.b_transposed) {
+        // B_orig[N,K]: each row is K elements wide.
+        // Tile (nt, kt): n rows starting at row nt*n, k cols starting at col kt*k.
+        int64_t b_offset = c * Nt_per_core * tile.n * info.K;
+        absl::StrAppend(&seq, absl::StrFormat(
+            "      aiex.npu.dma_memcpy_nd(%%arg1"
+            "[0, 0, 0, %d][%d, %d, %d, %d][%d, %d, %d, 1]) "
+            "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+            b_offset,
+            Nt_per_core, Kt, tile.n, tile.k,
+            tile.n * info.K, tile.k, info.K,
+            dma_id++, fifo_name(c, "inB_L2"), b_host_memref));
+      } else {
+        int64_t b_offset = c * Nt_per_core * tile.n;
+        absl::StrAppend(&seq, absl::StrFormat(
+            "      aiex.npu.dma_memcpy_nd(%%arg1"
+            "[0, 0, 0, %d][%d, %d, %d, %d][%d, %d, %d, 1]) "
+            "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+            b_offset,
+            Nt_per_core, Kt, tile.k, tile.n,
+            tile.n, tile.k * info.N, info.N,
+            dma_id++, fifo_name(c, "inB_L2"), b_host_memref));
+      }
 
       // C DMA: [1, Nt_per_core, m, n] strides [0, n, N, 1]
       // Each core writes a different column slice of C.
@@ -1969,6 +2001,7 @@ absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
             << " n=" << tile.n << " (M=" << info.M << " K=" << info.K
             << " N=" << info.N << " " << info.element_type
             << (use_vectorized ? " VECTORIZED" : " scalar")
+            << (info.b_transposed ? " B_TRANSPOSED" : "")
             << ") using " << num_cores << " core(s)";
   const std::string& ty = info.element_type;
   int start_col = caps.partition_start_column;
@@ -1976,7 +2009,10 @@ absl::StatusOr<AieLoweringResult> LowerMatmulToAieInternal(
   int compute_row = caps.first_compute_row;
 
   std::string a_memref = absl::StrFormat("memref<%dx%dx%s>", tile.m, tile.k, ty);
-  std::string b_memref = absl::StrFormat("memref<%dx%dx%s>", tile.k, tile.n, ty);
+  // Transposed B: DMA transfers tiles as n×k (original B_orig layout).
+  std::string b_memref = info.b_transposed
+      ? absl::StrFormat("memref<%dx%dx%s>", tile.n, tile.k, ty)
+      : absl::StrFormat("memref<%dx%dx%s>", tile.k, tile.n, ty);
   std::string c_memref = absl::StrFormat("memref<%dx%dx%s>", tile.m, tile.n, ty);
 
   // FIFO name helper: multi-core uses "c{col}_" prefix, single-core uses "".
@@ -2125,12 +2161,14 @@ std::optional<MatmulProgramInfo> DetectMatmul(mlir::ModuleOp module) {
   });
   if (!entry_func) return std::nullopt;
 
-  // Count linalg ops: we accept exactly {fill, matmul} or just {matmul}.
+  // Count linalg ops: we accept {fill, matmul} or {transpose_generic, fill, matmul}.
   int fill_count = 0;
   int matmul_count = 0;
+  int generic_count = 0;
   int other_linalg_count = 0;
   mlir::Operation* matmul_op = nullptr;
   mlir::Operation* fill_op = nullptr;
+  mlir::Operation* generic_op = nullptr;
 
   entry_func.walk([&](mlir::Operation* op) {
     llvm::StringRef name = op->getName().getStringRef();
@@ -2142,6 +2180,9 @@ std::optional<MatmulProgramInfo> DetectMatmul(mlir::ModuleOp module) {
     } else if (name == "linalg.matmul") {
       matmul_count++;
       matmul_op = op;
+    } else if (name == "linalg.generic") {
+      generic_count++;
+      generic_op = op;
     } else {
       other_linalg_count++;
     }
@@ -2149,6 +2190,7 @@ std::optional<MatmulProgramInfo> DetectMatmul(mlir::ModuleOp module) {
 
   if (matmul_count != 1 || other_linalg_count != 0) return std::nullopt;
   if (fill_count > 1) return std::nullopt;  // At most one fill
+  if (generic_count > 1) return std::nullopt;  // At most one generic (transpose)
 
   // Validate fill value is zero — our lowering unconditionally zeroes the
   // accumulator, so a non-zero fill would be silently dropped.
@@ -2173,9 +2215,71 @@ std::optional<MatmulProgramInfo> DetectMatmul(mlir::ModuleOp module) {
     }
   }
 
+  // Check if the generic op is a pure transpose that feeds into the matmul's
+  // B input. Validates shapes, indexing maps, AND body semantics.
+  bool b_transposed = false;
+  if (generic_count == 1 && generic_op) {
+    // Transpose generic: 1 input (DPS), 1 output (DPS) = 2 operands.
+    if (generic_op->getNumOperands() != 2) return std::nullopt;
+    auto gin_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic_op->getOperand(0).getType());
+    auto gout_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic_op->getResult(0).getType());
+    if (!gin_type || !gout_type) return std::nullopt;
+    if (gin_type.getRank() != 2 || gout_type.getRank() != 2) return std::nullopt;
+    // Shape check: input (a, b), output (b, a).
+    if (gin_type.getShape()[0] != gout_type.getShape()[1] ||
+        gin_type.getShape()[1] != gout_type.getShape()[0]) {
+      LOG(INFO) << "XDNA: linalg.generic in matmul module is not a transpose";
+      return std::nullopt;
+    }
+    // Verify indexing maps are transpose: input map swaps dims, output is identity.
+    // Expected: input = (d0, d1) -> (d1, d0), output = (d0, d1) -> (d0, d1).
+    auto generic_typed = mlir::dyn_cast<mlir::linalg::GenericOp>(generic_op);
+    if (!generic_typed) return std::nullopt;
+    auto maps = generic_typed.getIndexingMapsArray();
+    if (maps.size() != 2) return std::nullopt;
+    // Input map must be a permutation that swaps the two dims.
+    auto in_map = maps[0];
+    if (in_map.getNumDims() != 2 || in_map.getNumResults() != 2)
+      return std::nullopt;
+    auto r0 = mlir::dyn_cast<mlir::AffineDimExpr>(in_map.getResult(0));
+    auto r1 = mlir::dyn_cast<mlir::AffineDimExpr>(in_map.getResult(1));
+    if (!r0 || !r1 || r0.getPosition() != 1 || r1.getPosition() != 0) {
+      LOG(INFO) << "XDNA: linalg.generic input map is not a transpose";
+      return std::nullopt;
+    }
+    // Output map must be identity.
+    if (!maps[1].isIdentity()) {
+      LOG(INFO) << "XDNA: linalg.generic output map is not identity";
+      return std::nullopt;
+    }
+    // Body must be a pure copy: just yields the input block argument.
+    mlir::Block& body = generic_typed.getRegion().front();
+    auto body_ops = body.without_terminator();
+    if (body_ops.begin() != body_ops.end()) {
+      LOG(INFO) << "XDNA: linalg.generic body is not a pure copy";
+      return std::nullopt;
+    }
+    auto yield = mlir::dyn_cast<mlir::linalg::YieldOp>(body.getTerminator());
+    if (!yield || yield.getNumOperands() != 1 ||
+        yield.getOperand(0) != body.getArgument(0)) {
+      LOG(INFO) << "XDNA: linalg.generic yield does not pass through input";
+      return std::nullopt;
+    }
+    // Verify the transpose output feeds into the matmul's B input (operand 1).
+    if (generic_op->getResult(0) != matmul_op->getOperand(1)) {
+      LOG(INFO) << "XDNA: transpose generic does not feed matmul B input";
+      return std::nullopt;
+    }
+    b_transposed = true;
+  }
+
   // Extract M, K, N from matmul operand shapes.
   // linalg.matmul ins(%A : tensor<MxKxTy>, %B : tensor<KxNxTy>)
   //               outs(%C : tensor<MxNxTy>)
+  // When b_transposed, B is the transposed result (K×N) but the host buffer
+  // is the original layout (N×K).
   if (matmul_op->getNumOperands() < 3) return std::nullopt;
 
   auto a_type = mlir::dyn_cast<mlir::RankedTensorType>(
@@ -2201,7 +2305,367 @@ std::optional<MatmulProgramInfo> DetectMatmul(mlir::ModuleOp module) {
   info.K = K;
   info.N = N;
   info.element_type = elem_type;
+  info.b_transposed = b_transposed;
+  if (b_transposed) {
+    LOG(INFO) << "XDNA: detected transposed matmul (Q @ K^T pattern)";
+  }
   return info;
+}
+
+// Detects a softmax pattern in the module.
+// XLA decomposes jax.nn.softmax into multiple linalg ops:
+//   reduce(maximumf) + exp + reduce(addf) + divf
+// We detect this signature and fuse into a single AIE API C++ kernel call.
+std::optional<SoftmaxProgramInfo> DetectSoftmax(mlir::ModuleOp module) {
+  mlir::func::FuncOp entry_func;
+  module.walk([&](mlir::func::FuncOp func) {
+    if (func.getName() == "main" || !entry_func) entry_func = func;
+  });
+  if (!entry_func) return std::nullopt;
+
+  // Verify function signature: single input tensor, single result tensor.
+  auto func_type = entry_func.getFunctionType();
+  if (func_type.getNumInputs() != 1 || func_type.getNumResults() != 1)
+    return std::nullopt;
+
+  // Validate input/output types: both must be the same ranked tensor type.
+  auto input = mlir::dyn_cast<mlir::RankedTensorType>(func_type.getInput(0));
+  auto output = mlir::dyn_cast<mlir::RankedTensorType>(func_type.getResult(0));
+  if (!input || !output) return std::nullopt;
+  if (input.getRank() < 1) return std::nullopt;
+  if (input != output) {
+    LOG(INFO) << "XDNA: softmax input/output type mismatch";
+    return std::nullopt;
+  }
+
+  std::string elem_type = GetElementTypeStr(input.getElementType());
+  if (elem_type != "bf16") return std::nullopt;  // bf16 only for now
+
+  // Count all linalg ops and look for the softmax decomposition pattern:
+  //   fill(-inf) + reduce(maximumf) + clamp + broadcast_max +
+  //   subf + exp + extf + fill(0) + reduce(addf) + truncf +
+  //   broadcast_sum + divf = 2 fills + 10 generics = 12 ops total.
+  // Reject if unexpected linalg ops are present (e.g. matmul).
+  bool has_max_reduce = false, has_exp = false;
+  bool has_sum_reduce = false, has_div = false;
+  mlir::Operation* div_op = nullptr;
+  int fill_count = 0, generic_count = 0, other_linalg_count = 0;
+
+  entry_func.walk([&](mlir::Operation* op) {
+    llvm::StringRef op_name = op->getName().getStringRef();
+    if (!op_name.starts_with("linalg.")) return;
+    if (op_name == "linalg.yield") return;
+    if (op_name == "linalg.fill") { fill_count++; return; }
+    if (op_name == "linalg.generic") { generic_count++; } else {
+      other_linalg_count++;
+      return;
+    }
+  });
+
+  // Reject if non-fill/generic linalg ops exist or total count is unexpected.
+  // XLA's softmax decomposition produces exactly 2 fills + 10 generics = 12.
+  // Allow some tolerance for XLA version variation, but reject clearly
+  // non-softmax modules.
+  if (other_linalg_count > 0) return std::nullopt;
+  if (fill_count + generic_count > 15) return std::nullopt;
+
+  // The last dimension index — softmax must reduce over this axis.
+  int64_t last_dim_idx = input.getRank() - 1;
+
+  entry_func.walk([&](mlir::linalg::GenericOp generic) {
+    auto iterators = generic.getIteratorTypesArray();
+
+    // Find which positions are reductions.
+    bool is_reduction = false;
+    for (auto it : iterators) {
+      if (it == mlir::utils::IteratorType::reduction) {
+        is_reduction = true;
+        break;
+      }
+    }
+
+    // For reductions, verify the reduction dimension maps to the input's
+    // last axis. XLA's softmax reduces along the last dimension; if this
+    // reduces a different axis, it's not last-axis softmax.
+    if (is_reduction) {
+      auto maps = generic.getIndexingMapsArray();
+      // The first map is the input map. Find which loop dim(s) are reductions
+      // and check they correspond to the last input dimension.
+      bool reduces_last_dim = false;
+      if (!maps.empty()) {
+        auto input_map = maps[0];
+        for (unsigned d = 0; d < iterators.size(); d++) {
+          if (iterators[d] != mlir::utils::IteratorType::reduction) continue;
+          // Check if this reduction loop dim maps to the last input dim.
+          // For softmax, the input map is (d0, d1) -> (d0, d1) and d1 is
+          // the reduction dim, which maps to position 1 = last_dim_idx.
+          for (unsigned r = 0; r < input_map.getNumResults(); r++) {
+            auto expr = input_map.getResult(r);
+            if (auto dim = mlir::dyn_cast<mlir::AffineDimExpr>(expr)) {
+              if (dim.getPosition() == d &&
+                  static_cast<int64_t>(r) == last_dim_idx) {
+                reduces_last_dim = true;
+              }
+            }
+          }
+        }
+      }
+      if (!reduces_last_dim) {
+        // This reduction doesn't reduce the last axis — not last-axis softmax.
+        // Clear the flags so detection fails.
+        has_max_reduce = false;
+        has_sum_reduce = false;
+        return;
+      }
+    }
+
+    mlir::Block& body = generic.getRegion().front();
+    for (mlir::Operation& body_op : body.without_terminator()) {
+      llvm::StringRef name = body_op.getName().getStringRef();
+      if (name == "arith.maximumf" && is_reduction) has_max_reduce = true;
+      if (name == "math.exp") has_exp = true;
+      if (name == "arith.addf" && is_reduction) has_sum_reduce = true;
+      if (name == "arith.divf") { has_div = true; div_op = generic; }
+    }
+  });
+
+  if (!has_max_reduce || !has_exp || !has_sum_reduce || !has_div)
+    return std::nullopt;
+
+  // Verify the divf generic's output feeds into the function return value.
+  // This ensures the module's output IS the softmax result, not some other
+  // computation that happens to contain softmax-like ops.
+  if (div_op) {
+    mlir::Value div_result = div_op->getResult(0);
+    bool feeds_return = false;
+    for (mlir::Operation* user : div_result.getUsers()) {
+      // The result may pass through stablehlo.custom_call @xla.sdy.FuncResultSharding
+      // before reaching the return op.
+      if (mlir::isa<mlir::func::ReturnOp>(user)) {
+        feeds_return = true;
+      } else if (user->getName().getStringRef() == "stablehlo.custom_call") {
+        for (mlir::Operation* inner_user : user->getResult(0).getUsers()) {
+          if (mlir::isa<mlir::func::ReturnOp>(inner_user))
+            feeds_return = true;
+        }
+      }
+    }
+    if (!feeds_return) {
+      LOG(INFO) << "XDNA: divf output does not feed function return, "
+                << "not a pure softmax module";
+      return std::nullopt;
+    }
+  }
+
+  int64_t row_length = input.getShape().back();
+  int64_t num_rows = 1;
+  for (int i = 0; i < input.getRank() - 1; i++)
+    num_rows *= input.getShape()[i];
+
+  // AIE API softmax kernel uses 32-wide bf16 vectors.
+  if (row_length % 32 != 0) return std::nullopt;
+  if (num_rows < 1) return std::nullopt;
+
+  SoftmaxProgramInfo sinfo;
+  sinfo.num_rows = num_rows;
+  sinfo.row_length = row_length;
+  sinfo.element_type = elem_type;
+  return sinfo;
+}
+
+// Generates AIE MLIR for softmax using an external C++ kernel.
+// Each core processes rows_per_core rows, calling softmax_bf16 per row.
+absl::StatusOr<AieLoweringResult> LowerSoftmaxToAie(
+    const SoftmaxProgramInfo& info, const TargetCaps& caps,
+    int max_columns) {
+  // Auto-scale number of cores.
+  int num_cores = std::min(max_columns, caps.num_columns);
+  while (num_cores > 1) {
+    if (info.num_rows % num_cores != 0) { num_cores--; continue; }
+    break;
+  }
+  int64_t rows_per_core = info.num_rows / num_cores;
+  int64_t total_elements = info.num_rows * info.row_length;
+
+  // L1 budget: 2 FIFOs (in + out) x 2 ping-pong x row_length x 2 bytes.
+  int64_t l1_per_row = 2 * 2 * info.row_length * 2;  // 8 * row_length
+  if (l1_per_row > caps.l1_usable_bytes) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Softmax row_length=%d exceeds L1 budget (%d bytes needed, %d available)",
+        info.row_length, l1_per_row, caps.l1_usable_bytes));
+  }
+
+  // DMA dimension limits (10-bit fields, max 1023 32-bit words).
+  int64_t d0_words = info.row_length * 2 / 4;  // bf16 elements → 32-bit words
+  if (d0_words > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Softmax row_length=%d exceeds DMA d0 limit (%d words, max %d)",
+        info.row_length, d0_words, kMaxBdWords));
+  }
+  if (rows_per_core > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Softmax rows_per_core=%d exceeds DMA d1 limit (max %d)",
+        rows_per_core, kMaxBdWords));
+  }
+
+  LOG(INFO) << "XDNA softmax lowering: " << info.num_rows << " rows x "
+            << info.row_length << " " << info.element_type
+            << " using " << num_cores << " core(s) ("
+            << rows_per_core << " rows/core)";
+
+  int start_col = caps.partition_start_column;
+  int shim_row = caps.shim_row;
+  int compute_row = caps.first_compute_row;
+  int fifo_depth = 2;
+
+  std::string row_memref = absl::StrFormat("memref<%dxbf16>", info.row_length);
+  std::string host_memref = absl::StrFormat("memref<%dxbf16>", total_elements);
+
+  auto fifo_name = [&](int c, const std::string& base) -> std::string {
+    return num_cores > 1 ? absl::StrFormat("c%d_%s", c, base) : base;
+  };
+
+  std::string aie_mlir;
+  absl::StrAppend(&aie_mlir, "module {\n");
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "  aie.device(%s) {\n", DeviceNameForColumns(num_cores)));
+
+  // Pass 1: Tile declarations.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, shim_row, col, shim_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, caps.mem_tile_row, col, caps.mem_tile_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, compute_row, col, compute_row));
+  }
+
+  // Pass 2: ObjectFIFOs and links (shim ↔ mem ↔ compute).
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string shim = absl::StrFormat("tile_%d_%d", col, shim_row);
+    std::string mem = absl::StrFormat("tile_%d_%d", col, caps.mem_tile_row);
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+
+    // Input: shim → mem (L2) → compute (L1).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_L2"), shim, mem, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in"), mem, compute, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "in_L2"), fifo_name(c, "in")));
+
+    // Output: compute → mem (L2) → shim.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out"), compute, mem, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out_L2"), mem, shim, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "out"), fifo_name(c, "out_L2")));
+  }
+
+  // External function declaration (resolved at link time from softmax_kernel.o).
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    func.func private @softmax_bf16(%s, %s, i32) -> ()\n",
+      row_memref, row_memref));
+
+  // Pass 3: Core bodies.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+    std::string subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", row_memref);
+
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%core_%d_%d = aie.core(%%%s) {\n", col, compute_row, compute));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%c0 = arith.constant 0 : index\n"
+        "      %%c1 = arith.constant 1 : index\n"
+        "      %%num_rows = arith.constant %d : index\n"
+        "      %%row_len = arith.constant %d : i32\n",
+        rows_per_core, info.row_length));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      scf.for %%i = %%c0 to %%num_rows step %%c1 {\n"
+        "        %%in_sub = aie.objectfifo.acquire @%s(Consume, 1) : %s\n"
+        "        %%in_buf = aie.objectfifo.subview.access %%in_sub[0] "
+        ": %s -> %s\n"
+        "        %%out_sub = aie.objectfifo.acquire @%s(Produce, 1) : %s\n"
+        "        %%out_buf = aie.objectfifo.subview.access %%out_sub[0] "
+        ": %s -> %s\n"
+        "        func.call @softmax_bf16(%%in_buf, %%out_buf, %%row_len) "
+        ": (%s, %s, i32) -> ()\n"
+        "        aie.objectfifo.release @%s(Consume, 1)\n"
+        "        aie.objectfifo.release @%s(Produce, 1)\n"
+        "      }\n",
+        fifo_name(c, "in"), subview_ty, subview_ty, row_memref,
+        fifo_name(c, "out"), subview_ty, subview_ty, row_memref,
+        row_memref, row_memref,
+        fifo_name(c, "in"), fifo_name(c, "out")));
+    absl::StrAppend(&aie_mlir, "      aie.end\n    }\n");
+  }
+
+  // Runtime sequence (DMA).
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.runtime_sequence(%%arg0: %s, %%arg1: %s) {\n",
+      host_memref, host_memref));
+
+  int dma_id = 0;
+  for (int c = 0; c < num_cores; c++) {
+    int64_t offset = c * rows_per_core * info.row_length;
+
+    // Input DMA: transfer rows_per_core rows starting at offset.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg0"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        offset, rows_per_core, info.row_length, info.row_length,
+        dma_id++, fifo_name(c, "in_L2"), host_memref));
+
+    // Output DMA: receive rows_per_core rows at same offset.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg1"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        offset, rows_per_core, info.row_length, info.row_length,
+        dma_id++, fifo_name(c, "out_L2"), host_memref));
+  }
+
+  // Wait for all DMAs.
+  for (int c = 0; c < num_cores; c++) {
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "out_L2")));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "in_L2")));
+  }
+
+  absl::StrAppend(&aie_mlir, "    }\n");  // end runtime_sequence
+  absl::StrAppend(&aie_mlir, "  }\n");    // end aie.device
+  absl::StrAppend(&aie_mlir, "}\n");      // end module
+
+  LOG(INFO) << "XDNA softmax lowering: generated AIE MLIR:\n" << aie_mlir;
+
+  return AieLoweringResult{aie_mlir, num_cores,
+                           /*use_aievec=*/false,
+                           /*convert_vector_to_aievec=*/false,
+                           /*needs_matmul_workarounds=*/false,
+                           /*needs_softfloat_stubs=*/true,
+                           /*use_distribute=*/false,
+                           /*needs_softmax_kernel=*/true};
 }
 
 absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
@@ -2214,6 +2678,15 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
               << "," << matmul_info->K << "]@[" << matmul_info->K << ","
               << matmul_info->N << "] " << matmul_info->element_type;
     return LowerMatmulToAieInternal(*matmul_info, caps, config.num_columns);
+  }
+
+  // Check for softmax before elementwise analysis.
+  auto softmax_info = DetectSoftmax(linalg_module);
+  if (softmax_info.has_value()) {
+    LOG(INFO) << "XDNA AIE lowering: detected softmax "
+              << softmax_info->num_rows << "x" << softmax_info->row_length
+              << " " << softmax_info->element_type;
+    return LowerSoftmaxToAie(*softmax_info, caps, config.num_columns);
   }
 
   // Step 1: Analyze the linalg module (elementwise path).

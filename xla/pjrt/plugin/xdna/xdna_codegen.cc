@@ -75,6 +75,37 @@ std::string GetXclbinutilPath() {
   return env ? env : "/opt/xilinx/xrt/bin/xclbinutil";
 }
 
+std::string GetPeanoClangxxPath() {
+  const char* env = std::getenv("XDNA_PEANO_CLANGXX");
+  return env ? env : "/opt/peano/bin/clang++";
+}
+
+std::string GetPeanoSysrootInclude() {
+  const char* env = std::getenv("XDNA_PEANO_SYSROOT_INCLUDE");
+  return env ? env : "/opt/peano-sysroot/include";
+}
+
+std::string GetLibcxxInclude() {
+  const char* env = std::getenv("XDNA_LIBCXX_INCLUDE");
+  if (env) return env;
+  // Derive from Peano path: /opt/peano/bin/clang → /opt/peano/../llvm-aie/libcxx/include
+  // Fallback: check common locations relative to HOME.
+  const char* home = std::getenv("HOME");
+  if (home) {
+    std::string candidate = std::string(home) + "/code/llvm-aie/libcxx/include";
+    if (std::filesystem::exists(candidate + "/__config_site")) return candidate;
+  }
+  return "/opt/peano/libcxx/include";
+}
+
+std::string GetAieApiInclude() {
+  const char* env = std::getenv("XDNA_AIE_API_INCLUDE");
+  if (env) return env;
+  // Derive from aie-opt path: /opt/mlir-aie/bin/aie-opt → /opt/mlir-aie/include
+  return std::filesystem::path(GetAieOptPath())
+      .parent_path().parent_path().string() + "/include";
+}
+
 // ---------------------------------------------------------------------------
 // File I/O helpers.
 // ---------------------------------------------------------------------------
@@ -414,7 +445,8 @@ absl::Status CheckTools(const std::string& aie_opt,
 absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     const std::string& aie_mlir, int num_data_args, const TargetCaps& caps,
     int num_cores, bool use_aievec, bool convert_vector_to_aievec,
-    bool needs_matmul_workarounds, bool needs_softfloat_stubs) {
+    bool needs_matmul_workarounds, bool needs_softfloat_stubs,
+    bool needs_softmax_kernel) {
   // Create a temporary working directory.
   auto tmpdir = std::filesystem::temp_directory_path() / "xdna_codegen_XXXXXX";
   std::string tmpdir_str = tmpdir.string();
@@ -453,10 +485,11 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
   //   - create-pathfinder-flows: routes logical flows through physical switches
   //   - assign-buffer-addresses: allocates memory in tile local stores
   // -----------------------------------------------------------------------
-  // Step numbering: 1 shared + N per core + 5 shared = total.
+  // Step numbering: 1 shared + N per core + shared steps = total.
   bool needs_rt_stubs = needs_matmul_workarounds || needs_softfloat_stubs;
   int steps_per_core = needs_rt_stubs ? 8 : 7;  // +1 for rt stubs
-  int total_compile_steps = steps_per_core * num_cores + 6;
+  int shared_steps = 6 + (needs_softmax_kernel ? 3 : 0);
+  int total_compile_steps = steps_per_core * num_cores + shared_steps;
   int step = 1;
 
   std::string lowered_mlir = workdir + "/lowered.mlir";
@@ -479,6 +512,116 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
       " ", input_mlir, " -o ", lowered_mlir),
       absl::StrFormat("Step %d/%d: AIE lowering passes",
                       step++, total_compile_steps)));
+
+  // -----------------------------------------------------------------------
+  // Step 2b: Compile softmax C++ kernel with Peano (if needed).
+  // Uses AIE API (aie_api/aie.hpp) for vectorized softmax implementation.
+  // Compiled once, linked into each core's ELF.
+  // -----------------------------------------------------------------------
+  std::string softmax_kernel_obj;
+  if (needs_softmax_kernel) {
+    std::string peano_clangxx = GetPeanoClangxxPath();
+    std::string sysroot_include = GetPeanoSysrootInclude();
+    std::string libcxx_include = GetLibcxxInclude();
+    std::string aie_api_include = GetAieApiInclude();
+
+    std::string kernel_src = workdir + "/softmax_kernel.cc";
+    softmax_kernel_obj = workdir + "/softmax_kernel.o";
+
+    // Generate the softmax kernel C++ source.
+    // Uses load_v/store_v instead of iterators (iterators produce zeros on NPU2).
+    // Float comparisons use integer bitcast to avoid soft-float __ltsf2 hang.
+    std::string kernel_code = R"(#include <aie_api/aie.hpp>
+#include <stdint.h>
+
+#define VL 32
+#define log2e_val 1.4453125f
+
+// Integer-based float comparison (avoids __ltsf2 that hangs on AIE2p).
+static inline int float_gt(float a, float b) {
+  union { float f; int i; } ua, ub;
+  ua.f = a; ub.f = b;
+  int sa = ua.i >> 31, sb = ub.i >> 31;
+  if (sa == 0 && sb == 0) return ua.i > ub.i;
+  if (sa && sb) return ua.i < ub.i;
+  if (sa == 0) return 1;
+  return 0;
+}
+
+extern "C" void softmax_bf16(bfloat16* __restrict input,
+                             bfloat16* __restrict output,
+                             const int32_t input_size) {
+  const int n_iters = input_size / VL;
+  aie::vector<bfloat16, VL> log2e_vec =
+      aie::broadcast<bfloat16, VL>((bfloat16)log2e_val);
+
+  // Pass 1: scale by log2e and find running max.
+  float max_val = -65504.0f;  // -bf16_max
+  for (int i = 0; i < n_iters; i++) {
+    aie::vector<bfloat16, VL> v = aie::load_v<VL>(input + i * VL);
+    aie::accum<accfloat, VL> scaled = aie::mul(v, log2e_vec);
+    float rm = aie::reduce_max(scaled.to_vector<bfloat16>());
+    if (float_gt(rm, max_val)) max_val = rm;
+  }
+
+  // Pass 2: exp2(scaled - max), write to output, accumulate sum.
+  aie::vector<bfloat16, VL> max_vec =
+      aie::broadcast<bfloat16, VL>((bfloat16)max_val);
+  aie::accum<accfloat, VL> sum_acc = aie::zeros<accfloat, VL>();
+  for (int i = 0; i < n_iters; i++) {
+    aie::vector<bfloat16, VL> v = aie::load_v<VL>(input + i * VL);
+    aie::accum<accfloat, VL> scaled = aie::mul(v, log2e_vec);
+    aie::accum<accfloat, VL> shifted = aie::sub(scaled, max_vec);
+    aie::vector<bfloat16, VL> exp_v =
+        aie::exp2<bfloat16>(shifted.to_vector<float>());
+    sum_acc = aie::add(sum_acc, exp_v);
+    aie::store_v(output + i * VL, exp_v);
+  }
+
+  // Pass 3: normalize by reciprocal of sum.
+  float total = aie::reduce_add(sum_acc.to_vector<float>());
+  bfloat16 inv_total = (bfloat16)aie::inv(total);
+  for (int i = 0; i < n_iters; i++) {
+    aie::vector<bfloat16, VL> v = aie::load_v<VL>(output + i * VL);
+    aie::accum<accfloat, VL> normed = aie::mul(v, inv_total);
+    aie::store_v(output + i * VL, normed.to_vector<bfloat16>());
+  }
+}
+)";
+
+    TF_RETURN_IF_ERROR(WriteFile(kernel_src, kernel_code));
+
+    // Two-step compilation to avoid Peano VLIW scheduler miscompilation:
+    // Step A: clang++ → LLVM IR (frontend at O1 for template inlining)
+    // Step B: opt at O0 + strip (avoid LLVM optimization bugs)
+    // Step C: llc at O2 --aie-loop-aware=false (code gen without scheduler)
+    std::string kernel_ll = workdir + "/softmax_kernel.ll";
+    std::string kernel_bc = workdir + "/softmax_kernel.opt.bc";
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        peano_clangxx,
+        " --target=", caps.isa_target, "-none-unknown-elf"
+        " -O1 -std=c++20 -S -emit-llvm"
+        " -isystem ", sysroot_include,
+        " -I ", libcxx_include,
+        " -I ", aie_api_include,
+        " ", kernel_src, " -o ", kernel_ll),
+        absl::StrFormat("Step %d/%d: Softmax kernel → LLVM IR",
+                        step++, total_compile_steps)));
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        GetPeanoOptPath(), " '--passes=default<O0>,strip' ",
+        kernel_ll, " -o ", kernel_bc),
+        absl::StrFormat("Step %d/%d: Softmax opt",
+                        step++, total_compile_steps)));
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        GetPeanoLlcPath(),
+        " -O2 --aie-loop-aware=false -filetype=obj ",
+        kernel_bc, " -o ", softmax_kernel_obj),
+        absl::StrFormat("Step %d/%d: Softmax llc",
+                        step++, total_compile_steps)));
+  }
 
   // -----------------------------------------------------------------------
   // Step 3: Per-core code compilation with Peano.
@@ -1041,12 +1184,15 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
 
     // 3i: Peano clang link.
     std::string core_elf = absl::StrFormat("%s/%s.elf", workdir, core);
+    std::string extra_objs;
+    if (!rt_stubs_obj.empty()) absl::StrAppend(&extra_objs, " ", rt_stubs_obj);
+    if (!softmax_kernel_obj.empty())
+      absl::StrAppend(&extra_objs, " ", softmax_kernel_obj);
     TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
         peano_clang,
         " -O2 --target=", caps.isa_target, "-none-elf -nostdlib"
         " -Wl,--gc-sections -Wl,--entry=", core, " ",
-        core_obj, (rt_stubs_obj.empty() ? "" : " "),
-        rt_stubs_obj,
+        core_obj, extra_objs,
         " -Wl,-T,", core_ldscript, " -o ", core_elf),
         absl::StrFormat("Step %d/%d: Core (%d,%d) Peano linking",
                         step++, total_compile_steps, col, row)));

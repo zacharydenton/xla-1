@@ -640,6 +640,113 @@ def test_relu_bf16_1024():
     np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, rtol=1e-2)
 
 
+def _softmax_ref(x):
+    """CPU reference softmax using numpy (avoids JAX device issues)."""
+    x_f32 = x.astype(np.float32)
+    x_max = np.max(x_f32, axis=-1, keepdims=True)
+    e = np.exp(x_f32 - x_max)
+    return e / np.sum(e, axis=-1, keepdims=True)
+
+
+def test_softmax_bf16_1x64():
+    """Softmax: bf16[1,64] — single row, single core."""
+    import ml_dtypes
+    rng = np.random.RandomState(200)
+    a = rng.randn(1, 64).astype(ml_dtypes.bfloat16)
+    result = jax.jit(jax.nn.softmax)(a)
+    expected = _softmax_ref(a)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.02)
+
+
+def test_softmax_bf16_4x128():
+    """Softmax: bf16[4,128] — multi-row, potentially multi-core."""
+    import ml_dtypes
+    rng = np.random.RandomState(201)
+    a = rng.randn(4, 128).astype(ml_dtypes.bfloat16)
+    result = jax.jit(jax.nn.softmax)(a)
+    expected = _softmax_ref(a)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.02)
+
+
+def test_softmax_bf16_8x256():
+    """Softmax: bf16[8,256] — larger, multi-core."""
+    import ml_dtypes
+    rng = np.random.RandomState(202)
+    a = rng.randn(8, 256).astype(ml_dtypes.bfloat16)
+    result = jax.jit(jax.nn.softmax)(a)
+    expected = _softmax_ref(a)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.02)
+
+
+def test_transposed_matmul_bf16_4x8():
+    """Transposed matmul: Q(4,8) @ K(4,8)^T = (4,4) — Q @ K^T pattern."""
+    import ml_dtypes
+    rng = np.random.RandomState(210)
+    q = rng.randn(4, 8).astype(ml_dtypes.bfloat16)
+    k = rng.randn(4, 8).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda q, k: q @ k.T)(q, k)
+    expected = q.astype(np.float32) @ k.astype(np.float32).T
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, atol=0.5)
+
+
+def test_transposed_matmul_bf16_16x32():
+    """Transposed matmul: Q(16,32) @ K(16,32)^T = (16,16) — multi-tile."""
+    import ml_dtypes
+    rng = np.random.RandomState(211)
+    q = rng.randn(16, 32).astype(ml_dtypes.bfloat16)
+    k = rng.randn(16, 32).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda q, k: q @ k.T)(q, k)
+    expected = q.astype(np.float32) @ k.astype(np.float32).T
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, atol=0.5)
+
+
+def test_transposed_matmul_bf16_multicore():
+    """Transposed matmul: Q(8,32) @ K(32,32)^T = (8,32) — multi-core N=32."""
+    import ml_dtypes
+    rng = np.random.RandomState(212)
+    q = rng.randn(8, 32).astype(ml_dtypes.bfloat16)
+    k = rng.randn(32, 32).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda q, k: q @ k.T)(q, k)
+    expected = q.astype(np.float32) @ k.astype(np.float32).T
+    np.testing.assert_allclose(np.array(result, dtype=np.float32), expected, atol=0.5)
+
+
+def test_attention_bf16():
+    """End-to-end attention: softmax(Q @ K^T / sqrt(dk)) @ V on NPU.
+
+    Constraints: seq_len must be divisible by 32 (softmax VL) and 4 (matmul tile).
+    dk must be divisible by 4 (matmul tile). All steps run on the NPU with data
+    round-tripping through host between steps.
+    """
+    import ml_dtypes
+    rng = np.random.RandomState(220)
+    seq_len, dk = 32, 32
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    # Use bf16 scale to keep multiplication in bf16 (avoids __mulsf3).
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(dk))
+
+    # Each step is a separate JIT call (data round-trips through host).
+    scores = jax.jit(lambda q, k: q @ k.T)(Q, K)                # transposed matmul
+    scores = jax.jit(lambda s: s * scale)(scores)                 # elementwise scale
+    weights = jax.jit(jax.nn.softmax)(scores)                     # softmax
+    output = jax.jit(jnp.dot)(weights, V)                         # matmul
+
+    # Numpy reference: match the bf16 precision at each step.
+    Q_f32 = Q.astype(np.float32)
+    K_f32 = K.astype(np.float32)
+    V_f32 = V.astype(np.float32)
+    scores_ref = (Q_f32 @ K_f32.T) * np.float32(scale)
+    weights_ref = _softmax_ref(scores_ref.astype(ml_dtypes.bfloat16))
+    output_ref = weights_ref @ V_f32
+    np.testing.assert_allclose(
+        np.array(output, dtype=np.float32), output_ref, atol=2.0)
+
+
 def test_unsupported_reshape():
     """Unsupported: reshape should fail with a clear error, not crash."""
     a = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
@@ -759,6 +866,15 @@ def main():
         ("distribute neg f32[65536]", test_distribute_neg_f32_65536),
         ("distribute add f32[65536] (auto-reduce)", test_distribute_add_f32_65536),
         ("distribute fallback mul f32[65536]", test_distribute_fallback_mul_f32_65536),
+    ] + [
+        ("softmax bf16[1,64]", test_softmax_bf16_1x64),
+        ("softmax bf16[4,128]", test_softmax_bf16_4x128),
+        ("softmax bf16[8,256]", test_softmax_bf16_8x256),
+    ] + [
+        ("transposed matmul bf16 [4,8]@[4,8]^T", test_transposed_matmul_bf16_4x8),
+        ("transposed matmul bf16 [16,32]@[16,32]^T", test_transposed_matmul_bf16_16x32),
+        ("transposed matmul bf16 multicore [8,32]@[32,32]^T", test_transposed_matmul_bf16_multicore),
+        ("attention bf16 [32,32]", test_attention_bf16),
     ] + [
         ("unsupported: reshape", test_unsupported_reshape),
         ("unsupported: reduce_sum", test_unsupported_reduce_sum),
