@@ -2903,7 +2903,7 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
         "      aie.objectfifo.release @%s(Consume, 1)\n",
         fifo_name(c, "out"), fifo_name(c, "in_q")));
     // stack_size = 0x2000 for attention kernel:
-    // Scratch-free 3-pass kernel has no local arrays, but Peano llc -O2
+    // Online softmax kernel has no local arrays, but Peano llc -O2
     // may spill vector registers for larger loop nests (M_pc=64, seq=64).
     absl::StrAppend(&aie_mlir,
         "      aie.end\n    } { stack_size = 0x2000 : i32 }\n");

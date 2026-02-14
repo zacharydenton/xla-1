@@ -685,19 +685,19 @@ extern "C" void softmax_bf16(bfloat16* __restrict input,
         attention_dk));
 
     // Generate the attention kernel C++ source.
-    // SCRATCH-FREE 3-PASS ATTENTION KERNEL (ALL VECTOR OPS)
-    // Two constraints drive this design:
+    // ONLINE SOFTMAX ATTENTION KERNEL (1-PASS, ALL VECTOR OPS)
+    // Three constraints drive this design:
     // 1. Peano LLC miscompiles reduce_add → store-to-alloca (wrong values)
     // 2. AIE2p has no scalar float arithmetic (__mulsf3/__addsf3 undefined)
+    // 3. Peano's VLIW scheduler miscompiles branches in compute-heavy loops
+    //    (causes NPU hang / ERT_CMD_STATE_TIMEOUT)
     //
-    // Solution: recompute dot products 3× and express ALL arithmetic as
-    // vector hardware ops (aie::mul/sub/add/exp2/inv/reduce_add).
-    // Zero scalar float operations. Only scalar locals are bf16 (assignments,
-    // conversions, comparisons via integer-based float_gt).
-    //
-    // Pass A: dots → scale → max (bf16 scalars, vector mul for scale)
-    // Pass B: dots → scale → exp2(score-max) → sum (vector accum)
-    // Pass C: dots → scale → exp2 → weight → O += w*V (vector MAC)
+    // Solution: online softmax (FlashAttention algorithm) processes each
+    // K/V row once, maintaining running max/sum and rescaling O when the
+    // max changes. The inner loop is branchless — max is computed via
+    // aie::max and both exp2 values are always evaluated. ALL arithmetic
+    // expressed as vector hardware ops.
+    // ~2x less compute than the 3-pass design it replaces.
     std::string kernel_code = absl::StrFormat(
         R"KERNEL(#include <aie_api/aie.hpp>
 #include <stdint.h>
@@ -707,17 +707,6 @@ extern "C" void softmax_bf16(bfloat16* __restrict input,
 // Prevents Peano's VLIW scheduler from miscompiling variable-bound loops.
 #define CONST_M_PC %d
 #define CONST_SEQ_LEN %d
-
-// Integer-based float comparison (avoids __ltsf2/__gtsf2 hang on AIE2p).
-static inline int float_gt(float a, float b) {
-  union { float f; int i; } ua, ub;
-  ua.f = a; ub.f = b;
-  int sa = ua.i >> 31, sb = ub.i >> 31;
-  if (sa == 0 && sb == 0) return ua.i > ub.i;
-  if (sa && sb) return ua.i < ub.i;
-  if (sa == 0) return 1;
-  return 0;
-}
 
 // Compute dot(Q_row, K_row) → bf16 via vectorized MAC + reduce_add.
 // Returns bf16 to avoid any scalar float arithmetic on the result.
@@ -764,6 +753,22 @@ static inline bfloat16 mul_bf16(bfloat16 a, bfloat16 b) {
   return prod.to_vector<bfloat16>()[0];
 }
 
+// Add two bf16 scalars using vector hardware accumulator.
+// Returns bf16 — avoids scalar __addsf3.
+static inline bfloat16 add_bf16(bfloat16 a, bfloat16 b) {
+  auto av = aie::broadcast<bfloat16, VL>(a);
+  aie::accum<accfloat, VL> acc(av, 0);
+  acc = aie::add(acc, aie::broadcast<bfloat16, VL>(b));
+  return acc.to_vector<bfloat16>()[0];
+}
+
+// Max of two bf16 scalars using vector hardware.
+// Avoids scalar float comparison (no __gtsf2).
+static inline bfloat16 max_bf16(bfloat16 a, bfloat16 b) {
+  return aie::max(aie::broadcast<bfloat16, VL>(a),
+                  aie::broadcast<bfloat16, VL>(b))[0];
+}
+
 extern "C" void attention_bf16(
     bfloat16* __restrict Q,   // [M_per_core, dk] flat
     bfloat16* __restrict K,   // [seq_len, dk] flat
@@ -779,56 +784,46 @@ extern "C" void attention_bf16(
     bfloat16* q_row = Q + m * dk;
     bfloat16* o_row = O + m * dk;
 
-    // --- Pass A: Recompute dots → scale → find max ---
-    // All values as bf16 scalars, no scalar float arithmetic.
+    // Initialize with first K/V row: max=score[0], sum=1, O=V[0].
     bfloat16 max_val = scale_bf16(
         dot_product_bf16(q_row, K, dk), combined_scale);
+    bfloat16 total_sum = (bfloat16)1.0f;
+    for (int d = 0; d < dk; d += VL) {
+      aie::store_v(o_row + d, aie::load_v<VL>(V + d));
+    }
+
+    // Online softmax: single branchless pass over remaining K/V rows.
+    // Always computes both exp2 values to avoid branches that cause
+    // Peano's VLIW scheduler to miscompile.
     for (int s = 1; s < CONST_SEQ_LEN; s++) {
       bfloat16 score = scale_bf16(
           dot_product_bf16(q_row, K + s * dk, dk), combined_scale);
-      if (float_gt((float)score, (float)max_val)) max_val = score;
-    }
 
-    // --- Pass B: Recompute dots → exp2(score - max) → sum ---
-    // Accumulate exp values using vector accumulator (all VL lanes same).
-    aie::accum<accfloat, VL> sum_acc = aie::zeros<accfloat, VL>();
-    for (int s = 0; s < CONST_SEQ_LEN; s++) {
-      bfloat16 score = scale_bf16(
-          dot_product_bf16(q_row, K + s * dk, dk), combined_scale);
-      bfloat16 exp_val = exp2_diff_bf16(score, max_val);
-      // Broadcast exp to all lanes and accumulate (hardware vector add)
-      sum_acc = aie::add(sum_acc,
-          aie::broadcast<bfloat16, VL>(exp_val));
-    }
-    // All VL lanes have the same sum. Extract total via reduce_add / VL.
-    // But: reduce_add sums all lanes → VL * total, and dividing by VL
-    // needs __divsf3. Instead, extract one lane:
-    // to_vector<bfloat16>() does SRS, [0] extracts element 0.
-    bfloat16 total_sum = sum_acc.to_vector<bfloat16>()[0];
-    // Reciprocal using hardware aie::inv (lookup table, no __mulsf3)
-    bfloat16 inv_total = (bfloat16)aie::inv((float)total_sum);
+      bfloat16 new_max = max_bf16(score, max_val);
+      bfloat16 correction = exp2_diff_bf16(max_val, new_max);
+      bfloat16 weight = exp2_diff_bf16(score, new_max);
+      max_val = new_max;
+      total_sum = add_bf16(mul_bf16(total_sum, correction), weight);
 
-    // --- Pass C: Recompute dots → weight → accumulate O ---
-    for (int d = 0; d < dk; d += VL) {
-      aie::store_v(o_row + d, aie::zeros<bfloat16, VL>());
-    }
-    for (int s = 0; s < CONST_SEQ_LEN; s++) {
-      bfloat16 score = scale_bf16(
-          dot_product_bf16(q_row, K + s * dk, dk), combined_scale);
-      bfloat16 exp_val = exp2_diff_bf16(score, max_val);
-      // weight = exp * inv_total (vector multiply, hardware MAC)
-      bfloat16 weight = mul_bf16(exp_val, inv_total);
-
-      // Accumulate: O_row += weight * V_row (MAC hardware)
-      bfloat16* v_row = V + s * dk;
+      // O = O * correction + weight * V[s]
+      auto correction_v = aie::broadcast<bfloat16, VL>(correction);
       auto weight_v = aie::broadcast<bfloat16, VL>(weight);
+      bfloat16* v_row = V + s * dk;
       for (int d = 0; d < dk; d += VL) {
-        auto vv = aie::load_v<VL>(v_row + d);
         auto ov = aie::load_v<VL>(o_row + d);
-        aie::accum<accfloat, VL> o_acc(ov, 0);
+        auto vv = aie::load_v<VL>(v_row + d);
+        auto o_acc = aie::mul(ov, correction_v);
         o_acc = aie::mac(o_acc, vv, weight_v);
         aie::store_v(o_row + d, o_acc.to_vector<bfloat16>());
       }
+    }
+
+    // Normalize: O /= total_sum
+    bfloat16 inv_total = (bfloat16)aie::inv((float)total_sum);
+    auto inv_v = aie::broadcast<bfloat16, VL>(inv_total);
+    for (int d = 0; d < dk; d += VL) {
+      auto ov = aie::load_v<VL>(o_row + d);
+      aie::store_v(o_row + d, aie::mul(ov, inv_v).to_vector<bfloat16>());
     }
   }
 }
