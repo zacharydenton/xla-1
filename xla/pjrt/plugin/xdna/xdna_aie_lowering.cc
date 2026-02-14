@@ -2784,7 +2784,36 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
         col, compute_row, col, compute_row));
   }
 
-  // Pass 2: ObjectFIFOs and links (shim ↔ mem ↔ compute).
+  // Pass 2: ObjectFIFOs and links.
+  // KV broadcast: single chain from start_col shim → start_col mem → all
+  // compute tiles. K and V share one ObjectFIFO (depth=2). Shim sends K
+  // (slot 0) then V (slot 1). All cores acquire from the same broadcast FIFO.
+  // This sends KV once from host instead of N times (one per core).
+  {
+    std::string kv_shim = absl::StrFormat("tile_%d_%d", start_col, shim_row);
+    std::string kv_mem = absl::StrFormat("tile_%d_%d", start_col,
+                                          caps.mem_tile_row);
+    // L2: shim(start_col) → mem(start_col).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @in_kv_L2(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        kv_shim, kv_mem, fifo_depth, kv_memref));
+    // L1 broadcast: mem(start_col) → {all compute tiles}.
+    std::string kv_consumers;
+    for (int c = 0; c < num_cores; c++) {
+      if (c > 0) kv_consumers += ", ";
+      absl::StrAppendFormat(&kv_consumers, "%%tile_%d_%d",
+                            start_col + c, compute_row);
+    }
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @in_kv(%%%s, {%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        kv_mem, kv_consumers, fifo_depth, kv_memref));
+    absl::StrAppend(&aie_mlir,
+        "    aie.objectfifo.link [@in_kv_L2] -> [@in_kv] ([] [])\n");
+  }
+
+  // Q and O per-column: each column has its own shim ↔ mem ↔ compute chain.
   for (int c = 0; c < num_cores; c++) {
     int col = start_col + c;
     std::string shim = absl::StrFormat("tile_%d_%d", col, shim_row);
@@ -2803,23 +2832,6 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
     absl::StrAppend(&aie_mlir, absl::StrFormat(
         "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
         fifo_name(c, "in_q_L2"), fifo_name(c, "in_q")));
-
-    // KV input: K and V share one ObjectFIFO (depth=2).
-    // Shim sends K (fills slot 0) then V (fills slot 1) sequentially.
-    // Core acquires 2 elements: slot[0]=K, slot[1]=V.
-    // This keeps shim DMA within the 2-MM2S channel limit (Q + KV).
-    // Route through mem tile for multi-core support (same as Q and O).
-    absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
-        ": !aie.objectfifo<%s>\n",
-        fifo_name(c, "in_kv_L2"), shim, mem, fifo_depth, kv_memref));
-    absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
-        ": !aie.objectfifo<%s>\n",
-        fifo_name(c, "in_kv"), mem, compute, fifo_depth, kv_memref));
-    absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
-        fifo_name(c, "in_kv_L2"), fifo_name(c, "in_kv")));
 
     // O output: compute → mem → shim.
     absl::StrAppend(&aie_mlir, absl::StrFormat(
@@ -2860,13 +2872,14 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
         ": %s -> %s\n",
         fifo_name(c, "in_q"), q_subview_ty, q_subview_ty, q_memref));
     // Acquire KV (2 elements): slot[0]=K, slot[1]=V.
+    // All cores acquire from the shared broadcast FIFO @in_kv.
     absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "      %%kv_sub = aie.objectfifo.acquire @%s(Consume, 2) : %s\n"
+        "      %%kv_sub = aie.objectfifo.acquire @in_kv(Consume, 2) : %s\n"
         "      %%k_buf = aie.objectfifo.subview.access %%kv_sub[0] "
         ": %s -> %s\n"
         "      %%v_buf = aie.objectfifo.subview.access %%kv_sub[1] "
         ": %s -> %s\n",
-        fifo_name(c, "in_kv"), kv_subview_ty,
+        kv_subview_ty,
         kv_subview_ty, kv_memref, kv_subview_ty, kv_memref));
     // Acquire O (1 element).
     absl::StrAppend(&aie_mlir, absl::StrFormat(
@@ -2886,10 +2899,9 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
         q_memref, kv_memref, kv_memref, o_memref));
     absl::StrAppend(&aie_mlir, absl::StrFormat(
         "      aie.objectfifo.release @%s(Produce, 1)\n"
-        "      aie.objectfifo.release @%s(Consume, 2)\n"
+        "      aie.objectfifo.release @in_kv(Consume, 2)\n"
         "      aie.objectfifo.release @%s(Consume, 1)\n",
-        fifo_name(c, "out"), fifo_name(c, "in_kv"),
-        fifo_name(c, "in_q")));
+        fifo_name(c, "out"), fifo_name(c, "in_q")));
     // stack_size = 0x2000 for attention kernel:
     // Scratch-free 3-pass kernel has no local arrays, but Peano llc -O2
     // may spill vector registers for larger loop nests (M_pc=64, seq=64).
@@ -2903,58 +2915,53 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
       "%%arg3: %s) {\n",
       q_host_memref, k_host_memref, v_host_memref, o_host_memref));
 
-  // Issue DMAs per column with waits after each column to prevent
-  // BD interference on the shared KV channel (K and V both target the
-  // same ObjectFIFO). Per matmul pattern: issue_token + dma_wait on
-  // ALL channels after each block.
+  // KV broadcast: send K and V once to @in_kv_L2. The ObjectFIFO broadcast
+  // replicates data to all compute tiles via stream routing.
   int dma_id = 0;
+
+  // K DMA: transfer full K to broadcast KV ObjectFIFO (fills slot 0).
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "      aiex.npu.dma_memcpy_nd(%%arg1"
+      "[0, 0, 0, 0][1, 1, %d, %d][0, 0, %d, 1]) "
+      "{id = %d : i64, metadata = @in_kv_L2, issue_token = true} : %s\n",
+      info.seq_len, info.dk, info.dk, dma_id++, k_host_memref));
+
+  // V DMA: transfer full V to broadcast KV ObjectFIFO (fills slot 1).
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "      aiex.npu.dma_memcpy_nd(%%arg2"
+      "[0, 0, 0, 0][1, 1, %d, %d][0, 0, %d, 1]) "
+      "{id = %d : i64, metadata = @in_kv_L2, issue_token = true} : %s\n",
+      info.seq_len, info.dk, info.dk, dma_id++, v_host_memref));
+
+  // Q per-column: each core gets its M_per_core rows.
   for (int c = 0; c < num_cores; c++) {
     int64_t q_offset = c * m_per_core * info.dk;
-
-    // Q DMA: transfer M_per_core rows from offset.
     absl::StrAppend(&aie_mlir, absl::StrFormat(
         "      aiex.npu.dma_memcpy_nd(%%arg0"
         "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
         "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
         q_offset, m_per_core, info.dk, info.dk,
         dma_id++, fifo_name(c, "in_q_L2"), q_host_memref));
+  }
 
-    // K DMA: transfer full K to KV ObjectFIFO via L2 (fills slot 0).
-    absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "      aiex.npu.dma_memcpy_nd(%%arg1"
-        "[0, 0, 0, 0][1, 1, %d, %d][0, 0, %d, 1]) "
-        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
-        info.seq_len, info.dk, info.dk,
-        dma_id++, fifo_name(c, "in_kv_L2"), k_host_memref));
-
-    // Wait for K before sending V to same ObjectFIFO.
-    absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "      aiex.npu.dma_wait { symbol = @%s }\n",
-        fifo_name(c, "in_kv_L2")));
-
-    // V DMA: transfer full V to KV ObjectFIFO via L2 (fills slot 1).
-    absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "      aiex.npu.dma_memcpy_nd(%%arg2"
-        "[0, 0, 0, 0][1, 1, %d, %d][0, 0, %d, 1]) "
-        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
-        info.seq_len, info.dk, info.dk,
-        dma_id++, fifo_name(c, "in_kv_L2"), v_host_memref));
-
-    // O DMA: receive M_per_core rows at offset.
+  // O per-column: each core writes its M_per_core rows.
+  for (int c = 0; c < num_cores; c++) {
+    int64_t o_offset = c * m_per_core * info.dk;
     absl::StrAppend(&aie_mlir, absl::StrFormat(
         "      aiex.npu.dma_memcpy_nd(%%arg3"
         "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
         "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
-        q_offset, m_per_core, info.dk, info.dk,
+        o_offset, m_per_core, info.dk, info.dk,
         dma_id++, fifo_name(c, "out_L2"), o_host_memref));
+  }
 
-    // Wait for all channels to complete before next column.
+  // Wait for all channels to complete.
+  absl::StrAppend(&aie_mlir,
+      "      aiex.npu.dma_wait { symbol = @in_kv_L2 }\n");
+  for (int c = 0; c < num_cores; c++) {
     absl::StrAppend(&aie_mlir, absl::StrFormat(
         "      aiex.npu.dma_wait { symbol = @%s }\n",
         fifo_name(c, "in_q_L2")));
-    absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "      aiex.npu.dma_wait { symbol = @%s }\n",
-        fifo_name(c, "in_kv_L2")));
     absl::StrAppend(&aie_mlir, absl::StrFormat(
         "      aiex.npu.dma_wait { symbol = @%s }\n",
         fifo_name(c, "out_L2")));
