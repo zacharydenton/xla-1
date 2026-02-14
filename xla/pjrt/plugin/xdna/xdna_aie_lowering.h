@@ -46,6 +46,10 @@ struct AieLoweringResult {
   bool needs_softfloat_stubs = false;  // Kernel uses soft-float comparisons.
   bool use_distribute = false;  // Elementwise uses distribute/join ObjectFIFO pattern.
   bool needs_softmax_kernel = false;  // Softmax: compile AIE API C++ kernel.
+  bool needs_attention_kernel = false;  // Fused attention: compile AIE API C++ kernel.
+  int64_t attention_seq_len = 0;  // Fused attention: seq_len for kernel gen.
+  int64_t attention_dk = 0;  // Fused attention: dk for kernel gen.
+  int64_t attention_m_per_core = 0;  // Fused attention: rows per core.
 };
 
 // Lowers a linalg-on-tensors MLIR module to AIE dialect MLIR text.

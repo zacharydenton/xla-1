@@ -180,6 +180,15 @@ struct SoftmaxProgramInfo {
   std::string element_type;  // "bf16"
 };
 
+// Fused attention program description for AIE lowering.
+// Represents softmax(Q @ K^T / sqrt(dk)) @ V fused into a single kernel.
+struct AttentionProgramInfo {
+  int64_t num_rows;      // M dimension (Q rows, = seq_len for self-attention)
+  int64_t seq_len;       // S dimension (K/V rows, scores width)
+  int64_t dk;            // shared dimension (Q/K/V columns)
+  std::string element_type;  // "bf16" only
+};
+
 // Returns true if the given op name is a supported body op for DAG analysis.
 bool IsSupportedBodyOp(llvm::StringRef name) {
   return name == "arith.addf" || name == "arith.subf" || name == "arith.mulf" ||
@@ -2473,6 +2482,504 @@ std::optional<SoftmaxProgramInfo> DetectSoftmax(mlir::ModuleOp module) {
   return sinfo;
 }
 
+// Detects a fused attention pattern: softmax(Q @ K^T * scale) @ V.
+// The module must contain exactly 2 linalg.matmul ops, a transpose generic
+// feeding the first matmul's B input, and softmax-like ops (reduce(maximumf),
+// exp, reduce(addf), divf) between the matmuls. 3 inputs, 1 output.
+std::optional<AttentionProgramInfo> DetectAttention(mlir::ModuleOp module) {
+  mlir::func::FuncOp entry_func;
+  module.walk([&](mlir::func::FuncOp func) {
+    if (func.getName() == "main" || !entry_func) entry_func = func;
+  });
+  if (!entry_func) return std::nullopt;
+
+  // Verify function signature: 3 input tensors, 1 result tensor.
+  auto func_type = entry_func.getFunctionType();
+  if (func_type.getNumInputs() != 3 || func_type.getNumResults() != 1)
+    return std::nullopt;
+
+  // All inputs must be 2D bf16 ranked tensors.
+  for (unsigned i = 0; i < 3; i++) {
+    auto t = mlir::dyn_cast<mlir::RankedTensorType>(func_type.getInput(i));
+    if (!t || t.getRank() != 2) return std::nullopt;
+    if (GetElementTypeStr(t.getElementType()) != "bf16") return std::nullopt;
+  }
+  auto result_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      func_type.getResult(0));
+  if (!result_type || result_type.getRank() != 2) return std::nullopt;
+  if (GetElementTypeStr(result_type.getElementType()) != "bf16")
+    return std::nullopt;
+
+  // Count linalg ops.
+  int matmul_count = 0;
+  int fill_count = 0;
+  int generic_count = 0;
+  int other_linalg_count = 0;
+  std::vector<mlir::Operation*> matmul_ops;
+
+  entry_func.walk([&](mlir::Operation* op) {
+    llvm::StringRef name = op->getName().getStringRef();
+    if (!name.starts_with("linalg.")) return;
+    if (name == "linalg.yield") return;
+    if (name == "linalg.fill") {
+      fill_count++;
+    } else if (name == "linalg.matmul") {
+      matmul_count++;
+      matmul_ops.push_back(op);
+    } else if (name == "linalg.generic") {
+      generic_count++;
+    } else {
+      other_linalg_count++;
+    }
+  });
+
+  // Must have exactly 2 matmuls, no other linalg ops (e.g., conv).
+  if (matmul_count != 2 || other_linalg_count != 0) return std::nullopt;
+  // At least 2 fills (one per matmul), plus generics for transpose/scale/softmax.
+  if (fill_count < 2) return std::nullopt;
+  // Softmax decomposes into ~10 generics + transpose + scale = ~12+ generics.
+  if (generic_count < 5) return std::nullopt;
+
+  // Check for softmax markers in the generics.
+  bool has_max_reduce = false, has_exp = false;
+  bool has_sum_reduce = false, has_div = false;
+
+  entry_func.walk([&](mlir::linalg::GenericOp generic) {
+    auto iterators = generic.getIteratorTypesArray();
+    bool is_reduction = false;
+    for (auto it : iterators) {
+      if (it == mlir::utils::IteratorType::reduction) {
+        is_reduction = true;
+        break;
+      }
+    }
+    mlir::Block& body = generic.getRegion().front();
+    for (mlir::Operation& body_op : body.without_terminator()) {
+      llvm::StringRef name = body_op.getName().getStringRef();
+      if (name == "arith.maximumf" && is_reduction) has_max_reduce = true;
+      if (name == "math.exp") has_exp = true;
+      if (name == "arith.addf" && is_reduction) has_sum_reduce = true;
+      if (name == "arith.divf") has_div = true;
+    }
+  });
+
+  if (!has_max_reduce || !has_exp || !has_sum_reduce || !has_div) {
+    LOG(INFO) << "XDNA: 2 matmuls found but no softmax pattern, "
+              << "not fused attention";
+    return std::nullopt;
+  }
+
+  // Check for transpose generic that feeds the first matmul's B input.
+  // The first matmul (in program order) computes Q @ K^T.
+  mlir::Operation* matmul1 = matmul_ops[0];
+  mlir::Operation* matmul2 = matmul_ops[1];
+
+  // Determine matmul order: the first matmul's result should NOT be the
+  // function return. The second matmul's result should feed the return.
+  // If matmul_ops[1]'s result feeds into matmul_ops[0] (reverse order),
+  // swap them.
+  bool mat1_feeds_return = false;
+  for (mlir::Operation* user : matmul1->getResult(0).getUsers()) {
+    if (mlir::isa<mlir::func::ReturnOp>(user)) mat1_feeds_return = true;
+    if (user->getName().getStringRef() == "stablehlo.custom_call") {
+      for (mlir::Operation* inner : user->getResult(0).getUsers()) {
+        if (mlir::isa<mlir::func::ReturnOp>(inner)) mat1_feeds_return = true;
+      }
+    }
+  }
+  if (mat1_feeds_return) {
+    std::swap(matmul1, matmul2);
+  }
+
+  // Verify matmul1's B input comes from a transpose generic.
+  bool has_transpose = false;
+  mlir::Value matmul1_b = matmul1->getOperand(1);
+  if (auto* def_op = matmul1_b.getDefiningOp()) {
+    if (auto generic = mlir::dyn_cast<mlir::linalg::GenericOp>(def_op)) {
+      // Check if it's a pure transpose: 2 operands, swapped indexing maps,
+      // body is a pure yield of input.
+      if (generic->getNumOperands() == 2) {
+        auto gin = mlir::dyn_cast<mlir::RankedTensorType>(
+            generic->getOperand(0).getType());
+        auto gout = mlir::dyn_cast<mlir::RankedTensorType>(
+            generic->getResult(0).getType());
+        if (gin && gout && gin.getRank() == 2 && gout.getRank() == 2 &&
+            gin.getShape()[0] == gout.getShape()[1] &&
+            gin.getShape()[1] == gout.getShape()[0]) {
+          auto maps = generic.getIndexingMapsArray();
+          if (maps.size() == 2) {
+            auto r0 = mlir::dyn_cast<mlir::AffineDimExpr>(
+                maps[0].getResult(0));
+            auto r1 = mlir::dyn_cast<mlir::AffineDimExpr>(
+                maps[0].getResult(1));
+            if (r0 && r1 && r0.getPosition() == 1 && r1.getPosition() == 0 &&
+                maps[1].isIdentity()) {
+              mlir::Block& body = generic.getRegion().front();
+              auto body_ops = body.without_terminator();
+              if (body_ops.begin() == body_ops.end()) {
+                auto yield = mlir::dyn_cast<mlir::linalg::YieldOp>(
+                    body.getTerminator());
+                if (yield && yield.getNumOperands() == 1 &&
+                    yield.getOperand(0) == body.getArgument(0)) {
+                  has_transpose = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (!has_transpose) {
+    LOG(INFO) << "XDNA: 2 matmuls + softmax found but no transpose on "
+              << "first matmul B input, not Q@K^T attention pattern";
+    return std::nullopt;
+  }
+
+  // Extract dimensions.
+  // matmul1: Q[M, dk] @ K_T[dk, S] → scores[M, S]
+  auto q_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      matmul1->getOperand(0).getType());
+  auto kt_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      matmul1->getOperand(1).getType());
+  if (!q_type || !kt_type) return std::nullopt;
+  if (q_type.getRank() != 2 || kt_type.getRank() != 2) return std::nullopt;
+
+  int64_t M = q_type.getShape()[0];
+  int64_t dk = q_type.getShape()[1];
+  int64_t S = kt_type.getShape()[1];
+
+  // Verify K^T's first dim matches dk.
+  if (kt_type.getShape()[0] != dk) return std::nullopt;
+
+  // matmul2: weights[M, S] @ V[S, dk2] → O[M, dk2]
+  auto v_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      matmul2->getOperand(1).getType());
+  if (!v_type || v_type.getRank() != 2) return std::nullopt;
+  int64_t dk2 = v_type.getShape()[1];
+  if (v_type.getShape()[0] != S) return std::nullopt;
+
+  // For standard attention, dk == dk2 (Q and V have same model dimension).
+  if (dk != dk2) {
+    LOG(INFO) << "XDNA: attention dk mismatch: Q dk=" << dk
+              << " V dk=" << dk2;
+    return std::nullopt;
+  }
+
+  // Verify output shape matches [M, dk].
+  if (result_type.getShape()[0] != M || result_type.getShape()[1] != dk)
+    return std::nullopt;
+
+  // Constraints for the fused kernel.
+  if (dk % 32 != 0) {
+    LOG(INFO) << "XDNA: attention dk=" << dk << " not divisible by 32";
+    return std::nullopt;
+  }
+  if (S % 32 != 0) {
+    LOG(INFO) << "XDNA: attention seq_len=" << S << " not divisible by 32";
+    return std::nullopt;
+  }
+
+  LOG(INFO) << "XDNA: detected fused attention pattern: M=" << M
+            << " S=" << S << " dk=" << dk;
+
+  AttentionProgramInfo info;
+  info.num_rows = M;
+  info.seq_len = S;
+  info.dk = dk;
+  info.element_type = "bf16";
+  return info;
+}
+
+// Generates AIE MLIR for fused attention using an external C++ kernel.
+// Each core processes M_per_core rows of the attention output.
+// The kernel receives full K and V arrays and computes:
+//   O_row = softmax(Q_row @ K^T / sqrt(dk)) @ V
+// All intermediates (scores, softmax weights) stay in L1 stack.
+absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
+    const AttentionProgramInfo& info, const TargetCaps& caps,
+    int max_columns) {
+  // Auto-scale number of cores.
+  int num_cores = std::min(max_columns, caps.num_columns);
+  while (num_cores > 1) {
+    if (info.num_rows % num_cores != 0) { num_cores--; continue; }
+    break;
+  }
+  int64_t m_per_core = info.num_rows / num_cores;
+
+  // L1 budget: Q (depth 2) + KV (depth 2, holds K and V) + O (depth 2).
+  // K and V share a single ObjectFIFO (depth=2): core acquires 2 elements,
+  // slot[0]=K and slot[1]=V. Routed through mem tile (shim→mem→compute).
+  // Stateful transform creates depth+1=3 buffers for acquire(2).
+  int64_t q_l1 = 2 * m_per_core * info.dk * 2;  // depth=2, 2 buffers
+  int64_t kv_l1 = 3 * info.seq_len * info.dk * 2;  // depth=2 + acquire(2) → 3 buffers
+  int64_t o_l1 = 2 * m_per_core * info.dk * 2;  // depth=2, 2 buffers
+  int64_t total_l1 = q_l1 + kv_l1 + o_l1;
+
+  if (total_l1 > caps.l1_usable_bytes) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Fused attention L1 budget exceeded: M_pc=%d S=%d dk=%d needs %dB, "
+        "have %dB. Try smaller seq_len or dk.",
+        m_per_core, info.seq_len, info.dk, total_l1, caps.l1_usable_bytes));
+  }
+
+  // DMA dimension limits.
+  int64_t d0_words_dk = info.dk * 2 / 4;  // bf16 elements → 32-bit words
+  if (d0_words_dk > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Attention dk=%d exceeds DMA d0 limit (%d words, max %d)",
+        info.dk, d0_words_dk, kMaxBdWords));
+  }
+
+  LOG(INFO) << "XDNA attention lowering: M=" << info.num_rows
+            << " S=" << info.seq_len << " dk=" << info.dk
+            << " using " << num_cores << " core(s) ("
+            << m_per_core << " rows/core)"
+            << " L1=" << total_l1 << "B";
+
+  int start_col = caps.partition_start_column;
+  int shim_row = caps.shim_row;
+  int compute_row = caps.first_compute_row;
+  int fifo_depth = 2;
+
+  // ObjectFIFO buffer types (flattened 1D for simplicity).
+  std::string q_memref = absl::StrFormat("memref<%dxbf16>",
+                                          m_per_core * info.dk);
+  // K and V share one ObjectFIFO — each element is S*dk bf16.
+  // The FIFO has depth=2: slot 0 = K, slot 1 = V.
+  std::string kv_memref = absl::StrFormat("memref<%dxbf16>",
+                                           info.seq_len * info.dk);
+  std::string o_memref = absl::StrFormat("memref<%dxbf16>",
+                                          m_per_core * info.dk);
+
+  // Host buffer types (flat, full size).
+  int64_t q_total = info.num_rows * info.dk;
+  int64_t kv_total = info.seq_len * info.dk;
+  int64_t o_total = info.num_rows * info.dk;
+  std::string q_host_memref = absl::StrFormat("memref<%dxbf16>", q_total);
+  std::string k_host_memref = absl::StrFormat("memref<%dxbf16>", kv_total);
+  std::string v_host_memref = absl::StrFormat("memref<%dxbf16>", kv_total);
+  std::string o_host_memref = absl::StrFormat("memref<%dxbf16>", o_total);
+
+  auto fifo_name = [&](int c, const std::string& base) -> std::string {
+    return num_cores > 1 ? absl::StrFormat("c%d_%s", c, base) : base;
+  };
+
+  std::string aie_mlir;
+  absl::StrAppend(&aie_mlir, "module {\n");
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "  aie.device(%s) {\n", DeviceNameForColumns(num_cores)));
+
+  // Pass 1: Tile declarations.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, shim_row, col, shim_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, caps.mem_tile_row, col, caps.mem_tile_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, compute_row, col, compute_row));
+  }
+
+  // Pass 2: ObjectFIFOs and links (shim ↔ mem ↔ compute).
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string shim = absl::StrFormat("tile_%d_%d", col, shim_row);
+    std::string mem = absl::StrFormat("tile_%d_%d", col, caps.mem_tile_row);
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+
+    // Q input: shim → mem → compute.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_q_L2"), shim, mem, fifo_depth, q_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_q"), mem, compute, fifo_depth, q_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "in_q_L2"), fifo_name(c, "in_q")));
+
+    // KV input: K and V share one ObjectFIFO (depth=2).
+    // Shim sends K (fills slot 0) then V (fills slot 1) sequentially.
+    // Core acquires 2 elements: slot[0]=K, slot[1]=V.
+    // This keeps shim DMA within the 2-MM2S channel limit (Q + KV).
+    // Route through mem tile for multi-core support (same as Q and O).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_kv_L2"), shim, mem, fifo_depth, kv_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_kv"), mem, compute, fifo_depth, kv_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "in_kv_L2"), fifo_name(c, "in_kv")));
+
+    // O output: compute → mem → shim.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out"), compute, mem, fifo_depth, o_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out_L2"), mem, shim, fifo_depth, o_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "out"), fifo_name(c, "out_L2")));
+  }
+
+  // External function declaration (resolved at link time from attention_kernel.o).
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    func.func private @attention_bf16(%s, %s, %s, %s, i32, i32, i32) -> ()\n",
+      q_memref, kv_memref, kv_memref, o_memref));
+
+  // Pass 3: Core bodies — single acquire/compute/release.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+    std::string q_subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", q_memref);
+    std::string kv_subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", kv_memref);
+    std::string o_subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", o_memref);
+
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%core_%d_%d = aie.core(%%%s) {\n", col, compute_row, compute));
+    // Acquire Q (1 element).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%q_sub = aie.objectfifo.acquire @%s(Consume, 1) : %s\n"
+        "      %%q_buf = aie.objectfifo.subview.access %%q_sub[0] "
+        ": %s -> %s\n",
+        fifo_name(c, "in_q"), q_subview_ty, q_subview_ty, q_memref));
+    // Acquire KV (2 elements): slot[0]=K, slot[1]=V.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%kv_sub = aie.objectfifo.acquire @%s(Consume, 2) : %s\n"
+        "      %%k_buf = aie.objectfifo.subview.access %%kv_sub[0] "
+        ": %s -> %s\n"
+        "      %%v_buf = aie.objectfifo.subview.access %%kv_sub[1] "
+        ": %s -> %s\n",
+        fifo_name(c, "in_kv"), kv_subview_ty,
+        kv_subview_ty, kv_memref, kv_subview_ty, kv_memref));
+    // Acquire O (1 element).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%o_sub = aie.objectfifo.acquire @%s(Produce, 1) : %s\n"
+        "      %%o_buf = aie.objectfifo.subview.access %%o_sub[0] "
+        ": %s -> %s\n",
+        fifo_name(c, "out"), o_subview_ty, o_subview_ty, o_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%m_pc = arith.constant %d : i32\n"
+        "      %%seq = arith.constant %d : i32\n"
+        "      %%dk = arith.constant %d : i32\n",
+        m_per_core, info.seq_len, info.dk));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      func.call @attention_bf16(%%q_buf, %%k_buf, %%v_buf, "
+        "%%o_buf, %%m_pc, %%seq, %%dk) "
+        ": (%s, %s, %s, %s, i32, i32, i32) -> ()\n",
+        q_memref, kv_memref, kv_memref, o_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aie.objectfifo.release @%s(Produce, 1)\n"
+        "      aie.objectfifo.release @%s(Consume, 2)\n"
+        "      aie.objectfifo.release @%s(Consume, 1)\n",
+        fifo_name(c, "out"), fifo_name(c, "in_kv"),
+        fifo_name(c, "in_q")));
+    // stack_size = 0x2000 for attention kernel:
+    // Scratch-free 3-pass kernel has no local arrays, but Peano llc -O2
+    // may spill vector registers for larger loop nests (M_pc=64, seq=64).
+    absl::StrAppend(&aie_mlir,
+        "      aie.end\n    } { stack_size = 0x2000 : i32 }\n");
+  }
+
+  // Runtime sequence (DMA): 4 args = Q, K, V, O.
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.runtime_sequence(%%arg0: %s, %%arg1: %s, %%arg2: %s, "
+      "%%arg3: %s) {\n",
+      q_host_memref, k_host_memref, v_host_memref, o_host_memref));
+
+  // Issue DMAs per column with waits after each column to prevent
+  // BD interference on the shared KV channel (K and V both target the
+  // same ObjectFIFO). Per matmul pattern: issue_token + dma_wait on
+  // ALL channels after each block.
+  int dma_id = 0;
+  for (int c = 0; c < num_cores; c++) {
+    int64_t q_offset = c * m_per_core * info.dk;
+
+    // Q DMA: transfer M_per_core rows from offset.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg0"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        q_offset, m_per_core, info.dk, info.dk,
+        dma_id++, fifo_name(c, "in_q_L2"), q_host_memref));
+
+    // K DMA: transfer full K to KV ObjectFIFO via L2 (fills slot 0).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg1"
+        "[0, 0, 0, 0][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        info.seq_len, info.dk, info.dk,
+        dma_id++, fifo_name(c, "in_kv_L2"), k_host_memref));
+
+    // Wait for K before sending V to same ObjectFIFO.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "in_kv_L2")));
+
+    // V DMA: transfer full V to KV ObjectFIFO via L2 (fills slot 1).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg2"
+        "[0, 0, 0, 0][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        info.seq_len, info.dk, info.dk,
+        dma_id++, fifo_name(c, "in_kv_L2"), v_host_memref));
+
+    // O DMA: receive M_per_core rows at offset.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg3"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        q_offset, m_per_core, info.dk, info.dk,
+        dma_id++, fifo_name(c, "out_L2"), o_host_memref));
+
+    // Wait for all channels to complete before next column.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "in_q_L2")));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "in_kv_L2")));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "out_L2")));
+  }
+
+  absl::StrAppend(&aie_mlir, "    }\n");  // end runtime_sequence
+  absl::StrAppend(&aie_mlir, "  }\n");    // end aie.device
+  absl::StrAppend(&aie_mlir, "}\n");      // end module
+
+  LOG(INFO) << "XDNA attention lowering: generated AIE MLIR:\n" << aie_mlir;
+
+  return AieLoweringResult{
+      aie_mlir, num_cores,
+      /*use_aievec=*/false,
+      /*convert_vector_to_aievec=*/false,
+      /*needs_matmul_workarounds=*/false,
+      /*needs_softfloat_stubs=*/true,
+      /*use_distribute=*/false,
+      /*needs_softmax_kernel=*/false,
+      /*needs_attention_kernel=*/true,
+      /*attention_seq_len=*/info.seq_len,
+      /*attention_dk=*/info.dk,
+      /*attention_m_per_core=*/m_per_core};
+}
+
 // Generates AIE MLIR for softmax using an external C++ kernel.
 // Each core processes rows_per_core rows, calling softmax_bf16 per row.
 absl::StatusOr<AieLoweringResult> LowerSoftmaxToAie(
@@ -2671,6 +3178,16 @@ absl::StatusOr<AieLoweringResult> LowerSoftmaxToAie(
 absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
     mlir::ModuleOp linalg_module, const AieLoweringConfig& config,
     const TargetCaps& caps) {
+  // Check for fused attention before matmul/softmax (attention contains both).
+  auto attention_info = DetectAttention(linalg_module);
+  if (attention_info.has_value()) {
+    LOG(INFO) << "XDNA AIE lowering: detected fused attention M="
+              << attention_info->num_rows << " S=" << attention_info->seq_len
+              << " dk=" << attention_info->dk << " "
+              << attention_info->element_type;
+    return LowerAttentionToAie(*attention_info, caps, config.num_columns);
+  }
+
   // Check for matmul before elementwise analysis.
   auto matmul_info = DetectMatmul(linalg_module);
   if (matmul_info.has_value()) {

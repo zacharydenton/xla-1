@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/pjrt/plugin/xdna/xdna_codegen.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -256,13 +257,49 @@ absl::Status PatchCoreElfAttributes(const std::string& mlir_path) {
       return absl::InternalError("Unmatched braces in aie.core op");
     }
 
-    // Replace body with just aie.end and add elf_file attribute.
+    // Check for existing attribute dictionary after the closing '}'.
+    // e.g., "} { stack_size = 0xD00 : i32 }" — extract inner attributes.
+    std::string extra_attrs;
+    auto after_close = pos + 1;
+    // Skip whitespace after '}'.
+    auto attr_start = after_close;
+    while (attr_start != content.cend() && (*attr_start == ' ' ||
+           *attr_start == '\t' || *attr_start == '\n')) {
+      ++attr_start;
+    }
+    if (attr_start != content.cend() && *attr_start == '{') {
+      // Found attribute dict. Find matching '}'.
+      auto attr_end = attr_start + 1;
+      int attr_depth = 1;
+      while (attr_end != content.cend() && attr_depth > 0) {
+        if (*attr_end == '{') attr_depth++;
+        else if (*attr_end == '}') attr_depth--;
+        if (attr_depth > 0) ++attr_end;
+      }
+      if (attr_depth == 0) {
+        // Extract contents between { and }.
+        extra_attrs = std::string(attr_start + 1, attr_end);
+        // Trim whitespace.
+        while (!extra_attrs.empty() && extra_attrs.front() == ' ')
+          extra_attrs.erase(extra_attrs.begin());
+        while (!extra_attrs.empty() && extra_attrs.back() == ' ')
+          extra_attrs.pop_back();
+        after_close = attr_end + 1;
+      }
+    }
+
+    // Replace body with just aie.end and add elf_file + any extra attributes.
     result.append(prefix);
     result.append("{\n      aie.end\n    } {elf_file = \"");
     result.append(elf_name);
-    result.append("\"}");
+    result.append("\"");
+    if (!extra_attrs.empty()) {
+      result.append(", ");
+      result.append(extra_attrs);
+    }
+    result.append("}");
 
-    search_start = pos + 1;
+    search_start = after_close;
   }
 
   // Append remainder.
@@ -446,7 +483,9 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     const std::string& aie_mlir, int num_data_args, const TargetCaps& caps,
     int num_cores, bool use_aievec, bool convert_vector_to_aievec,
     bool needs_matmul_workarounds, bool needs_softfloat_stubs,
-    bool needs_softmax_kernel) {
+    bool needs_softmax_kernel, bool needs_attention_kernel,
+    int64_t attention_seq_len, int64_t attention_dk,
+    int64_t attention_m_per_core) {
   // Create a temporary working directory.
   auto tmpdir = std::filesystem::temp_directory_path() / "xdna_codegen_XXXXXX";
   std::string tmpdir_str = tmpdir.string();
@@ -488,7 +527,9 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
   // Step numbering: 1 shared + N per core + shared steps = total.
   bool needs_rt_stubs = needs_matmul_workarounds || needs_softfloat_stubs;
   int steps_per_core = needs_rt_stubs ? 8 : 7;  // +1 for rt stubs
-  int shared_steps = 6 + (needs_softmax_kernel ? 3 : 0);
+  int kernel_steps = (needs_softmax_kernel ? 3 : 0) +
+                     (needs_attention_kernel ? 3 : 0);
+  int shared_steps = 6 + kernel_steps;
   int total_compile_steps = steps_per_core * num_cores + shared_steps;
   int step = 1;
 
@@ -531,7 +572,7 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     // Generate the softmax kernel C++ source.
     // Uses load_v/store_v instead of iterators (iterators produce zeros on NPU2).
     // Float comparisons use integer bitcast to avoid soft-float __ltsf2 hang.
-    std::string kernel_code = R"(#include <aie_api/aie.hpp>
+    std::string kernel_code = R"KERNEL(#include <aie_api/aie.hpp>
 #include <stdint.h>
 
 #define VL 32
@@ -587,7 +628,7 @@ extern "C" void softmax_bf16(bfloat16* __restrict input,
     aie::store_v(output + i * VL, normed.to_vector<bfloat16>());
   }
 }
-)";
+)KERNEL";
 
     TF_RETURN_IF_ERROR(WriteFile(kernel_src, kernel_code));
 
@@ -620,6 +661,207 @@ extern "C" void softmax_bf16(bfloat16* __restrict input,
         " -O2 --aie-loop-aware=false -filetype=obj ",
         kernel_bc, " -o ", softmax_kernel_obj),
         absl::StrFormat("Step %d/%d: Softmax llc",
+                        step++, total_compile_steps)));
+  }
+
+  // -----------------------------------------------------------------------
+  // Step 2c: Compile fused attention C++ kernel with Peano (if needed).
+  // Single kernel that does Q@K^T, scale, softmax, weights@V in L1.
+  // -----------------------------------------------------------------------
+  std::string attention_kernel_obj;
+  if (needs_attention_kernel) {
+    std::string peano_clangxx = GetPeanoClangxxPath();
+    std::string sysroot_include = GetPeanoSysrootInclude();
+    std::string libcxx_include = GetLibcxxInclude();
+    std::string aie_api_include = GetAieApiInclude();
+
+    std::string kernel_src = workdir + "/attention_kernel.cc";
+    attention_kernel_obj = workdir + "/attention_kernel.o";
+
+    // Precompute combined scale: log2e / sqrt(dk).
+    // This fuses the attention scaling (1/sqrt(dk)) with the log2e factor
+    // used by exp2-based softmax, eliminating a separate scaling pass.
+    float combined_scale = 1.4453125f / sqrtf(static_cast<float>(
+        attention_dk));
+
+    // Generate the attention kernel C++ source.
+    // SCRATCH-FREE 3-PASS ATTENTION KERNEL (ALL VECTOR OPS)
+    // Two constraints drive this design:
+    // 1. Peano LLC miscompiles reduce_add → store-to-alloca (wrong values)
+    // 2. AIE2p has no scalar float arithmetic (__mulsf3/__addsf3 undefined)
+    //
+    // Solution: recompute dot products 3× and express ALL arithmetic as
+    // vector hardware ops (aie::mul/sub/add/exp2/inv/reduce_add).
+    // Zero scalar float operations. Only scalar locals are bf16 (assignments,
+    // conversions, comparisons via integer-based float_gt).
+    //
+    // Pass A: dots → scale → max (bf16 scalars, vector mul for scale)
+    // Pass B: dots → scale → exp2(score-max) → sum (vector accum)
+    // Pass C: dots → scale → exp2 → weight → O += w*V (vector MAC)
+    std::string kernel_code = absl::StrFormat(
+        R"KERNEL(#include <aie_api/aie.hpp>
+#include <stdint.h>
+
+#define VL 32
+// Compile-time constants for loop bounds.
+// Prevents Peano's VLIW scheduler from miscompiling variable-bound loops.
+#define CONST_M_PC %d
+#define CONST_SEQ_LEN %d
+
+// Integer-based float comparison (avoids __ltsf2/__gtsf2 hang on AIE2p).
+static inline int float_gt(float a, float b) {
+  union { float f; int i; } ua, ub;
+  ua.f = a; ub.f = b;
+  int sa = ua.i >> 31, sb = ub.i >> 31;
+  if (sa == 0 && sb == 0) return ua.i > ub.i;
+  if (sa && sb) return ua.i < ub.i;
+  if (sa == 0) return 1;
+  return 0;
+}
+
+// Compute dot(Q_row, K_row) → bf16 via vectorized MAC + reduce_add.
+// Returns bf16 to avoid any scalar float arithmetic on the result.
+static inline bfloat16 dot_product_bf16(
+    bfloat16* __restrict q_row,
+    bfloat16* __restrict k_row,
+    int32_t dk) {
+  aie::accum<accfloat, VL> acc = aie::zeros<accfloat, VL>();
+  for (int d = 0; d < dk; d += VL) {
+    auto qv = aie::load_v<VL>(q_row + d);
+    auto kv = aie::load_v<VL>(k_row + d);
+    acc = aie::mac(acc, qv, kv);
+  }
+  // reduce_add returns float; truncate to bf16 immediately
+  return (bfloat16)aie::reduce_add(acc.to_vector<float>());
+}
+
+// Scale a bf16 scalar by combined_scale using vector hardware MAC.
+// Returns bf16 — avoids scalar __mulsf3.
+static inline bfloat16 scale_bf16(bfloat16 val, bfloat16 scale) {
+  auto vv = aie::broadcast<bfloat16, VL>(val);
+  auto sv = aie::broadcast<bfloat16, VL>(scale);
+  auto prod = aie::mul(vv, sv);
+  return prod.to_vector<bfloat16>()[0];
+}
+
+// Compute exp2(a - b) as bf16 using vector hardware.
+// Returns bf16 — avoids scalar __subsf3.
+static inline bfloat16 exp2_diff_bf16(bfloat16 a, bfloat16 b) {
+  auto av = aie::broadcast<bfloat16, VL>(a);
+  auto bv = aie::broadcast<bfloat16, VL>(b);
+  auto diff_v = aie::sub(av, bv);
+  aie::accum<accfloat, VL> diff_acc(diff_v, 0);
+  auto exp_v = aie::exp2<bfloat16>(diff_acc.to_vector<float>());
+  return exp_v[0];
+}
+
+// Multiply two bf16 scalars using vector hardware MAC.
+// Returns bf16 — avoids scalar __mulsf3.
+static inline bfloat16 mul_bf16(bfloat16 a, bfloat16 b) {
+  auto av = aie::broadcast<bfloat16, VL>(a);
+  auto bv = aie::broadcast<bfloat16, VL>(b);
+  auto prod = aie::mul(av, bv);
+  return prod.to_vector<bfloat16>()[0];
+}
+
+extern "C" void attention_bf16(
+    bfloat16* __restrict Q,   // [M_per_core, dk] flat
+    bfloat16* __restrict K,   // [seq_len, dk] flat
+    bfloat16* __restrict V,   // [seq_len, dk] flat
+    bfloat16* __restrict O,   // [M_per_core, dk] flat
+    int32_t M_per_core,
+    int32_t seq_len,
+    int32_t dk) {
+
+  const bfloat16 combined_scale = (bfloat16)%ff;
+
+  for (int m = 0; m < CONST_M_PC; m++) {
+    bfloat16* q_row = Q + m * dk;
+    bfloat16* o_row = O + m * dk;
+
+    // --- Pass A: Recompute dots → scale → find max ---
+    // All values as bf16 scalars, no scalar float arithmetic.
+    bfloat16 max_val = scale_bf16(
+        dot_product_bf16(q_row, K, dk), combined_scale);
+    for (int s = 1; s < CONST_SEQ_LEN; s++) {
+      bfloat16 score = scale_bf16(
+          dot_product_bf16(q_row, K + s * dk, dk), combined_scale);
+      if (float_gt((float)score, (float)max_val)) max_val = score;
+    }
+
+    // --- Pass B: Recompute dots → exp2(score - max) → sum ---
+    // Accumulate exp values using vector accumulator (all VL lanes same).
+    aie::accum<accfloat, VL> sum_acc = aie::zeros<accfloat, VL>();
+    for (int s = 0; s < CONST_SEQ_LEN; s++) {
+      bfloat16 score = scale_bf16(
+          dot_product_bf16(q_row, K + s * dk, dk), combined_scale);
+      bfloat16 exp_val = exp2_diff_bf16(score, max_val);
+      // Broadcast exp to all lanes and accumulate (hardware vector add)
+      sum_acc = aie::add(sum_acc,
+          aie::broadcast<bfloat16, VL>(exp_val));
+    }
+    // All VL lanes have the same sum. Extract total via reduce_add / VL.
+    // But: reduce_add sums all lanes → VL * total, and dividing by VL
+    // needs __divsf3. Instead, extract one lane:
+    // to_vector<bfloat16>() does SRS, [0] extracts element 0.
+    bfloat16 total_sum = sum_acc.to_vector<bfloat16>()[0];
+    // Reciprocal using hardware aie::inv (lookup table, no __mulsf3)
+    bfloat16 inv_total = (bfloat16)aie::inv((float)total_sum);
+
+    // --- Pass C: Recompute dots → weight → accumulate O ---
+    for (int d = 0; d < dk; d += VL) {
+      aie::store_v(o_row + d, aie::zeros<bfloat16, VL>());
+    }
+    for (int s = 0; s < CONST_SEQ_LEN; s++) {
+      bfloat16 score = scale_bf16(
+          dot_product_bf16(q_row, K + s * dk, dk), combined_scale);
+      bfloat16 exp_val = exp2_diff_bf16(score, max_val);
+      // weight = exp * inv_total (vector multiply, hardware MAC)
+      bfloat16 weight = mul_bf16(exp_val, inv_total);
+
+      // Accumulate: O_row += weight * V_row (MAC hardware)
+      bfloat16* v_row = V + s * dk;
+      auto weight_v = aie::broadcast<bfloat16, VL>(weight);
+      for (int d = 0; d < dk; d += VL) {
+        auto vv = aie::load_v<VL>(v_row + d);
+        auto ov = aie::load_v<VL>(o_row + d);
+        aie::accum<accfloat, VL> o_acc(ov, 0);
+        o_acc = aie::mac(o_acc, vv, weight_v);
+        aie::store_v(o_row + d, o_acc.to_vector<bfloat16>());
+      }
+    }
+  }
+}
+)KERNEL", attention_m_per_core, attention_seq_len, combined_scale);
+
+    TF_RETURN_IF_ERROR(WriteFile(kernel_src, kernel_code));
+
+    // Same 3-step Peano compilation as softmax kernel.
+    std::string kernel_ll = workdir + "/attention_kernel.ll";
+    std::string kernel_bc = workdir + "/attention_kernel.opt.bc";
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        peano_clangxx,
+        " --target=", caps.isa_target, "-none-unknown-elf"
+        " -O1 -std=c++20 -S -emit-llvm"
+        " -isystem ", sysroot_include,
+        " -I ", libcxx_include,
+        " -I ", aie_api_include,
+        " ", kernel_src, " -o ", kernel_ll),
+        absl::StrFormat("Step %d/%d: Attention kernel → LLVM IR",
+                        step++, total_compile_steps)));
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        GetPeanoOptPath(), " '--passes=default<O0>,strip' ",
+        kernel_ll, " -o ", kernel_bc),
+        absl::StrFormat("Step %d/%d: Attention opt",
+                        step++, total_compile_steps)));
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        GetPeanoLlcPath(),
+        " -O2 --aie-loop-aware=false -filetype=obj ",
+        kernel_bc, " -o ", attention_kernel_obj),
+        absl::StrFormat("Step %d/%d: Attention llc",
                         step++, total_compile_steps)));
   }
 
@@ -1188,6 +1430,8 @@ extern "C" void softmax_bf16(bfloat16* __restrict input,
     if (!rt_stubs_obj.empty()) absl::StrAppend(&extra_objs, " ", rt_stubs_obj);
     if (!softmax_kernel_obj.empty())
       absl::StrAppend(&extra_objs, " ", softmax_kernel_obj);
+    if (!attention_kernel_obj.empty())
+      absl::StrAppend(&extra_objs, " ", attention_kernel_obj);
     TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
         peano_clang,
         " -O2 --target=", caps.isa_target, "-none-elf -nostdlib"

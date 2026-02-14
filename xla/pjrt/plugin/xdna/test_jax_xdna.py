@@ -747,6 +747,85 @@ def test_attention_bf16():
         np.array(output, dtype=np.float32), output_ref, atol=2.0)
 
 
+def _attention_ref(Q, K, V, dk):
+    """CPU reference for scaled dot-product attention using numpy."""
+    Q_f32 = Q.astype(np.float32)
+    K_f32 = K.astype(np.float32)
+    V_f32 = V.astype(np.float32)
+    scale = 1.0 / np.sqrt(float(dk))
+    scores = Q_f32 @ K_f32.T * scale
+    weights = _softmax_ref(scores)
+    return weights @ V_f32
+
+
+def test_fused_attention_bf16_basic():
+    """Fused attention: bf16 [32,32] — single JIT call, all on NPU."""
+    import ml_dtypes
+    rng = np.random.RandomState(230)
+    seq_len, dk = 32, 32
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(dk))
+    attn = jax.jit(lambda q, k, v: jax.nn.softmax(
+        (q @ k.T) * scale) @ v)
+    result = attn(Q, K, V)
+    expected = _attention_ref(Q, K, V, dk)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=2.0)
+
+
+def test_fused_attention_bf16_rectangular():
+    """Fused attention: bf16 seq_len=64, dk=32 (non-square)."""
+    import ml_dtypes
+    rng = np.random.RandomState(231)
+    seq_len, dk = 64, 32
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(dk))
+    attn = jax.jit(lambda q, k, v: jax.nn.softmax(
+        (q @ k.T) * scale) @ v)
+    result = attn(Q, K, V)
+    expected = _attention_ref(Q, K, V, dk)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=2.0)
+
+
+def test_fused_attention_bf16_multicore():
+    """Fused attention: bf16 seq_len=64, dk=64 — 4-core parallel."""
+    import ml_dtypes
+    rng = np.random.RandomState(232)
+    seq_len, dk = 64, 64
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(dk))
+    attn = jax.jit(lambda q, k, v: jax.nn.softmax(
+        (q @ k.T) * scale) @ v)
+    result = attn(Q, K, V)
+    expected = _attention_ref(Q, K, V, dk)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=2.0)
+
+
+def test_fused_attention_bf16_larger():
+    """Fused attention: bf16 seq_len=32, dk=64 — larger dk."""
+    import ml_dtypes
+    rng = np.random.RandomState(233)
+    seq_len, dk = 32, 64
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(dk))
+    attn = jax.jit(lambda q, k, v: jax.nn.softmax(
+        (q @ k.T) * scale) @ v)
+    result = attn(Q, K, V)
+    expected = _attention_ref(Q, K, V, dk)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=2.0)
+
+
 def test_unsupported_reshape():
     """Unsupported: reshape should fail with a clear error, not crash."""
     a = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
@@ -875,6 +954,11 @@ def main():
         ("transposed matmul bf16 [16,32]@[16,32]^T", test_transposed_matmul_bf16_16x32),
         ("transposed matmul bf16 multicore [8,32]@[32,32]^T", test_transposed_matmul_bf16_multicore),
         ("attention bf16 [32,32]", test_attention_bf16),
+    ] + [
+        ("fused attention bf16 [32,32]", test_fused_attention_bf16_basic),
+        ("fused attention bf16 [64,32]", test_fused_attention_bf16_rectangular),
+        ("fused attention bf16 [64,64]", test_fused_attention_bf16_multicore),
+        ("fused attention bf16 [32,64]", test_fused_attention_bf16_larger),
     ] + [
         ("unsupported: reshape", test_unsupported_reshape),
         ("unsupported: reduce_sum", test_unsupported_reduce_sum),

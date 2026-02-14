@@ -56,7 +56,11 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     bool convert_vector_to_aievec = false,
     bool needs_matmul_workarounds = false,
     bool needs_softfloat_stubs = false,
-    bool needs_softmax_kernel = false);
+    bool needs_softmax_kernel = false,
+    bool needs_attention_kernel = false,
+    int64_t attention_seq_len = 0,
+    int64_t attention_dk = 0,
+    int64_t attention_m_per_core = 0);
 
 }  // namespace xla
 
