@@ -162,6 +162,12 @@ struct LinalgProgramInfo {
   int64_t num_elements = 0;
   std::string storage_type;  // memref element type (e.g., "f16")
 
+  // Per DMA-input: true if the input is a broadcast (suffix projection).
+  // Size = num_inputs (DMA inputs only, not embedded constants).
+  std::vector<bool> broadcast_inputs;
+  int64_t broadcast_inner_dim = 0;   // N (row length, broadcast dim)
+  int64_t broadcast_outer_dim = 0;   // M (number of rows)
+
   bool is_multi_op() const {
     return !single_op.has_value() && generic_op;
   }
@@ -374,13 +380,30 @@ std::optional<float> TryExtractScalarFloat(mlir::Value value) {
   return val;
 }
 
+// Returns true if `map` is a suffix projection: the results are the trailing
+// dimensions of the input, dropping at least one leading dimension.
+// E.g., (d0, d1) -> (d1) maps a 2D iteration space to the last dim.
+bool IsSuffixProjection(mlir::AffineMap map) {
+  unsigned num_dims = map.getNumDims();
+  unsigned num_results = map.getNumResults();
+  if (num_results == 0 || num_results >= num_dims) return false;
+  for (unsigned r = 0; r < num_results; r++) {
+    auto expr = map.getResult(r);
+    auto dim = mlir::dyn_cast<mlir::AffineDimExpr>(expr);
+    if (!dim) return false;
+    if (dim.getPosition() != num_dims - num_results + r) return false;
+  }
+  return true;
+}
+
 // Analyzes a linalg.generic to build a LinalgProgramInfo.
 // Returns nullopt if the generic is not a supported element-wise computation.
 //
-// Supports two patterns:
+// Supports three patterns:
 //   1. All-identity indexing maps (standard elementwise: add, sub, mul, neg)
 //   2. Mixed identity + scalar-broadcast maps where broadcast inputs are
 //      compile-time constants (e.g., relu = max(x, 0) where 0 is broadcast)
+//   3. Mixed identity + suffix-projection maps (DMA broadcast: [M,N] + [N])
 std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
     mlir::linalg::GenericOp generic, mlir::ModuleOp module) {
   // Check that all iterator types are parallel (element-wise).
@@ -394,24 +417,65 @@ std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
   // Reject multi-output generics (we only support single output).
   if (generic.getNumDpsInits() != 1) return std::nullopt;
 
-  // Classify indexing maps: identity (DMA input) or scalar broadcast (constant).
+  // Classify indexing maps: identity (DMA input), scalar broadcast (constant),
+  // or suffix projection (DMA broadcast like [M,N] + [N]).
   auto maps = generic.getIndexingMapsArray();
   int num_total_inputs = static_cast<int>(generic.getInputs().size());
   std::vector<bool> is_broadcast(num_total_inputs, false);
   std::vector<std::string> broadcast_values(num_total_inputs);
+  std::vector<bool> is_dma_broadcast(num_total_inputs, false);
+  // For DMA broadcast inputs detected via broadcast generic: the original
+  // (pre-broadcast) input type. Used to compute broadcast dimensions.
+  std::vector<mlir::RankedTensorType> dma_broadcast_original_types(
+      num_total_inputs);
 
   for (int i = 0; i < num_total_inputs; i++) {
     auto map = maps[i];
     if (map.isIdentity()) {
-      // Identity map: could be a DMA input OR a constant splat tensor.
-      // stablehlo→linalg materializes broadcast constants as linalg.fill
-      // inside private helper functions. Trace through call boundaries.
+      // Identity map: could be a DMA input, a constant splat tensor, or
+      // the result of a broadcast generic (stablehlo broadcast_in_dim).
       mlir::Value inp = generic.getInputs()[i];
       mlir::Value traced = TraceBlockArgToCallSite(inp, module);
+
+      // Check for scalar constant broadcast.
       std::string constant = TryExtractScalarConstant(traced);
       if (!constant.empty()) {
         is_broadcast[i] = true;
         broadcast_values[i] = constant;
+        continue;
+      }
+
+      // Check if the input is produced by a broadcast generic:
+      // linalg.generic with a suffix-projection input map and trivial body
+      // (just yields the input). XLA decomposes [M,N]+[N] into:
+      //   %bcast = linalg.generic {maps=[(d0,d1)->(d1), (d0,d1)->(d0,d1)]}
+      //            ins(%bias) outs(%empty) { yield %in }
+      //   %result = linalg.generic {maps=[identity, identity, identity]}
+      //             ins(%x, %bcast) outs(%out) { addf }
+      auto* def_op = traced.getDefiningOp();
+      if (def_op) {
+        auto bcast_generic = mlir::dyn_cast<mlir::linalg::GenericOp>(def_op);
+        if (bcast_generic && bcast_generic.getInputs().size() == 1) {
+          // Check: trivial body (just yields input block arg).
+          mlir::Block& bcast_body = bcast_generic.getRegion().front();
+          bool trivial_body = true;
+          for (mlir::Operation& op : bcast_body.without_terminator()) {
+            (void)op;
+            trivial_body = false;
+            break;
+          }
+          if (trivial_body) {
+            // Check: input has a suffix projection map.
+            auto bcast_maps = bcast_generic.getIndexingMapsArray();
+            if (bcast_maps.size() >= 1 && IsSuffixProjection(bcast_maps[0])) {
+              is_dma_broadcast[i] = true;
+              dma_broadcast_original_types[i] =
+                  mlir::dyn_cast<mlir::RankedTensorType>(
+                      bcast_generic.getInputs()[0].getType());
+              continue;
+            }
+          }
+        }
       }
       continue;
     }
@@ -422,6 +486,10 @@ std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
       if (constant.empty()) return std::nullopt;
       is_broadcast[i] = true;
       broadcast_values[i] = constant;
+    } else if (IsSuffixProjection(map)) {
+      // Suffix projection: e.g., (d0,d1) -> (d1). This input has fewer
+      // dimensions than the output and needs DMA broadcast to all cores.
+      is_dma_broadcast[i] = true;
     } else {
       return std::nullopt;  // Unsupported indexing pattern.
     }
@@ -431,40 +499,61 @@ std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
   auto output_map = maps[num_total_inputs];  // output is after all inputs
   if (!output_map.isIdentity()) return std::nullopt;
 
-  // Get shape and element type from the first non-broadcast input.
-  mlir::RankedTensorType input_type;
-  for (int i = 0; i < num_total_inputs; i++) {
-    if (is_broadcast[i]) continue;
-    input_type = mlir::dyn_cast<mlir::RankedTensorType>(
-        generic.getInputs()[i].getType());
-    break;
-  }
-  if (!input_type) return std::nullopt;
+  // Get shape and element type from the output (identity-mapped, full shape).
+  auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      generic.getDpsInits()[0].getType());
+  if (!output_type) return std::nullopt;
 
-  // Verify all non-broadcast inputs have the same shape.
-  for (int i = 0; i < num_total_inputs; i++) {
-    if (is_broadcast[i]) continue;
-    auto ty = mlir::dyn_cast<mlir::RankedTensorType>(
-        generic.getInputs()[i].getType());
-    if (!ty || ty.getShape() != input_type.getShape()) return std::nullopt;
-  }
-
-  std::string storage_type = GetElementTypeStr(input_type.getElementType());
+  std::string storage_type = GetElementTypeStr(output_type.getElementType());
 
   // Reject f16: Peano's AIE2p backend treats f16 (half) as bf16 in its
   // fpext/fptrunc lowering (left-shift-by-16 and vconv.bf16.fp32), producing
   // incorrect results. All f16 ops are broken until Peano adds proper support.
   if (storage_type == "f16") return std::nullopt;
 
-  // Verify output element type matches input element type.
-  auto output_type = mlir::dyn_cast<mlir::RankedTensorType>(
-      generic.getDpsInits()[0].getType());
-  if (!output_type) return std::nullopt;
-  if (GetElementTypeStr(output_type.getElementType()) != storage_type)
+  // Get the first identity-mapped (non-broadcast) input for shape reference.
+  mlir::RankedTensorType identity_input_type;
+  for (int i = 0; i < num_total_inputs; i++) {
+    if (is_broadcast[i] || is_dma_broadcast[i]) continue;
+    identity_input_type = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic.getInputs()[i].getType());
+    break;
+  }
+  // At least one identity input is required (the activation).
+  if (!identity_input_type) return std::nullopt;
+
+  // Verify identity input element type matches output.
+  if (GetElementTypeStr(identity_input_type.getElementType()) != storage_type)
     return std::nullopt;
 
+  // Verify all identity-mapped inputs have the same shape as the output.
+  for (int i = 0; i < num_total_inputs; i++) {
+    if (is_broadcast[i] || is_dma_broadcast[i]) continue;
+    auto ty = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic.getInputs()[i].getType());
+    if (!ty || ty.getShape() != output_type.getShape()) return std::nullopt;
+  }
+
+  // Verify DMA broadcast inputs: trailing dims must match output's trailing dims,
+  // and element type must match.
+  for (int i = 0; i < num_total_inputs; i++) {
+    if (!is_dma_broadcast[i]) continue;
+    auto ty = mlir::dyn_cast<mlir::RankedTensorType>(
+        generic.getInputs()[i].getType());
+    if (!ty) return std::nullopt;
+    if (GetElementTypeStr(ty.getElementType()) != storage_type)
+      return std::nullopt;
+    auto out_shape = output_type.getShape();
+    auto in_shape = ty.getShape();
+    // Trailing dims of broadcast input must match trailing dims of output.
+    int offset = out_shape.size() - in_shape.size();
+    for (unsigned r = 0; r < in_shape.size(); r++) {
+      if (in_shape[r] != out_shape[offset + r]) return std::nullopt;
+    }
+  }
+
   int64_t num_elements = 1;
-  for (int64_t dim : input_type.getShape()) {
+  for (int64_t dim : output_type.getShape()) {
     num_elements *= dim;
   }
 
@@ -486,16 +575,51 @@ std::optional<LinalgProgramInfo> AnalyzeLinalgGeneric(
 
   if (compute_op_count == 0) return std::nullopt;
 
-  // Count DMA inputs (non-broadcast).
+  // Count DMA inputs (non-scalar-broadcast; includes DMA broadcast inputs).
   int dma_inputs = 0;
+  bool has_dma_broadcast = false;
   for (int i = 0; i < num_total_inputs; i++) {
-    if (!is_broadcast[i]) dma_inputs++;
+    if (!is_broadcast[i]) {
+      dma_inputs++;
+      if (is_dma_broadcast[i]) has_dma_broadcast = true;
+    }
   }
 
   LinalgProgramInfo program;
   program.num_inputs = dma_inputs;
   program.num_elements = num_elements;
   program.storage_type = storage_type;
+
+  // Build broadcast_inputs vector (indexed by DMA input order).
+  if (has_dma_broadcast) {
+    int dma_idx = 0;
+    program.broadcast_inputs.resize(dma_inputs, false);
+    for (int i = 0; i < num_total_inputs; i++) {
+      if (is_broadcast[i]) continue;  // skip scalar constants
+      if (is_dma_broadcast[i]) {
+        program.broadcast_inputs[dma_idx] = true;
+      }
+      dma_idx++;
+    }
+    // Compute broadcast dimensions from the original (pre-broadcast) shape.
+    // For broadcast-generic pattern: original type is stored.
+    // For suffix projection pattern: use the input type directly.
+    for (int i = 0; i < num_total_inputs; i++) {
+      if (!is_dma_broadcast[i]) continue;
+      mlir::RankedTensorType orig_ty = dma_broadcast_original_types[i];
+      if (!orig_ty) {
+        // Suffix projection path: input type IS the original shape.
+        orig_ty = mlir::dyn_cast<mlir::RankedTensorType>(
+            generic.getInputs()[i].getType());
+      }
+      if (!orig_ty) continue;
+      int64_t inner = 1;
+      for (int64_t d : orig_ty.getShape()) inner *= d;
+      program.broadcast_inner_dim = inner;
+      program.broadcast_outer_dim = num_elements / inner;
+      break;
+    }
+  }
 
   // Single op with NO casts → use single_op path.
   if (total_op_count == 1 && compute_op_count == 1) {
@@ -4627,6 +4751,363 @@ absl::StatusOr<AieLoweringResult> LowerLayerNormToAie(
   return result;
 }
 
+// Lowers a broadcast elementwise op to AIE dialect MLIR.
+// Pattern: [M, N] op [N] -> [M, N] (e.g., bias add).
+// Broadcasts the smaller input (bias) to all compute tiles via mem tile,
+// then each core processes M/num_cores rows with vectorized elementwise op.
+absl::StatusOr<AieLoweringResult> LowerBroadcastElementwiseToAie(
+    const LinalgProgramInfo& program, const TargetCaps& caps,
+    int max_columns) {
+  // Extract broadcast parameters.
+  int64_t N = program.broadcast_inner_dim;  // row length (broadcast dim)
+  int64_t M = program.broadcast_outer_dim;  // number of rows
+  const std::string& kernel_op = program.single_op->kernel_op;
+  const std::string& element_type = program.storage_type;
+  int element_bytes = GetElementBytes(element_type);
+
+  // Auto-scale number of cores.
+  int num_cores = std::min(max_columns, caps.num_columns);
+  while (num_cores > 1) {
+    if (M % num_cores != 0) { num_cores--; continue; }
+    break;
+  }
+  int64_t rows_per_core = M / num_cores;
+
+  // L1 budget: bias (depth 2) + act (depth 2) + out (depth 2).
+  // All buffers are N * element_bytes.
+  int64_t buf_size = N * element_bytes;
+  int64_t total_l1 = 6 * buf_size;  // 3 FIFOs x depth 2
+
+  if (total_l1 > caps.l1_usable_bytes) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Broadcast elementwise N=%d exceeds L1 budget (%d bytes needed, "
+        "%d available)", N, total_l1, caps.l1_usable_bytes));
+  }
+
+  // DMA dimension limits.
+  int64_t d0_words = N * element_bytes / 4;
+  if (d0_words > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Broadcast elementwise N=%d exceeds DMA d0 limit (%d words, max %d)",
+        N, d0_words, kMaxBdWords));
+  }
+  if (rows_per_core > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Broadcast elementwise rows_per_core=%d exceeds DMA d1 limit (max %d)",
+        rows_per_core, kMaxBdWords));
+  }
+
+  // Determine which DMA input index is the broadcast (bias) and which is the
+  // identity-mapped (activation). For a 2-input op like add(act, bias),
+  // broadcast_inputs tells us which.
+  int bias_dma_idx = -1;
+  int act_dma_idx = -1;
+  for (int i = 0; i < program.num_inputs; i++) {
+    if (i < static_cast<int>(program.broadcast_inputs.size()) &&
+        program.broadcast_inputs[i]) {
+      bias_dma_idx = i;
+    } else {
+      act_dma_idx = i;
+    }
+  }
+  if (bias_dma_idx < 0 || act_dma_idx < 0) {
+    return absl::InvalidArgumentError(
+        "Broadcast elementwise: could not identify bias and activation inputs");
+  }
+  // Track operand order: if bias is DMA input 0, it's the LHS in the body.
+  // For non-commutative ops (sub), we need to respect this order.
+  bool bias_is_lhs = (bias_dma_idx < act_dma_idx);
+
+  // Vectorization.
+  int vector_width = GetVectorWidth(element_type, kernel_op);
+  bool use_vectorized = (vector_width > 0 && N >= vector_width &&
+                         N % vector_width == 0);
+  bool use_aievec = use_vectorized && NeedsAievecPipeline(kernel_op);
+
+  int64_t total_elements = M * N;
+  LOG(INFO) << "XDNA broadcast elementwise lowering: [" << M << "," << N
+            << "] " << kernel_op << " " << element_type
+            << " using " << num_cores << " core(s) ("
+            << rows_per_core << " rows/core)"
+            << " L1=" << total_l1 << "B"
+            << (use_vectorized ? " vectorized" : " scalar");
+
+  int start_col = caps.partition_start_column;
+  int shim_row = caps.shim_row;
+  int compute_row = caps.first_compute_row;
+  int fifo_depth = 2;
+
+  std::string row_memref = absl::StrFormat("memref<%dx%s>", N, element_type);
+  std::string act_host_memref = absl::StrFormat("memref<%dx%s>",
+                                                 total_elements, element_type);
+  std::string bias_host_memref = absl::StrFormat("memref<%dx%s>",
+                                                  N, element_type);
+  std::string out_host_memref = absl::StrFormat("memref<%dx%s>",
+                                                 total_elements, element_type);
+
+  auto fifo_name = [&](int c, const std::string& base) -> std::string {
+    return num_cores > 1 ? absl::StrFormat("c%d_%s", c, base) : base;
+  };
+
+  std::string aie_mlir;
+  absl::StrAppend(&aie_mlir, "module {\n");
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "  aie.device(%s) {\n", DeviceNameForColumns(num_cores)));
+
+  // Tile declarations.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, shim_row, col, shim_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, caps.mem_tile_row, col, caps.mem_tile_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, compute_row, col, compute_row));
+  }
+
+  // Bias broadcast: single chain from start_col shim -> start_col mem ->
+  // all compute tiles. Send once, all cores read.
+  {
+    std::string bias_shim = absl::StrFormat("tile_%d_%d", start_col, shim_row);
+    std::string bias_mem = absl::StrFormat("tile_%d_%d", start_col,
+                                            caps.mem_tile_row);
+    // L2: shim(start_col) -> mem(start_col).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @in_bias_L2(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        bias_shim, bias_mem, fifo_depth, row_memref));
+    // L1 broadcast: mem(start_col) -> {all compute tiles}.
+    std::string bias_consumers;
+    for (int c = 0; c < num_cores; c++) {
+      if (c > 0) bias_consumers += ", ";
+      absl::StrAppendFormat(&bias_consumers, "%%tile_%d_%d",
+                            start_col + c, compute_row);
+    }
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @in_bias(%%%s, {%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        bias_mem, bias_consumers, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir,
+        "    aie.objectfifo.link [@in_bias_L2] -> [@in_bias] ([] [])\n");
+  }
+
+  // Activation input and output per-column.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string shim = absl::StrFormat("tile_%d_%d", col, shim_row);
+    std::string mem = absl::StrFormat("tile_%d_%d", col, caps.mem_tile_row);
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+
+    // Activation input: shim -> mem -> compute.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_act_L2"), shim, mem, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_act"), mem, compute, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "in_act_L2"), fifo_name(c, "in_act")));
+
+    // Output: compute -> mem -> shim.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out"), compute, mem, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out_L2"), mem, shim, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "out"), fifo_name(c, "out_L2")));
+  }
+
+  // Core bodies: acquire bias once, loop over rows with vectorized op.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+    std::string subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", row_memref);
+
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%core_%d_%d = aie.core(%%%s) {\n", col, compute_row, compute));
+
+    // Acquire bias (held for all rows).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%bias_sub = aie.objectfifo.acquire @in_bias(Consume, 1) : %s\n"
+        "      %%bias_buf = aie.objectfifo.subview.access %%bias_sub[0] "
+        ": %s -> %s\n",
+        subview_ty, subview_ty, row_memref));
+
+    // Row loop constants.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%c0 = arith.constant 0 : index\n"
+        "      %%c1 = arith.constant 1 : index\n"
+        "      %%num_rows = arith.constant %d : index\n",
+        rows_per_core));
+
+    absl::StrAppend(&aie_mlir,
+        "      scf.for %i = %c0 to %num_rows step %c1 {\n");
+
+    // Acquire activation and output.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "        %%act_sub = aie.objectfifo.acquire @%s(Consume, 1) : %s\n"
+        "        %%act_buf = aie.objectfifo.subview.access %%act_sub[0] "
+        ": %s -> %s\n"
+        "        %%out_sub = aie.objectfifo.acquire @%s(Produce, 1) : %s\n"
+        "        %%out_buf = aie.objectfifo.subview.access %%out_sub[0] "
+        ": %s -> %s\n",
+        fifo_name(c, "in_act"), subview_ty, subview_ty, row_memref,
+        fifo_name(c, "out"), subview_ty, subview_ty, row_memref));
+
+    // Generate vectorized or scalar elementwise loop over N elements.
+    if (use_vectorized) {
+      std::string vec_ty = absl::StrFormat("vector<%dx%s>",
+                                            vector_width, element_type);
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "        %%cv0 = arith.constant 0 : index\n"
+          "        %%cv_step = arith.constant %d : index\n"
+          "        %%cv_end = arith.constant %d : index\n",
+          vector_width, N));
+      absl::StrAppend(&aie_mlir,
+          "        scf.for %d = %cv0 to %cv_end step %cv_step {\n");
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "          %%va = vector.load %%act_buf[%%d] : %s, %s\n"
+          "          %%vb = vector.load %%bias_buf[%%d] : %s, %s\n",
+          row_memref, vec_ty, row_memref, vec_ty));
+      // Apply the kernel op (respect operand order for non-commutative ops).
+      if (bias_is_lhs) {
+        absl::StrAppend(&aie_mlir, absl::StrFormat(
+            "          %%vr = %s %%vb, %%va : %s\n", kernel_op, vec_ty));
+      } else {
+        absl::StrAppend(&aie_mlir, absl::StrFormat(
+            "          %%vr = %s %%va, %%vb : %s\n", kernel_op, vec_ty));
+      }
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "          vector.store %%vr, %%out_buf[%%d] : %s, %s\n",
+          row_memref, vec_ty));
+      absl::StrAppend(&aie_mlir, "        }\n");
+    } else {
+      // Scalar loop.
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "        %%cs0 = arith.constant 0 : index\n"
+          "        %%cs1 = arith.constant 1 : index\n"
+          "        %%cs_end = arith.constant %d : index\n",
+          N));
+      absl::StrAppend(&aie_mlir,
+          "        scf.for %d = %cs0 to %cs_end step %cs1 {\n");
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "          %%sa = memref.load %%act_buf[%%d] : %s\n"
+          "          %%sb = memref.load %%bias_buf[%%d] : %s\n",
+          row_memref, row_memref));
+      if (bias_is_lhs) {
+        absl::StrAppend(&aie_mlir, absl::StrFormat(
+            "          %%sr = %s %%sb, %%sa : %s\n", kernel_op, element_type));
+      } else {
+        absl::StrAppend(&aie_mlir, absl::StrFormat(
+            "          %%sr = %s %%sa, %%sb : %s\n", kernel_op, element_type));
+      }
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "          memref.store %%sr, %%out_buf[%%d] : %s\n", row_memref));
+      absl::StrAppend(&aie_mlir, "        }\n");
+    }
+
+    // Release activation and output.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "        aie.objectfifo.release @%s(Consume, 1)\n"
+        "        aie.objectfifo.release @%s(Produce, 1)\n",
+        fifo_name(c, "in_act"), fifo_name(c, "out")));
+    absl::StrAppend(&aie_mlir, "      }\n");  // end scf.for
+
+    // Release bias.
+    absl::StrAppend(&aie_mlir,
+        "      aie.objectfifo.release @in_bias(Consume, 1)\n");
+    absl::StrAppend(&aie_mlir, "      aie.end\n    }\n");
+  }
+
+  // Runtime sequence: args follow DMA input order (matching HLO parameter order).
+  // arg{act_dma_idx} = activation [M*N], arg{bias_dma_idx} = bias [N],
+  // arg{num_inputs} = output [M*N].
+  std::string arg_act = absl::StrFormat("%%arg%d", act_dma_idx);
+  std::string arg_bias = absl::StrFormat("%%arg%d", bias_dma_idx);
+  std::string arg_out = absl::StrFormat("%%arg%d", program.num_inputs);
+
+  // Build arg list in order.
+  std::vector<std::string> arg_decls(program.num_inputs + 1);
+  arg_decls[act_dma_idx] = absl::StrFormat("%%arg%d: %s",
+                                             act_dma_idx, act_host_memref);
+  arg_decls[bias_dma_idx] = absl::StrFormat("%%arg%d: %s",
+                                              bias_dma_idx, bias_host_memref);
+  arg_decls[program.num_inputs] = absl::StrFormat("%%arg%d: %s",
+                                                    program.num_inputs,
+                                                    out_host_memref);
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.runtime_sequence(%s) {\n",
+      absl::StrJoin(arg_decls, ", ")));
+
+  int dma_id = 0;
+
+  // Bias broadcast via @in_bias_L2 (single [N] transfer).
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "      aiex.npu.dma_memcpy_nd(%s"
+      "[0, 0, 0, 0][1, 1, 1, %d][0, 0, 0, 1]) "
+      "{id = %d : i64, metadata = @in_bias_L2, issue_token = true} : %s\n",
+      arg_bias, N, dma_id++, bias_host_memref));
+
+  // Activation per-column.
+  for (int c = 0; c < num_cores; c++) {
+    int64_t offset = c * rows_per_core * N;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%s"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        arg_act, offset, rows_per_core, N, N,
+        dma_id++, fifo_name(c, "in_act_L2"), act_host_memref));
+  }
+
+  // Output per-column.
+  for (int c = 0; c < num_cores; c++) {
+    int64_t offset = c * rows_per_core * N;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%s"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        arg_out, offset, rows_per_core, N, N,
+        dma_id++, fifo_name(c, "out_L2"), out_host_memref));
+  }
+
+  // Wait for all channels.
+  absl::StrAppend(&aie_mlir,
+      "      aiex.npu.dma_wait { symbol = @in_bias_L2 }\n");
+  for (int c = 0; c < num_cores; c++) {
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "out_L2")));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "in_act_L2")));
+  }
+
+  absl::StrAppend(&aie_mlir, "    }\n");  // end runtime_sequence
+  absl::StrAppend(&aie_mlir, "  }\n");    // end aie.device
+  absl::StrAppend(&aie_mlir, "}\n");      // end module
+
+  LOG(INFO) << "XDNA broadcast elementwise lowering: generated AIE MLIR:\n"
+            << aie_mlir;
+
+  AieLoweringResult result;
+  result.aie_mlir = aie_mlir;
+  result.num_cores = num_cores;
+  result.use_aievec = use_aievec;
+  result.convert_vector_to_aievec = use_aievec;
+  return result;
+}
+
 absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
     mlir::ModuleOp linalg_module, const AieLoweringConfig& config,
     const TargetCaps& caps) {
@@ -4682,6 +5163,16 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
   auto program_result = AnalyzeLinalgModule(linalg_module);
   if (!program_result.ok()) return program_result.status();
   LinalgProgramInfo program = std::move(*program_result);
+
+  // Check for broadcast elementwise (e.g., [M,N] + [N] bias add).
+  if (program.broadcast_inner_dim > 0 && program.single_op.has_value()) {
+    LOG(INFO) << "XDNA AIE lowering: detected broadcast elementwise ["
+              << program.broadcast_outer_dim << ","
+              << program.broadcast_inner_dim << "] "
+              << program.single_op->kernel_op << " "
+              << program.storage_type;
+    return LowerBroadcastElementwiseToAie(program, caps, config.num_columns);
+  }
 
   // Step 1b: Determine number of compute columns (cores).
   // All constraints are checked in a single loop to prevent one reduction

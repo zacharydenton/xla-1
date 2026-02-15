@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """GPT-2 124M forward pass test on XDNA NPU.
 
-Phase 16/18: Python-side orchestration with fused causal attention.
+Phase 19: Broadcast bias add on NPU (eliminates CPU roundtrips).
 - Fused causal attention (1 NPU call per head instead of 4)
 - FFN up N=3072 split into 2x1536 chunks (d3 limit workaround)
-- Bias additions on CPU (broadcast add untested on NPU)
+- Bias additions via broadcast add on NPU ([M,N] + [N])
 - Output head on CPU (vocab=50257 far exceeds NPU d3 limit)
 - seq_len=64 (L1 limit with dk=64)
 
@@ -100,12 +100,6 @@ def _bf16(x):
     return x.astype(ml_dtypes.bfloat16)
 
 
-def _add_bias_cpu(x_npu, bias):
-    """Add 1D bias to 2D NPU result on CPU, return bf16 numpy array."""
-    return _bf16(np.array(x_npu).astype(np.float32) +
-                 bias.astype(np.float32))
-
-
 def _init_weights(rng, emb_dim, n_layers, ffn_inner, vocab, seq_len):
     """Initialize random GPT-2 weights in bf16."""
     d = emb_dim
@@ -195,10 +189,14 @@ def _run_gpt2_test(n_layers):
         # --- Attention block ---
         x_norm = jit_ln(x, w[f'{p}.g1'], w[f'{p}.b1'])
 
-        # QKV projections (NPU) + bias (CPU).
-        q_full = _add_bias_cpu(jit_dot(x_norm, w[f'{p}.W_q']), w[f'{p}.b_q'])
-        k_full = _add_bias_cpu(jit_dot(x_norm, w[f'{p}.W_k']), w[f'{p}.b_k'])
-        v_full = _add_bias_cpu(jit_dot(x_norm, w[f'{p}.W_v']), w[f'{p}.b_v'])
+        # QKV projections (NPU matmul + NPU broadcast bias add).
+        # D2H needed for reshape into heads.
+        q_full = np.array(jit_add(jit_dot(x_norm, w[f'{p}.W_q']),
+                                  w[f'{p}.b_q']))
+        k_full = np.array(jit_add(jit_dot(x_norm, w[f'{p}.W_k']),
+                                  w[f'{p}.b_k']))
+        v_full = np.array(jit_add(jit_dot(x_norm, w[f'{p}.W_v']),
+                                  w[f'{p}.b_v']))
 
         # Split into heads (CPU): [S, d] -> [S, n_heads, hd].
         q_heads = q_full.reshape(seq_len, n_heads, head_dim)
@@ -216,9 +214,8 @@ def _run_gpt2_test(n_layers):
         # Concat heads (CPU) -> [S, d].
         attn_out = np.concatenate(head_outputs, axis=-1).astype(ml_dtypes.bfloat16)
 
-        # Output projection (NPU) + bias (CPU) + residual (NPU).
-        proj = _add_bias_cpu(
-            jit_dot(attn_out, w[f'{p}.W_out']), w[f'{p}.b_out'])
+        # Output projection (NPU) + bias (NPU) + residual (NPU).
+        proj = jit_add(jit_dot(attn_out, w[f'{p}.W_out']), w[f'{p}.b_out'])
         x = jit_add(x, proj)
 
         # --- FFN block ---
@@ -230,17 +227,17 @@ def _run_gpt2_test(n_layers):
         b1a = w[f'{p}.b_ff1'][:ff_half].copy()
         b1b = w[f'{p}.b_ff1'][ff_half:].copy()
 
-        ff1_a = _add_bias_cpu(jit_dot(x_norm2, W1a), b1a)
-        ff1_b = _add_bias_cpu(jit_dot(x_norm2, W1b), b1b)
+        # FFN up bias on NPU (stays on-device for GELU).
+        ff1_a = jit_add(jit_dot(x_norm2, W1a), b1a)
+        ff1_b = jit_add(jit_dot(x_norm2, W1b), b1b)
 
-        # GELU on NPU.
+        # GELU on NPU (D2H needed for concat).
         act_a = np.array(jit_gelu(ff1_a))
         act_b = np.array(jit_gelu(ff1_b))
 
-        # Concat halves (CPU) -> FFN down (NPU) + bias (CPU) + residual (NPU).
+        # Concat halves (CPU) -> FFN down (NPU) + bias (NPU) + residual (NPU).
         ff_cat = np.concatenate([act_a, act_b], axis=-1).astype(ml_dtypes.bfloat16)
-        ff2 = _add_bias_cpu(jit_dot(ff_cat, w[f'{p}.W_ff2']),
-                            w[f'{p}.b_ff2'])
+        ff2 = jit_add(jit_dot(ff_cat, w[f'{p}.W_ff2']), w[f'{p}.b_ff2'])
         x = jit_add(x, ff2)
 
         elapsed = time.time() - lt

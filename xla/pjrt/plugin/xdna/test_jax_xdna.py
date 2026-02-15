@@ -1046,6 +1046,54 @@ def test_layernorm_bf16_8x256():
         np.array(result, dtype=np.float32), expected, atol=0.1)
 
 
+def test_broadcast_add_bf16_basic():
+    """Broadcast add: bf16 [4,4] + [4] — minimal shape."""
+    import ml_dtypes
+    rng = np.random.RandomState(320)
+    x = rng.randn(4, 4).astype(ml_dtypes.bfloat16)
+    bias = rng.randn(4).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda a, b: a + b)(x, bias)
+    expected = x.astype(np.float32) + bias.astype(np.float32)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.05)
+
+
+def test_broadcast_add_bf16_768():
+    """Broadcast add: bf16 [64,768] + [768] — GPT-2 bias add shape."""
+    import ml_dtypes
+    rng = np.random.RandomState(321)
+    x = rng.randn(64, 768).astype(ml_dtypes.bfloat16)
+    bias = rng.randn(768).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda a, b: a + b)(x, bias)
+    expected = x.astype(np.float32) + bias.astype(np.float32)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.05)
+
+
+def test_broadcast_add_bf16_1536():
+    """Broadcast add: bf16 [64,1536] + [1536] — GPT-2 FFN bias shape."""
+    import ml_dtypes
+    rng = np.random.RandomState(322)
+    x = rng.randn(64, 1536).astype(ml_dtypes.bfloat16)
+    bias = rng.randn(1536).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda a, b: a + b)(x, bias)
+    expected = x.astype(np.float32) + bias.astype(np.float32)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.05)
+
+
+def test_broadcast_sub_bf16():
+    """Broadcast sub: bf16 [16,32] - [32]."""
+    import ml_dtypes
+    rng = np.random.RandomState(323)
+    x = rng.randn(16, 32).astype(ml_dtypes.bfloat16)
+    bias = rng.randn(32).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda a, b: a - b)(x, bias)
+    expected = x.astype(np.float32) - bias.astype(np.float32)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.05)
+
+
 def test_tiny_gpt_forward():
     """Tiny GPT: 1-layer forward pass using separate jit calls per op.
 
@@ -1387,6 +1435,11 @@ def main():
         ("layernorm bf16[1,64]", test_layernorm_bf16_1x64),
         ("layernorm bf16[4,128]", test_layernorm_bf16_4x128),
         ("layernorm bf16[8,256]", test_layernorm_bf16_8x256),
+    ] + [
+        ("broadcast add bf16[4,4]+[4]", test_broadcast_add_bf16_basic),
+        ("broadcast add bf16[64,768]+[768]", test_broadcast_add_bf16_768),
+        ("broadcast add bf16[64,1536]+[1536]", test_broadcast_add_bf16_1536),
+        ("broadcast sub bf16[16,32]-[32]", test_broadcast_sub_bf16),
     ] + [
         ("tiny GPT forward", test_tiny_gpt_forward),
     ] + [
