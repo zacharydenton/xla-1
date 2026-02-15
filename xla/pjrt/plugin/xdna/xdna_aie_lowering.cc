@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "absl/strings/numbers.h"
 
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -2777,11 +2778,380 @@ std::optional<AttentionProgramInfo> DetectAttention(mlir::ModuleOp module) {
   return info;
 }
 
+// Selects the KV block size (Sb) for tiled attention.
+// Returns the largest Sb ≤ max_sb that evenly divides seq_len.
+static int64_t SelectKvBlockSize(int64_t seq_len, int64_t dk,
+                                  int64_t m_per_core, int64_t l1_budget) {
+  // L1 budget for tiled path with combined KV FIFO (depth=2, acquire(2) → 3 buffers):
+  //   Q: 1 * m_pc * dk * 2    (depth=1, single transfer)
+  //   KV: 3 * Sb * dk * 2     (depth=2, acquire(2))
+  //   O: 1 * m_pc * dk * 2    (depth=1, single transfer)
+  //   State: m_pc * 2 * 2     (max_val + total_sum per row)
+  // Total = 4*m_pc*dk + 6*Sb*dk + 4*m_pc  ≤ l1_budget
+  // => Sb ≤ (l1_budget - 4*m_pc*dk - 4*m_pc) / (6*dk)
+  int64_t max_sb = (l1_budget - 4 * dk * m_per_core - 4 * m_per_core) /
+                   (6 * dk);
+  // Find largest divisor of seq_len that fits.
+  for (int64_t sb = max_sb; sb >= 1; sb--) {
+    if (seq_len % sb == 0) return sb;
+  }
+  return 1;  // Fallback: process one row at a time.
+}
+
+// Generates AIE MLIR for TILED fused attention (large seq_len).
+// Streams K and V through L1 in blocks of Sb rows using a combined KV
+// ObjectFIFO (depth=2, acquire(2) per block). K in slot[0], V in slot[1].
+// An aie.buffer holds online softmax state (max_val, total_sum) across blocks.
+absl::StatusOr<AieLoweringResult> LowerTiledAttentionToAie(
+    const AttentionProgramInfo& info, const TargetCaps& caps,
+    int num_cores, int64_t m_per_core, int64_t sb) {
+  int64_t num_blocks = info.seq_len / sb;
+
+  // Verify L1 budget:
+  // Q(depth=1) + KV(3 buffers: depth=2+acquire(2)) + O(depth=1) + state.
+  int64_t tiled_l1 = 4 * m_per_core * info.dk +
+                     6 * sb * info.dk +
+                     4 * m_per_core;
+  if (tiled_l1 > caps.l1_usable_bytes) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Tiled attention L1 exceeded: M_pc=%d Sb=%d dk=%d needs %dB, "
+        "have %dB", m_per_core, sb, info.dk, tiled_l1, caps.l1_usable_bytes));
+  }
+
+  // DMA dimension limits.
+  int64_t d0_words_dk = info.dk * 2 / 4;
+  if (d0_words_dk > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Attention dk=%d exceeds DMA d0 limit (%d words, max %d)",
+        info.dk, d0_words_dk, kMaxBdWords));
+  }
+  if (sb > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Attention Sb=%d exceeds DMA d1 limit (max %d)", sb, kMaxBdWords));
+  }
+  if (m_per_core > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Attention m_per_core=%d exceeds DMA d1 limit (max %d)",
+        m_per_core, kMaxBdWords));
+  }
+
+  LOG(INFO) << "XDNA tiled attention lowering: M=" << info.num_rows
+            << " S=" << info.seq_len << " dk=" << info.dk
+            << " Sb=" << sb << " blocks=" << num_blocks
+            << " using " << num_cores << " core(s) ("
+            << m_per_core << " rows/core)"
+            << " L1=" << tiled_l1 << "B";
+
+  int start_col = caps.partition_start_column;
+  int shim_row = caps.shim_row;
+  int compute_row = caps.first_compute_row;
+  int kv_fifo_depth = 2;   // KV: double-buffered for pipelining.
+  int qo_fifo_depth = 1;   // Q/O: single transfer, depth=1 saves L1.
+
+  // ObjectFIFO buffer types.
+  std::string q_memref = absl::StrFormat("memref<%dxbf16>",
+                                          m_per_core * info.dk);
+  // Combined KV FIFO: each element = Sb*dk bf16. Depth=2, acquire(2).
+  // Slot[0]=K_block, slot[1]=V_block.
+  std::string kv_memref = absl::StrFormat("memref<%dxbf16>", sb * info.dk);
+  std::string o_memref = absl::StrFormat("memref<%dxbf16>",
+                                          m_per_core * info.dk);
+  // State buffer: 2 bf16 per query row (max_val + total_sum).
+  std::string state_memref = absl::StrFormat("memref<%dxbf16>",
+                                              m_per_core * 2);
+
+  // Host buffer types.
+  int64_t q_total = info.num_rows * info.dk;
+  int64_t kv_total = info.seq_len * info.dk;
+  int64_t o_total = info.num_rows * info.dk;
+  std::string q_host_memref = absl::StrFormat("memref<%dxbf16>", q_total);
+  std::string k_host_memref = absl::StrFormat("memref<%dxbf16>", kv_total);
+  std::string v_host_memref = absl::StrFormat("memref<%dxbf16>", kv_total);
+  std::string o_host_memref = absl::StrFormat("memref<%dxbf16>", o_total);
+
+  auto fifo_name = [&](int c, const std::string& base) -> std::string {
+    return num_cores > 1 ? absl::StrFormat("c%d_%s", c, base) : base;
+  };
+
+  std::string aie_mlir;
+  absl::StrAppend(&aie_mlir, "module {\n");
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "  aie.device(%s) {\n", DeviceNameForColumns(num_cores)));
+
+  // Pass 1: Tile declarations.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, shim_row, col, shim_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, caps.mem_tile_row, col, caps.mem_tile_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, compute_row, col, compute_row));
+  }
+
+  // Pass 2: ObjectFIFOs and links.
+  // KV broadcast: combined K/V FIFO from shim(start_col) → mem → all compute.
+  // Single shim output channel (avoids DMA channel exhaustion).
+  {
+    std::string kv_shim = absl::StrFormat("tile_%d_%d", start_col, shim_row);
+    std::string kv_mem = absl::StrFormat("tile_%d_%d", start_col,
+                                          caps.mem_tile_row);
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @in_kv_L2(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        kv_shim, kv_mem, kv_fifo_depth, kv_memref));
+    std::string kv_consumers;
+    for (int c = 0; c < num_cores; c++) {
+      if (c > 0) kv_consumers += ", ";
+      absl::StrAppendFormat(&kv_consumers, "%%tile_%d_%d",
+                            start_col + c, compute_row);
+    }
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @in_kv(%%%s, {%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        kv_mem, kv_consumers, kv_fifo_depth, kv_memref));
+    absl::StrAppend(&aie_mlir,
+        "    aie.objectfifo.link [@in_kv_L2] -> [@in_kv] ([] [])\n");
+  }
+
+  // Q and O per-column.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string shim = absl::StrFormat("tile_%d_%d", col, shim_row);
+    std::string mem = absl::StrFormat("tile_%d_%d", col, caps.mem_tile_row);
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+
+    // Q input: shim → mem → compute. Depth=1 (single transfer).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_q_L2"), shim, mem, qo_fifo_depth, q_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_q"), mem, compute, qo_fifo_depth, q_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "in_q_L2"), fifo_name(c, "in_q")));
+
+    // O output: compute → mem → shim. Depth=1 (single transfer).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out"), compute, mem, qo_fifo_depth, o_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out_L2"), mem, shim, qo_fifo_depth, o_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "out"), fifo_name(c, "out_L2")));
+  }
+
+  // State buffer per compute tile (for online softmax running state).
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%state_%d = aie.buffer(%%tile_%d_%d) : %s\n",
+        c, col, compute_row, state_memref));
+  }
+
+  // External function declarations for tiled attention kernel.
+  // CONTRACT: The kernel ignores m_pc/sb/dk runtime args — loop bounds use
+  // compile-time CONST_M_PC/CONST_SB (#define) for Peano VLIW stability.
+  // The values passed here MUST match attention_m_per_core/attention_kv_block_size
+  // in the AieLoweringResult so that xdna_codegen.cc bakes the same constants.
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    func.func private @attention_init_bf16(%s, %s, i32, i32) -> ()\n",
+      o_memref, state_memref));
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    func.func private @attention_block_bf16("
+      "%s, %s, %s, %s, %s, i32, i32, i32) -> ()\n",
+      q_memref, kv_memref, kv_memref, o_memref, state_memref));
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    func.func private @attention_normalize_bf16(%s, %s, i32, i32) -> ()\n",
+      o_memref, state_memref));
+
+  // Pass 3: Core bodies — scf.for loop over KV blocks.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+    std::string q_subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", q_memref);
+    std::string kv_subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", kv_memref);
+    std::string o_subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", o_memref);
+
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%core_%d_%d = aie.core(%%%s) {\n", col, compute_row, compute));
+
+    // Acquire Q and O (held for entire computation).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%q_sub = aie.objectfifo.acquire @%s(Consume, 1) : %s\n"
+        "      %%q_buf = aie.objectfifo.subview.access %%q_sub[0] "
+        ": %s -> %s\n",
+        fifo_name(c, "in_q"), q_subview_ty, q_subview_ty, q_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%o_sub = aie.objectfifo.acquire @%s(Produce, 1) : %s\n"
+        "      %%o_buf = aie.objectfifo.subview.access %%o_sub[0] "
+        ": %s -> %s\n",
+        fifo_name(c, "out"), o_subview_ty, o_subview_ty, o_memref));
+
+    // Initialize O=0, state=(max=-large, sum=0).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%m_pc = arith.constant %d : i32\n"
+        "      %%sb_val = arith.constant %d : i32\n"
+        "      %%dk_val = arith.constant %d : i32\n",
+        m_per_core, sb, info.dk));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      func.call @attention_init_bf16(%%o_buf, %%state_%d, "
+        "%%m_pc, %%dk_val) : (%s, %s, i32, i32) -> ()\n",
+        c, o_memref, state_memref));
+
+    // scf.for loop over KV blocks.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%c0 = arith.constant 0 : index\n"
+        "      %%c1 = arith.constant 1 : index\n"
+        "      %%num_blocks = arith.constant %d : index\n",
+        num_blocks));
+    absl::StrAppend(&aie_mlir,
+        "      scf.for %b = %c0 to %num_blocks step %c1 {\n");
+
+    // Acquire KV (2 elements): slot[0]=K_block, slot[1]=V_block.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "        %%kv_sub = aie.objectfifo.acquire @in_kv(Consume, 2) : %s\n"
+        "        %%k_buf = aie.objectfifo.subview.access %%kv_sub[0] "
+        ": %s -> %s\n"
+        "        %%v_buf = aie.objectfifo.subview.access %%kv_sub[1] "
+        ": %s -> %s\n",
+        kv_subview_ty,
+        kv_subview_ty, kv_memref, kv_subview_ty, kv_memref));
+
+    // Call block kernel.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "        func.call @attention_block_bf16(%%q_buf, %%k_buf, %%v_buf, "
+        "%%o_buf, %%state_%d, %%m_pc, %%sb_val, %%dk_val) "
+        ": (%s, %s, %s, %s, %s, i32, i32, i32) -> ()\n",
+        c, q_memref, kv_memref, kv_memref, o_memref, state_memref));
+
+    // Release KV (2 elements).
+    absl::StrAppend(&aie_mlir,
+        "        aie.objectfifo.release @in_kv(Consume, 2)\n"
+        "      }\n");  // end scf.for
+
+    // Final normalization: O /= total_sum.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      func.call @attention_normalize_bf16(%%o_buf, %%state_%d, "
+        "%%m_pc, %%dk_val) : (%s, %s, i32, i32) -> ()\n",
+        c, o_memref, state_memref));
+
+    // Release Q and O.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aie.objectfifo.release @%s(Produce, 1)\n"
+        "      aie.objectfifo.release @%s(Consume, 1)\n",
+        fifo_name(c, "out"), fifo_name(c, "in_q")));
+    absl::StrAppend(&aie_mlir,
+        "      aie.end\n    } { stack_size = 0x2000 : i32 }\n");
+  }
+
+  // Runtime sequence (DMA): 4 args = Q, K, V, O.
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.runtime_sequence(%%arg0: %s, %%arg1: %s, %%arg2: %s, "
+      "%%arg3: %s) {\n",
+      q_host_memref, k_host_memref, v_host_memref, o_host_memref));
+
+  int dma_id = 0;
+
+  // Q per-column: sent first (needed before KV loop starts).
+  for (int c = 0; c < num_cores; c++) {
+    int64_t q_offset = c * m_per_core * info.dk;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg0"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        q_offset, m_per_core, info.dk, info.dk,
+        dma_id++, fifo_name(c, "in_q_L2"), q_host_memref));
+  }
+
+  // KV blocks interleaved: for each block, send K_block then V_block
+  // to the combined KV FIFO. K fills slot[0], V fills slot[1].
+  // CRITICAL: dma_wait after each K/V pair to prevent BD interference.
+  // Without this, the instruction processor submits later BDs before
+  // current ones complete, causing ERT_CMD_STATE_TIMEOUT with >2 blocks.
+  for (int64_t b = 0; b < num_blocks; b++) {
+    int64_t block_offset = b * sb * info.dk;
+    // K block → slot[0].
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg1"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @in_kv_L2, issue_token = true} : %s\n",
+        block_offset, sb, info.dk, info.dk, dma_id++, k_host_memref));
+    // V block → slot[1].
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg2"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @in_kv_L2, issue_token = true} : %s\n",
+        block_offset, sb, info.dk, info.dk, dma_id++, v_host_memref));
+    // Wait for this KV pair to complete before submitting the next.
+    absl::StrAppend(&aie_mlir,
+        "      aiex.npu.dma_wait { symbol = @in_kv_L2 }\n");
+  }
+
+  // O per-column.
+  for (int c = 0; c < num_cores; c++) {
+    int64_t o_offset = c * m_per_core * info.dk;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg3"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        o_offset, m_per_core, info.dk, info.dk,
+        dma_id++, fifo_name(c, "out_L2"), o_host_memref));
+  }
+
+  // Wait for all channels.
+  absl::StrAppend(&aie_mlir,
+      "      aiex.npu.dma_wait { symbol = @in_kv_L2 }\n");
+  for (int c = 0; c < num_cores; c++) {
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "in_q_L2")));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "out_L2")));
+  }
+
+  absl::StrAppend(&aie_mlir, "    }\n");  // end runtime_sequence
+  absl::StrAppend(&aie_mlir, "  }\n");    // end aie.device
+  absl::StrAppend(&aie_mlir, "}\n");      // end module
+
+  LOG(INFO) << "XDNA tiled attention lowering: generated AIE MLIR:\n"
+            << aie_mlir;
+
+  AieLoweringResult result;
+  result.aie_mlir = aie_mlir;
+  result.num_cores = num_cores;
+  result.needs_softfloat_stubs = true;
+  result.needs_attention_kernel = true;
+  result.attention_seq_len = info.seq_len;
+  result.attention_dk = info.dk;
+  result.attention_m_per_core = m_per_core;
+  result.attention_kv_block_size = sb;
+  // Sanity: the MLIR passes m_per_core/sb as runtime i32 args, but the kernel
+  // uses CONST_M_PC/CONST_SB compile-time defines. These must agree.
+  CHECK_GT(result.attention_m_per_core, 0);
+  CHECK_GT(result.attention_kv_block_size, 0);
+  CHECK_EQ(info.seq_len % sb, 0)
+      << "seq_len=" << info.seq_len << " not divisible by Sb=" << sb;
+  return result;
+}
+
 // Generates AIE MLIR for fused attention using an external C++ kernel.
 // Each core processes M_per_core rows of the attention output.
-// The kernel receives full K and V arrays and computes:
-//   O_row = softmax(Q_row @ K^T / sqrt(dk)) @ V
-// All intermediates (scores, softmax weights) stay in L1 stack.
+// For small seq_len (fits in L1): non-tiled path — full K/V in L1.
+// For large seq_len: tiled path — streams K/V blocks through L1.
 absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
     const AttentionProgramInfo& info, const TargetCaps& caps,
     int max_columns) {
@@ -2793,6 +3163,7 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
   }
   int64_t m_per_core = info.num_rows / num_cores;
 
+  // Check if non-tiled path fits in L1.
   // L1 budget: Q (depth 2) + KV (depth 2, holds K and V) + O (depth 2).
   // K and V share a single ObjectFIFO (depth=2): core acquires 2 elements,
   // slot[0]=K and slot[1]=V. Routed through mem tile (shim→mem→compute).
@@ -2800,14 +3171,18 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
   int64_t q_l1 = 2 * m_per_core * info.dk * 2;  // depth=2, 2 buffers
   int64_t kv_l1 = 3 * info.seq_len * info.dk * 2;  // depth=2 + acquire(2) → 3 buffers
   int64_t o_l1 = 2 * m_per_core * info.dk * 2;  // depth=2, 2 buffers
-  int64_t total_l1 = q_l1 + kv_l1 + o_l1;
+  int64_t non_tiled_l1 = q_l1 + kv_l1 + o_l1;
 
-  if (total_l1 > caps.l1_usable_bytes) {
-    return absl::InvalidArgumentError(absl::StrFormat(
-        "Fused attention L1 budget exceeded: M_pc=%d S=%d dk=%d needs %dB, "
-        "have %dB. Try smaller seq_len or dk.",
-        m_per_core, info.seq_len, info.dk, total_l1, caps.l1_usable_bytes));
+  if (non_tiled_l1 > caps.l1_usable_bytes) {
+    // Tiled path: stream K/V in blocks.
+    int64_t sb = SelectKvBlockSize(info.seq_len, info.dk, m_per_core,
+                                    caps.l1_usable_bytes);
+    LOG(INFO) << "XDNA attention: non-tiled L1=" << non_tiled_l1
+              << "B exceeds budget, using tiled path with Sb=" << sb;
+    return LowerTiledAttentionToAie(info, caps, num_cores, m_per_core, sb);
   }
+
+  // Non-tiled path: full K/V fit in L1.
 
   // DMA dimension limits.
   int64_t d0_words_dk = info.dk * 2 / 4;  // bf16 elements → 32-bit words
@@ -2833,7 +3208,7 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
             << " S=" << info.seq_len << " dk=" << info.dk
             << " using " << num_cores << " core(s) ("
             << m_per_core << " rows/core)"
-            << " L1=" << total_l1 << "B";
+            << " L1=" << non_tiled_l1 << "B";
 
   int start_col = caps.partition_start_column;
   int shim_row = caps.shim_row;

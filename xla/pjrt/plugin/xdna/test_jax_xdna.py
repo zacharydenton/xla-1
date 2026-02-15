@@ -826,6 +826,40 @@ def test_fused_attention_bf16_larger():
         np.array(result, dtype=np.float32), expected, atol=2.0)
 
 
+def test_fused_attention_bf16_128x64():
+    """Fused attention: bf16 seq_len=128, dk=64 — tiled KV blocks."""
+    import ml_dtypes
+    rng = np.random.RandomState(234)
+    seq_len, dk = 128, 64
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(dk))
+    attn = jax.jit(lambda q, k, v: jax.nn.softmax(
+        (q @ k.T) * scale) @ v)
+    result = attn(Q, K, V)
+    expected = _attention_ref(Q, K, V, dk)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=2.0)
+
+
+def test_fused_attention_bf16_256x64():
+    """Fused attention: bf16 seq_len=256, dk=64 — larger tiled attention."""
+    import ml_dtypes
+    rng = np.random.RandomState(235)
+    seq_len, dk = 256, 64
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(dk))
+    attn = jax.jit(lambda q, k, v: jax.nn.softmax(
+        (q @ k.T) * scale) @ v)
+    result = attn(Q, K, V)
+    expected = _attention_ref(Q, K, V, dk)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=2.0)
+
+
 def _gelu_ref(x):
     """CPU reference approximate GELU using numpy."""
     x_f32 = x.astype(np.float32)
@@ -1251,6 +1285,9 @@ def main():
         ("fused attention bf16 [64,32]", test_fused_attention_bf16_rectangular),
         ("fused attention bf16 [64,64]", test_fused_attention_bf16_multicore),
         ("fused attention bf16 [32,64]", test_fused_attention_bf16_larger),
+    ] + [
+        ("fused attention bf16 [128,64] tiled", test_fused_attention_bf16_128x64),
+        ("fused attention bf16 [256,64] tiled", test_fused_attention_bf16_256x64),
     ] + [
         ("masked attention rejected", test_masked_attention_rejected),
         ("custom scale attention rejected", test_custom_scale_attention_rejected),

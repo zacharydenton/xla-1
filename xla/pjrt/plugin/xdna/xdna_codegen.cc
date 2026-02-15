@@ -27,6 +27,7 @@ limitations under the License.
 #include <sys/wait.h>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -485,7 +486,7 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     bool needs_matmul_workarounds, bool needs_softfloat_stubs,
     bool needs_softmax_kernel, bool needs_attention_kernel,
     int64_t attention_seq_len, int64_t attention_dk,
-    int64_t attention_m_per_core,
+    int64_t attention_m_per_core, int64_t attention_kv_block_size,
     bool needs_gelu_kernel, bool needs_layernorm_kernel,
     int64_t layernorm_row_length) {
   // Create a temporary working directory.
@@ -688,32 +689,13 @@ extern "C" void softmax_bf16(bfloat16* __restrict input,
     float combined_scale = 1.4453125f / sqrtf(static_cast<float>(
         attention_dk));
 
-    // Generate the attention kernel C++ source.
-    // ONLINE SOFTMAX ATTENTION KERNEL (1-PASS, ALL VECTOR OPS)
-    // Three constraints drive this design:
-    // 1. Peano LLC miscompiles reduce_add → store-to-alloca (wrong values)
-    // 2. AIE2p has no scalar float arithmetic (__mulsf3/__addsf3 undefined)
-    // 3. Peano's VLIW scheduler miscompiles branches in compute-heavy loops
-    //    (causes NPU hang / ERT_CMD_STATE_TIMEOUT)
-    //
-    // Solution: online softmax (FlashAttention algorithm) processes each
-    // K/V row once, maintaining running max/sum and rescaling O when the
-    // max changes. The inner loop is branchless — max is computed via
-    // aie::max and both exp2 values are always evaluated. ALL arithmetic
-    // expressed as vector hardware ops.
-    // ~2x less compute than the 3-pass design it replaces.
-    std::string kernel_code = absl::StrFormat(
-        R"KERNEL(#include <aie_api/aie.hpp>
+    // Shared helper functions for both tiled and non-tiled kernels.
+    // All arithmetic uses vector hardware to avoid soft-float hangs.
+    std::string helpers_code = R"KERNEL(#include <aie_api/aie.hpp>
 #include <stdint.h>
 
 #define VL 32
-// Compile-time constants for loop bounds.
-// Prevents Peano's VLIW scheduler from miscompiling variable-bound loops.
-#define CONST_M_PC %d
-#define CONST_SEQ_LEN %d
 
-// Compute dot(Q_row, K_row) → bf16 via vectorized MAC + reduce_add.
-// Returns bf16 to avoid any scalar float arithmetic on the result.
 static inline bfloat16 dot_product_bf16(
     bfloat16* __restrict q_row,
     bfloat16* __restrict k_row,
@@ -724,12 +706,9 @@ static inline bfloat16 dot_product_bf16(
     auto kv = aie::load_v<VL>(k_row + d);
     acc = aie::mac(acc, qv, kv);
   }
-  // reduce_add returns float; truncate to bf16 immediately
   return (bfloat16)aie::reduce_add(acc.to_vector<float>());
 }
 
-// Scale a bf16 scalar by combined_scale using vector hardware MAC.
-// Returns bf16 — avoids scalar __mulsf3.
 static inline bfloat16 scale_bf16(bfloat16 val, bfloat16 scale) {
   auto vv = aie::broadcast<bfloat16, VL>(val);
   auto sv = aie::broadcast<bfloat16, VL>(scale);
@@ -737,8 +716,6 @@ static inline bfloat16 scale_bf16(bfloat16 val, bfloat16 scale) {
   return prod.to_vector<bfloat16>()[0];
 }
 
-// Compute exp2(a - b) as bf16 using vector hardware.
-// Returns bf16 — avoids scalar __subsf3.
 static inline bfloat16 exp2_diff_bf16(bfloat16 a, bfloat16 b) {
   auto av = aie::broadcast<bfloat16, VL>(a);
   auto bv = aie::broadcast<bfloat16, VL>(b);
@@ -748,8 +725,6 @@ static inline bfloat16 exp2_diff_bf16(bfloat16 a, bfloat16 b) {
   return exp_v[0];
 }
 
-// Multiply two bf16 scalars using vector hardware MAC.
-// Returns bf16 — avoids scalar __mulsf3.
 static inline bfloat16 mul_bf16(bfloat16 a, bfloat16 b) {
   auto av = aie::broadcast<bfloat16, VL>(a);
   auto bv = aie::broadcast<bfloat16, VL>(b);
@@ -757,8 +732,6 @@ static inline bfloat16 mul_bf16(bfloat16 a, bfloat16 b) {
   return prod.to_vector<bfloat16>()[0];
 }
 
-// Add two bf16 scalars using vector hardware accumulator.
-// Returns bf16 — avoids scalar __addsf3.
 static inline bfloat16 add_bf16(bfloat16 a, bfloat16 b) {
   auto av = aie::broadcast<bfloat16, VL>(a);
   aie::accum<accfloat, VL> acc(av, 0);
@@ -766,18 +739,121 @@ static inline bfloat16 add_bf16(bfloat16 a, bfloat16 b) {
   return acc.to_vector<bfloat16>()[0];
 }
 
-// Max of two bf16 scalars using vector hardware.
-// Avoids scalar float comparison (no __gtsf2).
 static inline bfloat16 max_bf16(bfloat16 a, bfloat16 b) {
   return aie::max(aie::broadcast<bfloat16, VL>(a),
                   aie::broadcast<bfloat16, VL>(b))[0];
 }
 
+)KERNEL";
+
+    std::string kernel_code;
+    if (attention_kv_block_size > 0) {
+      // TILED ATTENTION KERNEL (3 functions for streaming KV blocks).
+      // State layout: state[2*m] = max_val, state[2*m+1] = total_sum.
+      // NOTE: The kernel loop bounds use compile-time CONST_M_PC/CONST_SB
+      // (Peano VLIW scheduler requires fixed trip counts). The runtime
+      // m_pc/sb/dk args are passed for ABI consistency but ignored by the
+      // kernel — they must match the #define values baked here.
+      CHECK_GT(attention_m_per_core, 0);
+      CHECK_GT(attention_kv_block_size, 0);
+      CHECK_EQ(attention_seq_len % attention_kv_block_size, 0)
+          << "seq_len=" << attention_seq_len
+          << " not divisible by kv_block_size=" << attention_kv_block_size;
+      kernel_code = helpers_code + absl::StrFormat(
+          R"KERNEL(
+#define CONST_M_PC %d
+#define CONST_SB %d
+
+static const bfloat16 COMBINED_SCALE = (bfloat16)%ff;
+
+// Initialize O to zeros, state to (max=-large, sum=0).
+extern "C" void attention_init_bf16(
+    bfloat16* __restrict O,
+    bfloat16* __restrict state,
+    int32_t m_pc, int32_t dk) {
+  auto zero_v = aie::zeros<bfloat16, VL>();
+  for (int m = 0; m < CONST_M_PC; m++) {
+    for (int d = 0; d < dk; d += VL) {
+      aie::store_v(O + m * dk + d, zero_v);
+    }
+    // max_val = -16384 (large negative), total_sum = 0.
+    // Use -16384 instead of -inf to avoid NaN from exp2(-inf - (-inf)).
+    state[2 * m] = (bfloat16)(-16384.0f);
+    state[2 * m + 1] = (bfloat16)0.0f;
+  }
+}
+
+// Process one KV block (Sb rows), updating running online softmax state.
+extern "C" void attention_block_bf16(
+    bfloat16* __restrict Q,
+    bfloat16* __restrict K_block,
+    bfloat16* __restrict V_block,
+    bfloat16* __restrict O,
+    bfloat16* __restrict state,
+    int32_t m_pc, int32_t sb, int32_t dk) {
+
+  for (int m = 0; m < CONST_M_PC; m++) {
+    bfloat16* q_row = Q + m * dk;
+    bfloat16* o_row = O + m * dk;
+    bfloat16 max_val = state[2 * m];
+    bfloat16 total_sum = state[2 * m + 1];
+
+    for (int s = 0; s < CONST_SB; s++) {
+      bfloat16 score = scale_bf16(
+          dot_product_bf16(q_row, K_block + s * dk, dk), COMBINED_SCALE);
+
+      bfloat16 new_max = max_bf16(score, max_val);
+      bfloat16 correction = exp2_diff_bf16(max_val, new_max);
+      bfloat16 weight = exp2_diff_bf16(score, new_max);
+      max_val = new_max;
+      total_sum = add_bf16(mul_bf16(total_sum, correction), weight);
+
+      auto correction_v = aie::broadcast<bfloat16, VL>(correction);
+      auto weight_v = aie::broadcast<bfloat16, VL>(weight);
+      bfloat16* v_row = V_block + s * dk;
+      for (int d = 0; d < dk; d += VL) {
+        auto ov = aie::load_v<VL>(o_row + d);
+        auto vv = aie::load_v<VL>(v_row + d);
+        auto o_acc = aie::mul(ov, correction_v);
+        o_acc = aie::mac(o_acc, vv, weight_v);
+        aie::store_v(o_row + d, o_acc.to_vector<bfloat16>());
+      }
+    }
+
+    state[2 * m] = max_val;
+    state[2 * m + 1] = total_sum;
+  }
+}
+
+// Final normalization: O /= total_sum for each query row.
+extern "C" void attention_normalize_bf16(
+    bfloat16* __restrict O,
+    bfloat16* __restrict state,
+    int32_t m_pc, int32_t dk) {
+  for (int m = 0; m < CONST_M_PC; m++) {
+    bfloat16* o_row = O + m * dk;
+    bfloat16 total_sum = state[2 * m + 1];
+    bfloat16 inv_total = (bfloat16)aie::inv((float)total_sum);
+    auto inv_v = aie::broadcast<bfloat16, VL>(inv_total);
+    for (int d = 0; d < dk; d += VL) {
+      auto ov = aie::load_v<VL>(o_row + d);
+      aie::store_v(o_row + d, aie::mul(ov, inv_v).to_vector<bfloat16>());
+    }
+  }
+}
+)KERNEL", attention_m_per_core, attention_kv_block_size, combined_scale);
+    } else {
+      // NON-TILED ATTENTION KERNEL (single function, full K/V in L1).
+      kernel_code = helpers_code + absl::StrFormat(
+          R"KERNEL(
+#define CONST_M_PC %d
+#define CONST_SEQ_LEN %d
+
 extern "C" void attention_bf16(
-    bfloat16* __restrict Q,   // [M_per_core, dk] flat
-    bfloat16* __restrict K,   // [seq_len, dk] flat
-    bfloat16* __restrict V,   // [seq_len, dk] flat
-    bfloat16* __restrict O,   // [M_per_core, dk] flat
+    bfloat16* __restrict Q,
+    bfloat16* __restrict K,
+    bfloat16* __restrict V,
+    bfloat16* __restrict O,
     int32_t M_per_core,
     int32_t seq_len,
     int32_t dk) {
@@ -788,7 +864,6 @@ extern "C" void attention_bf16(
     bfloat16* q_row = Q + m * dk;
     bfloat16* o_row = O + m * dk;
 
-    // Initialize with first K/V row: max=score[0], sum=1, O=V[0].
     bfloat16 max_val = scale_bf16(
         dot_product_bf16(q_row, K, dk), combined_scale);
     bfloat16 total_sum = (bfloat16)1.0f;
@@ -796,9 +871,6 @@ extern "C" void attention_bf16(
       aie::store_v(o_row + d, aie::load_v<VL>(V + d));
     }
 
-    // Online softmax: single branchless pass over remaining K/V rows.
-    // Always computes both exp2 values to avoid branches that cause
-    // Peano's VLIW scheduler to miscompile.
     for (int s = 1; s < CONST_SEQ_LEN; s++) {
       bfloat16 score = scale_bf16(
           dot_product_bf16(q_row, K + s * dk, dk), combined_scale);
@@ -809,7 +881,6 @@ extern "C" void attention_bf16(
       max_val = new_max;
       total_sum = add_bf16(mul_bf16(total_sum, correction), weight);
 
-      // O = O * correction + weight * V[s]
       auto correction_v = aie::broadcast<bfloat16, VL>(correction);
       auto weight_v = aie::broadcast<bfloat16, VL>(weight);
       bfloat16* v_row = V + s * dk;
@@ -822,7 +893,6 @@ extern "C" void attention_bf16(
       }
     }
 
-    // Normalize: O /= total_sum
     bfloat16 inv_total = (bfloat16)aie::inv((float)total_sum);
     auto inv_v = aie::broadcast<bfloat16, VL>(inv_total);
     for (int d = 0; d < dk; d += VL) {
@@ -832,6 +902,7 @@ extern "C" void attention_bf16(
   }
 }
 )KERNEL", attention_m_per_core, attention_seq_len, combined_scale);
+    }
 
     TF_RETURN_IF_ERROR(WriteFile(kernel_src, kernel_code));
 
