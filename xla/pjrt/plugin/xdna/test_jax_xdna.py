@@ -860,6 +860,90 @@ def test_fused_attention_bf16_256x64():
         np.array(result, dtype=np.float32), expected, atol=2.0)
 
 
+def _causal_attention_ref(Q, K, V, dk):
+    """CPU reference for causal (masked) scaled dot-product attention."""
+    import ml_dtypes
+    Q_f32 = Q.astype(np.float32)
+    K_f32 = K.astype(np.float32)
+    V_f32 = V.astype(np.float32)
+    scale = 1.0 / np.sqrt(float(dk))
+    scores = Q_f32 @ K_f32.T * scale
+    S = scores.shape[0]
+    mask = np.triu(np.ones((S, S)), k=1).astype(bool)
+    scores = np.where(mask, -1e4, scores)
+    weights = _softmax_ref(scores.astype(ml_dtypes.bfloat16))
+    return weights @ V_f32
+
+
+def test_fused_causal_attention_bf16_basic():
+    """Causal fused attention: bf16 [32,32] — single JIT call with mask."""
+    import ml_dtypes
+    rng = np.random.RandomState(240)
+    seq_len, dk = 32, 32
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(dk))
+
+    def causal_attn(q, k, v):
+        S = q.shape[0]
+        mask = jnp.triu(jnp.ones((S, S), dtype=bool), k=1)
+        scores = (q @ k.T) * scale
+        scores = jnp.where(mask, jnp.bfloat16(-1e4), scores)
+        return jax.nn.softmax(scores) @ v
+
+    result = jax.jit(causal_attn)(Q, K, V)
+    expected = _causal_attention_ref(Q, K, V, dk)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=2.0)
+
+
+def test_fused_causal_attention_bf16_64x64():
+    """Causal fused attention: bf16 [64,64] — multi-core."""
+    import ml_dtypes
+    rng = np.random.RandomState(241)
+    seq_len, dk = 64, 64
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(dk))
+
+    def causal_attn(q, k, v):
+        S = q.shape[0]
+        mask = jnp.triu(jnp.ones((S, S), dtype=bool), k=1)
+        scores = (q @ k.T) * scale
+        scores = jnp.where(mask, jnp.bfloat16(-1e4), scores)
+        return jax.nn.softmax(scores) @ v
+
+    result = jax.jit(causal_attn)(Q, K, V)
+    expected = _causal_attention_ref(Q, K, V, dk)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=2.0)
+
+
+def test_fused_causal_attention_bf16_tiled():
+    """Causal fused attention: bf16 [128,64] — tiled KV blocks with causal mask."""
+    import ml_dtypes
+    rng = np.random.RandomState(242)
+    seq_len, dk = 128, 64
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(dk))
+
+    def causal_attn(q, k, v):
+        S = q.shape[0]
+        mask = jnp.triu(jnp.ones((S, S), dtype=bool), k=1)
+        scores = (q @ k.T) * scale
+        scores = jnp.where(mask, jnp.bfloat16(-1e4), scores)
+        return jax.nn.softmax(scores) @ v
+
+    result = jax.jit(causal_attn)(Q, K, V)
+    expected = _causal_attention_ref(Q, K, V, dk)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=2.0)
+
+
 def _gelu_ref(x):
     """CPU reference approximate GELU using numpy."""
     x_f32 = x.astype(np.float32)
@@ -1288,6 +1372,10 @@ def main():
     ] + [
         ("fused attention bf16 [128,64] tiled", test_fused_attention_bf16_128x64),
         ("fused attention bf16 [256,64] tiled", test_fused_attention_bf16_256x64),
+    ] + [
+        ("causal fused attention bf16 [32,32]", test_fused_causal_attention_bf16_basic),
+        ("causal fused attention bf16 [64,64]", test_fused_causal_attention_bf16_64x64),
+        ("causal fused attention bf16 [128,64] tiled", test_fused_causal_attention_bf16_tiled),
     ] + [
         ("masked attention rejected", test_masked_attention_rejected),
         ("custom scale attention rejected", test_custom_scale_attention_rejected),

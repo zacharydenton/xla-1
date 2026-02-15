@@ -487,6 +487,7 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     bool needs_softmax_kernel, bool needs_attention_kernel,
     int64_t attention_seq_len, int64_t attention_dk,
     int64_t attention_m_per_core, int64_t attention_kv_block_size,
+    bool attention_is_causal,
     bool needs_gelu_kernel, bool needs_layernorm_kernel,
     int64_t layernorm_row_length) {
   // Create a temporary working directory.
@@ -747,7 +748,193 @@ static inline bfloat16 max_bf16(bfloat16 a, bfloat16 b) {
 )KERNEL";
 
     std::string kernel_code;
-    if (attention_kv_block_size > 0) {
+    if (attention_is_causal && attention_kv_block_size > 0) {
+      // CAUSAL TILED ATTENTION KERNEL (3 functions for streaming KV blocks).
+      // Same structure as non-causal tiled, but attention_block_bf16 takes
+      // extra m_offset/s_offset params for causal masking.
+      // Positions where s_global > m_global are masked to -16384 (large
+      // negative that exp2(-16384 - max) ≈ 0 in online softmax).
+      CHECK_GT(attention_m_per_core, 0);
+      CHECK_GT(attention_kv_block_size, 0);
+      CHECK_EQ(attention_seq_len % attention_kv_block_size, 0)
+          << "seq_len=" << attention_seq_len
+          << " not divisible by kv_block_size=" << attention_kv_block_size;
+      kernel_code = helpers_code + absl::StrFormat(
+          R"KERNEL(
+#define CONST_M_PC %d
+#define CONST_SB %d
+
+static const bfloat16 COMBINED_SCALE = (bfloat16)%ff;
+
+// Initialize O to zeros, state to (max=-large, sum=0).
+// Causal: m_pc carries m_offset; stored at state[2*CONST_M_PC] for block.
+extern "C" void attention_init_bf16(
+    bfloat16* __restrict O,
+    bfloat16* __restrict state,
+    int32_t m_pc, int32_t dk) {
+  auto zero_v = aie::zeros<bfloat16, VL>();
+  for (int m = 0; m < CONST_M_PC; m++) {
+    for (int d = 0; d < dk; d += VL) {
+      aie::store_v(O + m * dk + d, zero_v);
+    }
+    state[2 * m] = (bfloat16)(-16384.0f);
+    state[2 * m + 1] = (bfloat16)0.0f;
+  }
+  // Store m_offset for causal block kernel (memcpy avoids strict-aliasing UB).
+  __builtin_memcpy(state + 2 * CONST_M_PC, &m_pc, sizeof(int32_t));
+}
+
+// Process one KV block with causal masking.
+// m_offset from state buffer (set by init).
+// s_offset passed as function parameter (sb param repurposed).
+// Fixed CONST_SB loop; masked positions get score = -16384.
+extern "C" void attention_block_bf16(
+    bfloat16* __restrict Q,
+    bfloat16* __restrict K_block,
+    bfloat16* __restrict V_block,
+    bfloat16* __restrict O,
+    bfloat16* __restrict state,
+    int32_t m_pc, int32_t sb, int32_t dk) {
+
+  // m_offset from state buffer; s_offset passed as function parameter
+  // (replacing the sb param; sb is compile-time CONST_SB).
+  int32_t m_offset;
+  __builtin_memcpy(&m_offset, state + 2 * CONST_M_PC, sizeof(int32_t));
+  int32_t s_offset = sb;  // sb param carries s_offset for causal
+
+  for (int m = 0; m < CONST_M_PC; m++) {
+    bfloat16* q_row = Q + m * dk;
+    bfloat16* o_row = O + m * dk;
+    bfloat16 max_val = state[2 * m];
+    bfloat16 total_sum = state[2 * m + 1];
+    int32_t m_global = m_offset + m;
+    // Pre-compute adjusted threshold outside inner loop.
+    // Using (s <= adjusted_m) instead of (s_offset + s <= m_global)
+    // avoids a Peano VLIW miscompilation with 3-operand comparisons.
+    int32_t adjusted_m = m_global - s_offset;
+
+    for (int s = 0; s < CONST_SB; s++) {
+      // Causal masking: masked positions get -16384 (exp2(-16384-max)≈0).
+      // Uses 2-operand comparison (s <= adjusted_m) which Peano handles
+      // correctly, unlike 3-operand (s_offset+s <= m_global) or branchless
+      // integer bit-select patterns which both cause VLIW miscompilation.
+      bfloat16 score;
+      if (s <= adjusted_m) {
+        score = scale_bf16(
+            dot_product_bf16(q_row, K_block + s * dk, dk), COMBINED_SCALE);
+      } else {
+        score = (bfloat16)(-16384.0f);
+      }
+
+      bfloat16 new_max = max_bf16(score, max_val);
+      bfloat16 correction = exp2_diff_bf16(max_val, new_max);
+      bfloat16 weight = exp2_diff_bf16(score, new_max);
+      max_val = new_max;
+      total_sum = add_bf16(mul_bf16(total_sum, correction), weight);
+
+      auto correction_v = aie::broadcast<bfloat16, VL>(correction);
+      auto weight_v = aie::broadcast<bfloat16, VL>(weight);
+      bfloat16* v_row = V_block + s * dk;
+      for (int d = 0; d < dk; d += VL) {
+        auto ov = aie::load_v<VL>(o_row + d);
+        auto vv = aie::load_v<VL>(v_row + d);
+        auto o_acc = aie::mul(ov, correction_v);
+        o_acc = aie::mac(o_acc, vv, weight_v);
+        aie::store_v(o_row + d, o_acc.to_vector<bfloat16>());
+      }
+    }
+
+    state[2 * m] = max_val;
+    state[2 * m + 1] = total_sum;
+  }
+}
+
+// Final normalization: O /= total_sum for each query row.
+extern "C" void attention_normalize_bf16(
+    bfloat16* __restrict O,
+    bfloat16* __restrict state,
+    int32_t m_pc, int32_t dk) {
+  for (int m = 0; m < CONST_M_PC; m++) {
+    bfloat16* o_row = O + m * dk;
+    bfloat16 total_sum = state[2 * m + 1];
+    bfloat16 inv_total = (bfloat16)aie::inv((float)total_sum);
+    auto inv_v = aie::broadcast<bfloat16, VL>(inv_total);
+    for (int d = 0; d < dk; d += VL) {
+      auto ov = aie::load_v<VL>(o_row + d);
+      aie::store_v(o_row + d, aie::mul(ov, inv_v).to_vector<bfloat16>());
+    }
+  }
+}
+)KERNEL", attention_m_per_core, attention_kv_block_size, combined_scale);
+    } else if (attention_is_causal) {
+      // CAUSAL NON-TILED ATTENTION KERNEL.
+      // Instead of masking scores with a sentinel value (which causes Peano
+      // VLIW miscompilation at larger trip counts), we simply loop only over
+      // unmasked positions: s = 0..m_global. Since exp(-16384) ≈ 0, skipping
+      // masked positions produces identical results. The inner loop body is
+      // the same as the non-causal kernel — no conditional masking code.
+      kernel_code = helpers_code + absl::StrFormat(
+          R"KERNEL(
+#define CONST_M_PC %d
+
+extern "C" void attention_bf16(
+    bfloat16* __restrict Q,
+    bfloat16* __restrict K,
+    bfloat16* __restrict V,
+    bfloat16* __restrict O,
+    int32_t M_per_core,
+    int32_t seq_len,
+    int32_t dk,
+    int32_t m_offset) {
+
+  const bfloat16 combined_scale = (bfloat16)%ff;
+
+  for (int m = 0; m < CONST_M_PC; m++) {
+    bfloat16* q_row = Q + m * dk;
+    bfloat16* o_row = O + m * dk;
+    int32_t m_global = m_offset + m;
+
+    auto zero_v = aie::zeros<bfloat16, VL>();
+    for (int d = 0; d < dk; d += VL) {
+      aie::store_v(o_row + d, zero_v);
+    }
+    bfloat16 max_val = (bfloat16)(-16384.0f);
+    bfloat16 total_sum = (bfloat16)0.0f;
+
+    // Causal: only attend to positions s <= m_global (lower triangle).
+    // Positions s > m_global have zero weight, so skipping them is exact.
+    for (int s = 0; s <= m_global; s++) {
+      bfloat16 score = scale_bf16(
+          dot_product_bf16(q_row, K + s * dk, dk), combined_scale);
+
+      bfloat16 new_max = max_bf16(score, max_val);
+      bfloat16 correction = exp2_diff_bf16(max_val, new_max);
+      bfloat16 weight = exp2_diff_bf16(score, new_max);
+      max_val = new_max;
+      total_sum = add_bf16(mul_bf16(total_sum, correction), weight);
+
+      auto correction_v = aie::broadcast<bfloat16, VL>(correction);
+      auto weight_v = aie::broadcast<bfloat16, VL>(weight);
+      bfloat16* v_row = V + s * dk;
+      for (int d = 0; d < dk; d += VL) {
+        auto ov = aie::load_v<VL>(o_row + d);
+        auto vv = aie::load_v<VL>(v_row + d);
+        auto o_acc = aie::mul(ov, correction_v);
+        o_acc = aie::mac(o_acc, vv, weight_v);
+        aie::store_v(o_row + d, o_acc.to_vector<bfloat16>());
+      }
+    }
+
+    bfloat16 inv_total = (bfloat16)aie::inv((float)total_sum);
+    auto inv_v = aie::broadcast<bfloat16, VL>(inv_total);
+    for (int d = 0; d < dk; d += VL) {
+      auto ov = aie::load_v<VL>(o_row + d);
+      aie::store_v(o_row + d, aie::mul(ov, inv_v).to_vector<bfloat16>());
+    }
+  }
+}
+)KERNEL", attention_m_per_core, combined_scale);
+    } else if (attention_kv_block_size > 0) {
       // TILED ATTENTION KERNEL (3 functions for streaming KV blocks).
       // State layout: state[2*m] = max_val, state[2*m+1] = total_sum.
       // NOTE: The kernel loop bounds use compile-time CONST_M_PC/CONST_SB
@@ -927,12 +1114,15 @@ extern "C" void attention_bf16(
         absl::StrFormat("Step %d/%d: Attention opt",
                         step++, total_compile_steps)));
 
+    // Default -O2; override with XDNA_ATTN_LLC_OPT env var for debugging.
+    const char* llc_env = std::getenv("XDNA_ATTN_LLC_OPT");
+    std::string attn_llc_opt = llc_env ? llc_env : "-O2";
     TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
         GetPeanoLlcPath(),
-        " -O2 --aie-loop-aware=false -filetype=obj ",
+        " ", attn_llc_opt, " --aie-loop-aware=false -filetype=obj ",
         kernel_bc, " -o ", attention_kernel_obj),
-        absl::StrFormat("Step %d/%d: Attention llc",
-                        step++, total_compile_steps)));
+        absl::StrFormat("Step %d/%d: Attention llc (%s)",
+                        step++, total_compile_steps, attn_llc_opt)));
   }
 
   // -----------------------------------------------------------------------

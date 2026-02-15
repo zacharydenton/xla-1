@@ -33,6 +33,8 @@ limitations under the License.
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -191,6 +193,7 @@ struct AttentionProgramInfo {
   int64_t seq_len;       // S dimension (K/V rows, scores width)
   int64_t dk;            // shared dimension (Q/K/V columns)
   std::string element_type;  // "bf16" only
+  bool is_causal = false;  // Upper-triangular causal mask detected.
 };
 
 // GELU program description for AIE lowering.
@@ -2513,6 +2516,223 @@ std::optional<SoftmaxProgramInfo> DetectSoftmax(mlir::ModuleOp module) {
   return sinfo;
 }
 
+// Helper: classify a Value as a 2D broadcast of a 1D iota (index vector).
+// Returns 0 if not an index tensor, 1 if row indices, 2 if column indices.
+// XLA lowers jnp.triu into: iota (linalg.index 0 → i32) → broadcast to 2D.
+// The broadcast indexing map determines row vs column:
+//   (d0, d1) -> (d0) = row indices,  (d0, d1) -> (d1) = column indices.
+static int ClassifyIndexTensor(mlir::Value val) {
+  auto* def = val.getDefiningOp();
+  if (!def) return 0;
+  auto bcast = mlir::dyn_cast<mlir::linalg::GenericOp>(def);
+  if (!bcast) return 0;
+
+  // Must be a broadcast: 1 input (1D i32), 1 output (2D i32), body = yield.
+  if (bcast.getInputs().size() != 1) return 0;
+  auto in_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      bcast.getInputs()[0].getType());
+  auto out_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      bcast.getResult(0).getType());
+  if (!in_type || !out_type) return 0;
+  if (in_type.getRank() != 1 || out_type.getRank() != 2) return 0;
+
+  // Body should be a pure yield (broadcast — no computation).
+  mlir::Block& body = bcast.getRegion().front();
+  auto body_ops = body.without_terminator();
+  if (body_ops.begin() != body_ops.end()) return 0;
+
+  // Input indexing map determines row vs column broadcast.
+  auto maps = bcast.getIndexingMapsArray();
+  if (maps.empty()) return 0;
+  auto in_map = maps[0];
+  if (in_map.getNumResults() != 1) return 0;
+  auto dim = mlir::dyn_cast<mlir::AffineDimExpr>(in_map.getResult(0));
+  if (!dim) return 0;
+
+  // Verify the 1D source is an iota pattern (contains linalg.index).
+  auto* iota_def = bcast.getInputs()[0].getDefiningOp();
+  if (!iota_def) return 0;
+  auto iota = mlir::dyn_cast<mlir::linalg::GenericOp>(iota_def);
+  if (!iota) return 0;
+  bool has_index = false;
+  for (auto& op : iota.getRegion().front()) {
+    if (mlir::isa<mlir::linalg::IndexOp>(&op)) has_index = true;
+  }
+  if (!has_index) return 0;
+
+  if (dim.getPosition() == 0) return 1;  // row broadcast
+  if (dim.getPosition() == 1) return 2;  // column broadcast
+  return 0;
+}
+
+// Detects whether the attention module has a causal (upper-triangular) mask.
+// XLA decomposes jnp.triu(jnp.ones((S,S), bool), k=1) into multiple separate
+// linalg.generic ops:
+//   1. iota (linalg.index 0) → 1D row/col index vectors
+//   2. broadcast to 2D via (d0,d1)->(d0) or (d0,d1)->(d1)
+//   3. arith.cmpi sge (row_indices, col_indices) → lower triangle
+//   4. arith.select(lower_tri, false, true) → upper triangle
+//   5. arith.select(upper_tri, neg_value, scores) → masked scores
+//
+// Strategy 1: Find a generic whose body contains arith.cmpi with row/col
+//   index tensor inputs (traced through broadcast→iota via ClassifyIndexTensor).
+//   The cmpi and select are in SEPARATE generics (XLA does not fuse them).
+// Strategy 2: Constant boolean tensor input that is upper-triangular.
+bool DetectCausalMask(mlir::func::FuncOp entry_func, int64_t M, int64_t S) {
+  // Causal masking only makes sense for self-attention (M == S).
+  if (M != S) {
+    LOG(INFO) << "XDNA: M=" << M << " != S=" << S
+              << ", not self-attention — cannot be causal";
+    return false;
+  }
+
+  bool found_causal = false;
+  entry_func.walk([&](mlir::linalg::GenericOp generic) {
+    if (found_causal) return;
+    mlir::Block& body = generic.getRegion().front();
+
+    // Strategy 1: Find arith.cmpi in body that compares row vs column indices.
+    // XLA decomposes the mask into separate generics, so the cmpi is in its
+    // own generic that takes 2D broadcast index tensors as inputs.
+    // We validate:
+    //   (a) Both operands trace through broadcast→iota to row/col indices
+    //   (b) Predicate is consistent with causal masking (k=1):
+    //       slt(row,col) or sgt(col,row) → upper triangle (strict)
+    //       sge(row,col) or sle(col,row) → lower triangle (complement)
+    //   (c) The cmpi result reaches a bf16 arith.select (score masking)
+    // CmpIPredicate enum: eq=0, ne=1, slt=2, sle=3, sgt=4, sge=5.
+    for (mlir::Operation& op : body.without_terminator()) {
+      if (op.getName().getStringRef() != "arith.cmpi") continue;
+
+      auto lhs_arg = mlir::dyn_cast<mlir::BlockArgument>(op.getOperand(0));
+      auto rhs_arg = mlir::dyn_cast<mlir::BlockArgument>(op.getOperand(1));
+      if (!lhs_arg || !rhs_arg) continue;
+      unsigned lhs_idx = lhs_arg.getArgNumber();
+      unsigned rhs_idx = rhs_arg.getArgNumber();
+      if (lhs_idx >= generic.getInputs().size()) continue;
+      if (rhs_idx >= generic.getInputs().size()) continue;
+
+      int lhs_class = ClassifyIndexTensor(generic.getInputs()[lhs_idx]);
+      int rhs_class = ClassifyIndexTensor(generic.getInputs()[rhs_idx]);
+
+      // One must be row indices (1), other must be column indices (2).
+      if (!((lhs_class == 1 && rhs_class == 2) ||
+            (lhs_class == 2 && rhs_class == 1))) {
+        continue;
+      }
+
+      // Validate predicate direction for causal masking.
+      auto pred_attr = op.getAttrOfType<mlir::IntegerAttr>("predicate");
+      if (!pred_attr) continue;
+      int64_t pred = pred_attr.getInt();
+
+      bool valid_causal = false;
+      if (lhs_class == 1 && rhs_class == 2) {
+        // lhs=row, rhs=col: slt (row < col) or sge (row >= col)
+        valid_causal = (pred == 2 || pred == 5);
+      } else {
+        // lhs=col, rhs=row: sgt (col > row) or sle (col <= row)
+        valid_causal = (pred == 4 || pred == 3);
+      }
+      if (!valid_causal) continue;
+
+      // Verify the cmpi result reaches a bf16 arith.select (the score
+      // masking op). BFS through tensor-level SSA users of this generic's
+      // result, following through intermediate generics (e.g., the i1
+      // mask-inversion select), until we find a generic whose body has
+      // arith.select on bf16.
+      bool reaches_bf16_select = false;
+      llvm::SmallVector<mlir::Value, 8> worklist;
+      llvm::SmallPtrSet<mlir::Operation*, 8> visited;
+      worklist.push_back(generic.getResult(0));
+      while (!worklist.empty() && !reaches_bf16_select) {
+        mlir::Value v = worklist.pop_back_val();
+        for (mlir::Operation* user : v.getUsers()) {
+          if (!visited.insert(user).second) continue;
+          auto user_generic =
+              mlir::dyn_cast<mlir::linalg::GenericOp>(user);
+          if (!user_generic) continue;
+          mlir::Block& ubody = user_generic.getRegion().front();
+          for (mlir::Operation& uop : ubody.without_terminator()) {
+            if (uop.getName().getStringRef() == "arith.select" &&
+                uop.getOperand(1).getType().isF16() == false &&
+                uop.getOperand(1).getType().isBF16()) {
+              reaches_bf16_select = true;
+              break;
+            }
+          }
+          // Follow through this generic's results for transitive users.
+          for (mlir::OpResult res : user_generic->getResults()) {
+            worklist.push_back(res);
+          }
+        }
+      }
+      if (!reaches_bf16_select) continue;
+
+      LOG(INFO) << "XDNA: detected causal mask via row/col index comparison"
+                << " (pred=" << pred << ", lhs=" << lhs_class
+                << ", rhs=" << rhs_class << ")";
+      found_causal = true;
+      return;
+    }
+
+    // Strategy 2: Constant boolean tensor input that is upper-triangular.
+    // (Handles potential future XLA constant-folding of the mask.)
+    mlir::Value select_cond;
+    for (mlir::Operation& op : body.without_terminator()) {
+      if (op.getName().getStringRef() == "arith.select") {
+        select_cond = op.getOperand(0);
+        break;
+      }
+    }
+    if (!select_cond) return;
+    if (auto block_arg = mlir::dyn_cast<mlir::BlockArgument>(select_cond)) {
+      unsigned arg_idx = block_arg.getArgNumber();
+      if (arg_idx < generic.getInputs().size()) {
+        mlir::Value input = generic.getInputs()[arg_idx];
+        if (auto* def_op = input.getDefiningOp()) {
+          if (def_op->getName().getStringRef() == "arith.constant") {
+            auto attr = def_op->getAttr("value");
+            auto dense = mlir::dyn_cast_or_null<mlir::DenseElementsAttr>(attr);
+            if (dense) {
+              auto shaped = dense.getType();
+              if (shaped.getRank() == 2 &&
+                  shaped.getDimSize(0) == M &&
+                  shaped.getDimSize(1) == S) {
+                // Verify upper-triangular: true above diagonal, false on/below.
+                bool is_upper_tri = true;
+                int64_t idx = 0;
+                for (int64_t r = 0; r < M && is_upper_tri; r++) {
+                  for (int64_t c = 0; c < S && is_upper_tri; c++, idx++) {
+                    bool expected = (c > r);
+                    bool actual;
+                    if (dense.getElementType().isInteger(1)) {
+                      actual = dense.getValues<bool>()[idx];
+                    } else if (dense.getElementType().isIntOrIndex()) {
+                      actual = dense.getValues<mlir::APInt>()[idx].getBoolValue();
+                    } else {
+                      is_upper_tri = false;
+                      break;
+                    }
+                    if (actual != expected) is_upper_tri = false;
+                  }
+                }
+                if (is_upper_tri) {
+                  LOG(INFO) << "XDNA: detected causal mask via constant tensor";
+                  found_causal = true;
+                  return;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+
+  return found_causal;
+}
+
 // Detects a fused attention pattern: softmax(Q @ K^T * scale) @ V.
 // The module must contain exactly 2 linalg.matmul ops, a transpose generic
 // feeding the first matmul's B input, and softmax-like ops (reduce(maximumf),
@@ -2522,12 +2742,19 @@ std::optional<AttentionProgramInfo> DetectAttention(mlir::ModuleOp module) {
   module.walk([&](mlir::func::FuncOp func) {
     if (func.getName() == "main" || !entry_func) entry_func = func;
   });
-  if (!entry_func) return std::nullopt;
+  if (!entry_func) {
+    LOG(INFO) << "XDNA DetectAttention: no entry func";
+    return std::nullopt;
+  }
 
   // Verify function signature: 3 input tensors, 1 result tensor.
   auto func_type = entry_func.getFunctionType();
-  if (func_type.getNumInputs() != 3 || func_type.getNumResults() != 1)
+  if (func_type.getNumInputs() != 3 || func_type.getNumResults() != 1) {
+    LOG(INFO) << "XDNA DetectAttention: sig mismatch inputs="
+               << func_type.getNumInputs() << " results="
+               << func_type.getNumResults();
     return std::nullopt;
+  }
 
   // All inputs must be 2D bf16 ranked tensors.
   for (unsigned i = 0; i < 3; i++) {
@@ -2551,7 +2778,7 @@ std::optional<AttentionProgramInfo> DetectAttention(mlir::ModuleOp module) {
   entry_func.walk([&](mlir::Operation* op) {
     llvm::StringRef name = op->getName().getStringRef();
     if (!name.starts_with("linalg.")) return;
-    if (name == "linalg.yield") return;
+    if (name == "linalg.yield" || name == "linalg.index") return;
     if (name == "linalg.fill") {
       fill_count++;
     } else if (name == "linalg.matmul") {
@@ -2565,11 +2792,22 @@ std::optional<AttentionProgramInfo> DetectAttention(mlir::ModuleOp module) {
   });
 
   // Must have exactly 2 matmuls, no other linalg ops (e.g., conv).
-  if (matmul_count != 2 || other_linalg_count != 0) return std::nullopt;
+  if (matmul_count != 2 || other_linalg_count != 0) {
+    LOG(INFO) << "XDNA DetectAttention: op counts matmul=" << matmul_count
+               << " other=" << other_linalg_count
+               << " fill=" << fill_count << " generic=" << generic_count;
+    return std::nullopt;
+  }
   // At least 2 fills (one per matmul), plus generics for transpose/scale/softmax.
-  if (fill_count < 2) return std::nullopt;
+  if (fill_count < 2) {
+    LOG(INFO) << "XDNA DetectAttention: fill_count=" << fill_count;
+    return std::nullopt;
+  }
   // Softmax decomposes into ~10 generics + transpose + scale = ~12+ generics.
-  if (generic_count < 5) return std::nullopt;
+  if (generic_count < 5) {
+    LOG(INFO) << "XDNA DetectAttention: generic_count=" << generic_count;
+    return std::nullopt;
+  }
 
   // Check for softmax markers in the generics.
   bool has_max_reduce = false, has_exp = false;
@@ -2600,9 +2838,8 @@ std::optional<AttentionProgramInfo> DetectAttention(mlir::ModuleOp module) {
     return std::nullopt;
   }
 
-  // Reject masked attention: arith.select in any generic body means a mask
-  // is applied (e.g., causal mask via jnp.where). We cannot fuse this because
-  // the kernel hardcodes unmasked attention.
+  // Check for masking (arith.select). If present, try to detect a causal
+  // (upper-triangular) mask pattern. Non-causal masks are rejected.
   bool has_select = false;
   entry_func.walk([&](mlir::linalg::GenericOp generic) {
     mlir::Block& body = generic.getRegion().front();
@@ -2611,10 +2848,49 @@ std::optional<AttentionProgramInfo> DetectAttention(mlir::ModuleOp module) {
         has_select = true;
     }
   });
+  bool is_causal = false;
   if (has_select) {
-    LOG(INFO) << "XDNA: attention has masking (arith.select) — "
-              << "not fusing (would drop mask)";
-    return std::nullopt;
+    // Dimensions not yet extracted — we need them for DetectCausalMask.
+    // Peek at matmul shapes to get M and S for the causal check.
+    auto peek_q = mlir::dyn_cast<mlir::RankedTensorType>(
+        matmul_ops[0]->getOperand(0).getType());
+    auto peek_kt = mlir::dyn_cast<mlir::RankedTensorType>(
+        matmul_ops[0]->getOperand(1).getType());
+    if (!peek_q || !peek_kt || peek_q.getRank() != 2 || peek_kt.getRank() != 2) {
+      LOG(INFO) << "XDNA: attention has masking but can't peek dimensions";
+      return std::nullopt;
+    }
+    // Determine matmul order: the matmul whose result feeds the return is #2.
+    int64_t peek_M, peek_S;
+    bool m1_feeds_return = false;
+    for (mlir::Operation* user : matmul_ops[0]->getResult(0).getUsers()) {
+      if (mlir::isa<mlir::func::ReturnOp>(user)) m1_feeds_return = true;
+      if (user->getName().getStringRef() == "stablehlo.custom_call") {
+        for (mlir::Operation* inner : user->getResult(0).getUsers()) {
+          if (mlir::isa<mlir::func::ReturnOp>(inner)) m1_feeds_return = true;
+        }
+      }
+    }
+    if (m1_feeds_return) {
+      // matmul_ops[1] is the Q@K^T matmul
+      auto q2 = mlir::dyn_cast<mlir::RankedTensorType>(
+          matmul_ops[1]->getOperand(0).getType());
+      auto kt2 = mlir::dyn_cast<mlir::RankedTensorType>(
+          matmul_ops[1]->getOperand(1).getType());
+      if (!q2 || !kt2) { return std::nullopt; }
+      peek_M = q2.getShape()[0];
+      peek_S = kt2.getShape()[1];
+    } else {
+      peek_M = peek_q.getShape()[0];
+      peek_S = peek_kt.getShape()[1];
+    }
+    is_causal = DetectCausalMask(entry_func, peek_M, peek_S);
+    if (!is_causal) {
+      LOG(INFO) << "XDNA: attention has non-causal masking (arith.select) — "
+                << "not fusing";
+      return std::nullopt;
+    }
+    LOG(INFO) << "XDNA: detected causal mask in attention pattern";
   }
 
   // Check for transpose generic that feeds the first matmul's B input.
@@ -2768,13 +3044,15 @@ std::optional<AttentionProgramInfo> DetectAttention(mlir::ModuleOp module) {
   }
 
   LOG(INFO) << "XDNA: detected fused attention pattern: M=" << M
-            << " S=" << S << " dk=" << dk;
+            << " S=" << S << " dk=" << dk
+            << (is_causal ? " (causal)" : "");
 
   AttentionProgramInfo info;
   info.num_rows = M;
   info.seq_len = S;
   info.dk = dk;
   info.element_type = "bf16";
+  info.is_causal = is_causal;
   return info;
 }
 
@@ -2857,8 +3135,10 @@ absl::StatusOr<AieLoweringResult> LowerTiledAttentionToAie(
   std::string o_memref = absl::StrFormat("memref<%dxbf16>",
                                           m_per_core * info.dk);
   // State buffer: 2 bf16 per query row (max_val + total_sum).
-  std::string state_memref = absl::StrFormat("memref<%dxbf16>",
-                                              m_per_core * 2);
+  // Causal: +4 bf16 slots for m_offset (2 slots = i32) + block_counter (2 slots = i32).
+  // Causal: +2 bf16 slots for m_offset (1 i32 = 2 bf16).
+  int64_t state_elems = m_per_core * 2 + (info.is_causal ? 2 : 0);
+  std::string state_memref = absl::StrFormat("memref<%dxbf16>", state_elems);
 
   // Host buffer types.
   int64_t q_total = info.num_rows * info.dk;
@@ -2959,10 +3239,13 @@ absl::StatusOr<AieLoweringResult> LowerTiledAttentionToAie(
   }
 
   // External function declarations for tiled attention kernel.
-  // CONTRACT: The kernel ignores m_pc/sb/dk runtime args — loop bounds use
-  // compile-time CONST_M_PC/CONST_SB (#define) for Peano VLIW stability.
-  // The values passed here MUST match attention_m_per_core/attention_kv_block_size
-  // in the AieLoweringResult so that xdna_codegen.cc bakes the same constants.
+  // CONTRACT: The kernel loop bounds use compile-time CONST_M_PC/CONST_SB
+  // (#define) for Peano VLIW stability. The i32 args have different meanings:
+  //   Non-causal: (m_pc, sb, dk) — unused by kernel, must match compile-time.
+  //   Causal:     (m_offset, s_offset, dk) — m_pc/sb slots repurposed for
+  //               causal offsets since the kernel ignores them anyway.
+  // Same function signature for both cases (8 params) to stay within AIE ABI
+  // register limits.
   absl::StrAppend(&aie_mlir, absl::StrFormat(
       "    func.func private @attention_init_bf16(%s, %s, i32, i32) -> ()\n",
       o_memref, state_memref));
@@ -3006,10 +3289,22 @@ absl::StatusOr<AieLoweringResult> LowerTiledAttentionToAie(
         "      %%sb_val = arith.constant %d : i32\n"
         "      %%dk_val = arith.constant %d : i32\n",
         m_per_core, sb, info.dk));
-    absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "      func.call @attention_init_bf16(%%o_buf, %%state_%d, "
-        "%%m_pc, %%dk_val) : (%s, %s, i32, i32) -> ()\n",
-        c, o_memref, state_memref));
+    if (info.is_causal) {
+      // Causal: pass m_offset (= c * m_per_core) as the m_pc arg to init.
+      // Init stores it in the state buffer for the block kernel to read.
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "      %%m_offset = arith.constant %d : i32\n",
+          c * m_per_core));
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "      func.call @attention_init_bf16(%%o_buf, %%state_%d, "
+          "%%m_offset, %%dk_val) : (%s, %s, i32, i32) -> ()\n",
+          c, o_memref, state_memref));
+    } else {
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "      func.call @attention_init_bf16(%%o_buf, %%state_%d, "
+          "%%m_pc, %%dk_val) : (%s, %s, i32, i32) -> ()\n",
+          c, o_memref, state_memref));
+    }
 
     // scf.for loop over KV blocks.
     absl::StrAppend(&aie_mlir, absl::StrFormat(
@@ -3030,12 +3325,24 @@ absl::StatusOr<AieLoweringResult> LowerTiledAttentionToAie(
         kv_subview_ty,
         kv_subview_ty, kv_memref, kv_subview_ty, kv_memref));
 
-    // Call block kernel.
-    absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "        func.call @attention_block_bf16(%%q_buf, %%k_buf, %%v_buf, "
-        "%%o_buf, %%state_%d, %%m_pc, %%sb_val, %%dk_val) "
-        ": (%s, %s, %s, %s, %s, i32, i32, i32) -> ()\n",
-        c, q_memref, kv_memref, kv_memref, o_memref, state_memref));
+    // Call block kernel. Same 8-param signature for causal and non-causal.
+    // Causal: pass s_offset (= b * sb) as 7th param instead of sb_val.
+    if (info.is_causal) {
+      absl::StrAppend(&aie_mlir,
+          "        %b_idx = arith.index_cast %b : index to i32\n"
+          "        %s_offset = arith.muli %b_idx, %sb_val : i32\n");
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "        func.call @attention_block_bf16(%%q_buf, %%k_buf, %%v_buf, "
+          "%%o_buf, %%state_%d, %%m_pc, %%s_offset, %%dk_val) "
+          ": (%s, %s, %s, %s, %s, i32, i32, i32) -> ()\n",
+          c, q_memref, kv_memref, kv_memref, o_memref, state_memref));
+    } else {
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "        func.call @attention_block_bf16(%%q_buf, %%k_buf, %%v_buf, "
+          "%%o_buf, %%state_%d, %%m_pc, %%sb_val, %%dk_val) "
+          ": (%s, %s, %s, %s, %s, i32, i32, i32) -> ()\n",
+          c, q_memref, kv_memref, kv_memref, o_memref, state_memref));
+    }
 
     // Release KV (2 elements).
     absl::StrAppend(&aie_mlir,
@@ -3139,6 +3446,7 @@ absl::StatusOr<AieLoweringResult> LowerTiledAttentionToAie(
   result.attention_dk = info.dk;
   result.attention_m_per_core = m_per_core;
   result.attention_kv_block_size = sb;
+  result.attention_is_causal = info.is_causal;
   // Sanity: the MLIR passes m_per_core/sb as runtime i32 args, but the kernel
   // uses CONST_M_PC/CONST_SB compile-time defines. These must agree.
   CHECK_GT(result.attention_m_per_core, 0);
@@ -3320,9 +3628,18 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
   }
 
   // External function declaration (resolved at link time from attention_kernel.o).
-  absl::StrAppend(&aie_mlir, absl::StrFormat(
-      "    func.func private @attention_bf16(%s, %s, %s, %s, i32, i32, i32) -> ()\n",
-      q_memref, kv_memref, kv_memref, o_memref));
+  if (info.is_causal) {
+    // Causal kernel has extra i32 param: m_offset.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    func.func private @attention_bf16("
+        "%s, %s, %s, %s, i32, i32, i32, i32) -> ()\n",
+        q_memref, kv_memref, kv_memref, o_memref));
+  } else {
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    func.func private @attention_bf16("
+        "%s, %s, %s, %s, i32, i32, i32) -> ()\n",
+        q_memref, kv_memref, kv_memref, o_memref));
+  }
 
   // Pass 3: Core bodies — single acquire/compute/release.
   for (int c = 0; c < num_cores; c++) {
@@ -3364,19 +3681,28 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
         "      %%seq = arith.constant %d : i32\n"
         "      %%dk = arith.constant %d : i32\n",
         m_per_core, info.seq_len, info.dk));
-    absl::StrAppend(&aie_mlir, absl::StrFormat(
-        "      func.call @attention_bf16(%%q_buf, %%k_buf, %%v_buf, "
-        "%%o_buf, %%m_pc, %%seq, %%dk) "
-        ": (%s, %s, %s, %s, i32, i32, i32) -> ()\n",
-        q_memref, kv_memref, kv_memref, o_memref));
+    if (info.is_causal) {
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "      %%m_offset = arith.constant %d : i32\n",
+          c * m_per_core));
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "      func.call @attention_bf16(%%q_buf, %%k_buf, %%v_buf, "
+          "%%o_buf, %%m_pc, %%seq, %%dk, %%m_offset) "
+          ": (%s, %s, %s, %s, i32, i32, i32, i32) -> ()\n",
+          q_memref, kv_memref, kv_memref, o_memref));
+    } else {
+      absl::StrAppend(&aie_mlir, absl::StrFormat(
+          "      func.call @attention_bf16(%%q_buf, %%k_buf, %%v_buf, "
+          "%%o_buf, %%m_pc, %%seq, %%dk) "
+          ": (%s, %s, %s, %s, i32, i32, i32) -> ()\n",
+          q_memref, kv_memref, kv_memref, o_memref));
+    }
     absl::StrAppend(&aie_mlir, absl::StrFormat(
         "      aie.objectfifo.release @%s(Produce, 1)\n"
         "      aie.objectfifo.release @in_kv(Consume, 2)\n"
         "      aie.objectfifo.release @%s(Consume, 1)\n",
         fifo_name(c, "out"), fifo_name(c, "in_q")));
-    // stack_size = 0x2000 for attention kernel:
-    // Online softmax kernel has no local arrays, but Peano llc -O2
-    // may spill vector registers for larger loop nests (M_pc=64, seq=64).
+    // stack_size = 0x2000 for attention kernel.
     absl::StrAppend(&aie_mlir,
         "      aie.end\n    } { stack_size = 0x2000 : i32 }\n");
   }
@@ -3445,18 +3771,16 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
 
   LOG(INFO) << "XDNA attention lowering: generated AIE MLIR:\n" << aie_mlir;
 
-  return AieLoweringResult{
-      aie_mlir, num_cores,
-      /*use_aievec=*/false,
-      /*convert_vector_to_aievec=*/false,
-      /*needs_matmul_workarounds=*/false,
-      /*needs_softfloat_stubs=*/true,
-      /*use_distribute=*/false,
-      /*needs_softmax_kernel=*/false,
-      /*needs_attention_kernel=*/true,
-      /*attention_seq_len=*/info.seq_len,
-      /*attention_dk=*/info.dk,
-      /*attention_m_per_core=*/m_per_core};
+  AieLoweringResult result;
+  result.aie_mlir = aie_mlir;
+  result.num_cores = num_cores;
+  result.needs_softfloat_stubs = true;
+  result.needs_attention_kernel = true;
+  result.attention_seq_len = info.seq_len;
+  result.attention_dk = info.dk;
+  result.attention_m_per_core = m_per_core;
+  result.attention_is_causal = info.is_causal;
+  return result;
 }
 
 // Generates AIE MLIR for softmax using an external C++ kernel.
@@ -4312,7 +4636,8 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
     LOG(INFO) << "XDNA AIE lowering: detected fused attention M="
               << attention_info->num_rows << " S=" << attention_info->seq_len
               << " dk=" << attention_info->dk << " "
-              << attention_info->element_type;
+              << attention_info->element_type
+              << (attention_info->is_causal ? " (causal)" : "");
     return LowerAttentionToAie(*attention_info, caps, config.num_columns);
   }
 

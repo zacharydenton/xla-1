@@ -51,6 +51,7 @@ struct AieLoweringResult {
   int64_t attention_dk = 0;  // Fused attention: dk for kernel gen.
   int64_t attention_m_per_core = 0;  // Fused attention: rows per core.
   int64_t attention_kv_block_size = 0;  // Tiled attention: KV block rows (0=non-tiled).
+  bool attention_is_causal = false;  // Causal (upper-triangular) masking in attention.
   bool needs_gelu_kernel = false;  // GELU: compile AIE API C++ kernel.
   bool needs_layernorm_kernel = false;  // LayerNorm: compile AIE API C++ kernel.
   int64_t layernorm_row_length = 0;  // LayerNorm: row length for kernel gen.
