@@ -1056,6 +1056,68 @@ def test_tiny_gpt_forward():
     np.testing.assert_allclose(npu_logits, logits_ref, atol=5.0)
 
 
+def test_masked_attention_rejected():
+    """Masked attention should NOT fuse — expect compilation error."""
+    import ml_dtypes
+    rng = np.random.RandomState(300)
+    seq_len, dk = 32, 32
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(dk))
+    # Create mask as numpy array (XDNA can't do tril/ones).
+    mask_np = np.tril(np.ones((seq_len, seq_len), dtype=ml_dtypes.bfloat16))
+    neg_inf = ml_dtypes.bfloat16(-1e4)
+    try:
+        result = jax.jit(lambda q, k, v, m: jax.nn.softmax(
+            jnp.where(m, (q @ k.T) * scale, neg_inf)) @ v)(
+            Q, K, V, mask_np)
+        # If it somehow compiles (e.g., future masked support), verify
+        # correctness against masked CPU reference.
+        Q_f32 = Q.astype(np.float32)
+        K_f32 = K.astype(np.float32)
+        V_f32 = V.astype(np.float32)
+        scores = Q_f32 @ K_f32.T * float(scale)
+        scores = np.where(mask_np.astype(np.float32), scores, -1e4)
+        weights = _softmax_ref(scores.astype(ml_dtypes.bfloat16))
+        expected = weights @ V_f32
+        np.testing.assert_allclose(
+            np.array(result, dtype=np.float32), expected, atol=2.0)
+    except Exception as e:
+        msg = str(e)
+        assert "XDNA cannot compile" in msg or "UNIMPLEMENTED" in msg, \
+            f"Expected clear error, got: {msg[:200]}"
+        print(f"         Correctly rejected: {msg[:100]}", flush=True)
+
+
+def test_custom_scale_attention_rejected():
+    """Non-standard temperature should NOT fuse — expect error."""
+    import ml_dtypes
+    rng = np.random.RandomState(301)
+    seq_len, dk = 32, 32
+    Q = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    K = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    V = rng.randn(seq_len, dk).astype(ml_dtypes.bfloat16)
+    custom_scale = ml_dtypes.bfloat16(0.5 / np.sqrt(dk))  # 0.5x standard
+    try:
+        result = jax.jit(lambda q, k, v: jax.nn.softmax(
+            (q @ k.T) * custom_scale) @ v)(Q, K, V)
+        # If it somehow compiles, verify correctness.
+        Q_f32 = Q.astype(np.float32)
+        K_f32 = K.astype(np.float32)
+        V_f32 = V.astype(np.float32)
+        scores = Q_f32 @ K_f32.T * float(custom_scale)
+        weights = _softmax_ref(scores.astype(ml_dtypes.bfloat16))
+        expected = weights @ V_f32
+        np.testing.assert_allclose(
+            np.array(result, dtype=np.float32), expected, atol=2.0)
+    except Exception as e:
+        msg = str(e)
+        assert "XDNA cannot compile" in msg or "UNIMPLEMENTED" in msg, \
+            f"Expected clear error, got: {msg[:200]}"
+        print(f"         Correctly rejected: {msg[:100]}", flush=True)
+
+
 def test_unsupported_reshape():
     """Unsupported: reshape should fail with a clear error, not crash."""
     a = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
@@ -1189,6 +1251,9 @@ def main():
         ("fused attention bf16 [64,32]", test_fused_attention_bf16_rectangular),
         ("fused attention bf16 [64,64]", test_fused_attention_bf16_multicore),
         ("fused attention bf16 [32,64]", test_fused_attention_bf16_larger),
+    ] + [
+        ("masked attention rejected", test_masked_attention_rejected),
+        ("custom scale attention rejected", test_custom_scale_attention_rejected),
     ] + [
         ("gelu bf16[64]", test_gelu_bf16_64),
         ("gelu bf16[256]", test_gelu_bf16_256),

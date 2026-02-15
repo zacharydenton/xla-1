@@ -16,11 +16,14 @@ limitations under the License.
 #include "xla/pjrt/plugin/xdna/xdna_aie_lowering.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
+
+#include "absl/strings/numbers.h"
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -353,6 +356,18 @@ std::string TryExtractScalarConstant(mlir::Value value) {
   }
 
   return "";
+}
+
+// Returns the float value of a scalar constant, or nullopt.
+std::optional<float> TryExtractScalarFloat(mlir::Value value) {
+  std::string s = TryExtractScalarConstant(value);
+  if (s.empty()) return std::nullopt;
+  // Parse the float from "0.176777 : bf16" format.
+  size_t colon = s.find(" : ");
+  if (colon == std::string::npos) return std::nullopt;
+  float val;
+  if (!absl::SimpleAtof(s.substr(0, colon), &val)) return std::nullopt;
+  return val;
 }
 
 // Analyzes a linalg.generic to build a LinalgProgramInfo.
@@ -2584,6 +2599,23 @@ std::optional<AttentionProgramInfo> DetectAttention(mlir::ModuleOp module) {
     return std::nullopt;
   }
 
+  // Reject masked attention: arith.select in any generic body means a mask
+  // is applied (e.g., causal mask via jnp.where). We cannot fuse this because
+  // the kernel hardcodes unmasked attention.
+  bool has_select = false;
+  entry_func.walk([&](mlir::linalg::GenericOp generic) {
+    mlir::Block& body = generic.getRegion().front();
+    for (mlir::Operation& op : body.without_terminator()) {
+      if (op.getName().getStringRef() == "arith.select")
+        has_select = true;
+    }
+  });
+  if (has_select) {
+    LOG(INFO) << "XDNA: attention has masking (arith.select) — "
+              << "not fusing (would drop mask)";
+    return std::nullopt;
+  }
+
   // Check for transpose generic that feeds the first matmul's B input.
   // The first matmul (in program order) computes Q @ K^T.
   mlir::Operation* matmul1 = matmul_ops[0];
@@ -2696,6 +2728,44 @@ std::optional<AttentionProgramInfo> DetectAttention(mlir::ModuleOp module) {
     return std::nullopt;
   }
 
+  // Validate the scale constant matches 1/sqrt(dk). The fused kernel
+  // hardcodes log2e/sqrt(dk), so a non-standard temperature would produce
+  // wrong results.
+  bool found_scale = false;
+  entry_func.walk([&](mlir::linalg::GenericOp generic) {
+    if (found_scale) return;
+    auto iters = generic.getIteratorTypesArray();
+    bool all_parallel = std::all_of(iters.begin(), iters.end(),
+        [](auto t) { return t == mlir::utils::IteratorType::parallel; });
+    if (!all_parallel) return;
+    // Check body: single arith.mulf.
+    mlir::Block& body = generic.getRegion().front();
+    int mulf_count = 0;
+    for (mlir::Operation& op : body.without_terminator())
+      if (op.getName().getStringRef() == "arith.mulf") mulf_count++;
+    if (mulf_count != 1) return;
+    // Check inputs for a broadcast constant matching 1/sqrt(dk).
+    // The constant may have a scalar map (numResults==0) or an identity map
+    // if StableHLO→linalg already broadcast it to a full tensor.
+    int n_inputs = generic.getInputs().size();
+    for (int i = 0; i < n_inputs; i++) {
+      auto val = TryExtractScalarFloat(generic.getInputs()[i]);
+      if (val.has_value()) {
+        float expected = 1.0f / sqrtf(static_cast<float>(dk));
+        // Relative tolerance: bf16 has ~0.8% relative error, use 2% to
+        // allow rounding but reject materially wrong temperatures.
+        // Floor of 1e-4 prevents division-by-zero-like issues.
+        float tol = std::max(1e-4f, 0.02f * expected);
+        if (std::abs(*val - expected) <= tol) found_scale = true;
+      }
+    }
+  });
+  if (!found_scale) {
+    LOG(INFO) << "XDNA: attention scale not found or doesn't match "
+              << "1/sqrt(dk=" << dk << ") — not fusing";
+    return std::nullopt;
+  }
+
   LOG(INFO) << "XDNA: detected fused attention pattern: M=" << M
             << " S=" << S << " dk=" << dk;
 
@@ -2745,6 +2815,18 @@ absl::StatusOr<AieLoweringResult> LowerAttentionToAie(
     return absl::InvalidArgumentError(absl::StrFormat(
         "Attention dk=%d exceeds DMA d0 limit (%d words, max %d)",
         info.dk, d0_words_dk, kMaxBdWords));
+  }
+  // K/V DMA: d1 = seq_len (rows transferred).
+  if (info.seq_len > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Attention seq_len=%d exceeds DMA d1 limit (max %d)",
+        info.seq_len, kMaxBdWords));
+  }
+  // Q/O DMA: d1 = m_per_core.
+  if (m_per_core > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "Attention m_per_core=%d exceeds DMA d1 limit (max %d)",
+        m_per_core, kMaxBdWords));
   }
 
   LOG(INFO) << "XDNA attention lowering: M=" << info.num_rows
@@ -3613,6 +3695,12 @@ absl::StatusOr<AieLoweringResult> LowerLayerNormToAie(
     return absl::InvalidArgumentError(absl::StrFormat(
         "LayerNorm row_length=%d exceeds DMA d0 limit (%d words, max %d)",
         info.row_length, d0_words, kMaxBdWords));
+  }
+  // X/O DMA: d1 = rows_per_core.
+  if (rows_per_core > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "LayerNorm rows_per_core=%d exceeds DMA d1 limit (max %d)",
+        rows_per_core, kMaxBdWords));
   }
 
   LOG(INFO) << "XDNA LayerNorm lowering: " << info.num_rows << " rows x "
