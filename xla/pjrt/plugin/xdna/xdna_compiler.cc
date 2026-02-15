@@ -132,7 +132,10 @@ absl::StatusOr<XdnaCodegenResult> XdnaCompiler::Compile(
                                             lowering.needs_attention_kernel,
                                             lowering.attention_seq_len,
                                             lowering.attention_dk,
-                                            lowering.attention_m_per_core));
+                                            lowering.attention_m_per_core,
+                                            lowering.needs_gelu_kernel,
+                                            lowering.needs_layernorm_kernel,
+                                            lowering.layernorm_row_length));
 
   LOG(INFO) << "XDNA compiler: xclbin generated, "
             << result.xclbin_bytes.size() << " bytes.";

@@ -60,7 +60,10 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     bool needs_attention_kernel = false,
     int64_t attention_seq_len = 0,
     int64_t attention_dk = 0,
-    int64_t attention_m_per_core = 0);
+    int64_t attention_m_per_core = 0,
+    bool needs_gelu_kernel = false,
+    bool needs_layernorm_kernel = false,
+    int64_t layernorm_row_length = 0);
 
 }  // namespace xla
 

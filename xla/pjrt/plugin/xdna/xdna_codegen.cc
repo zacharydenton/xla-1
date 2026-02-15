@@ -485,7 +485,9 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
     bool needs_matmul_workarounds, bool needs_softfloat_stubs,
     bool needs_softmax_kernel, bool needs_attention_kernel,
     int64_t attention_seq_len, int64_t attention_dk,
-    int64_t attention_m_per_core) {
+    int64_t attention_m_per_core,
+    bool needs_gelu_kernel, bool needs_layernorm_kernel,
+    int64_t layernorm_row_length) {
   // Create a temporary working directory.
   auto tmpdir = std::filesystem::temp_directory_path() / "xdna_codegen_XXXXXX";
   std::string tmpdir_str = tmpdir.string();
@@ -528,7 +530,9 @@ absl::StatusOr<XdnaCodegenResult> GenerateXclbinFromAie(
   bool needs_rt_stubs = needs_matmul_workarounds || needs_softfloat_stubs;
   int steps_per_core = needs_rt_stubs ? 8 : 7;  // +1 for rt stubs
   int kernel_steps = (needs_softmax_kernel ? 3 : 0) +
-                     (needs_attention_kernel ? 3 : 0);
+                     (needs_attention_kernel ? 3 : 0) +
+                     (needs_gelu_kernel ? 3 : 0) +
+                     (needs_layernorm_kernel ? 3 : 0);
   int shared_steps = 6 + kernel_steps;
   int total_compile_steps = steps_per_core * num_cores + shared_steps;
   int step = 1;
@@ -857,6 +861,235 @@ extern "C" void attention_bf16(
         " -O2 --aie-loop-aware=false -filetype=obj ",
         kernel_bc, " -o ", attention_kernel_obj),
         absl::StrFormat("Step %d/%d: Attention llc",
+                        step++, total_compile_steps)));
+  }
+
+  // -----------------------------------------------------------------------
+  // Step 2d: Compile GELU C++ kernel with Peano (if needed).
+  // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+  // Uses aie::tanh hardware intrinsic for bf16.
+  // -----------------------------------------------------------------------
+  std::string gelu_kernel_obj;
+  if (needs_gelu_kernel) {
+    std::string peano_clangxx = GetPeanoClangxxPath();
+    std::string sysroot_include = GetPeanoSysrootInclude();
+    std::string libcxx_include = GetLibcxxInclude();
+    std::string aie_api_include = GetAieApiInclude();
+
+    std::string kernel_src = workdir + "/gelu_kernel.cc";
+    gelu_kernel_obj = workdir + "/gelu_kernel.o";
+
+    std::string kernel_code = R"KERNEL(#include <aie_api/aie.hpp>
+#include <stdint.h>
+
+#define VL 32
+
+extern "C" void gelu_bf16(bfloat16* __restrict in,
+                           bfloat16* __restrict out,
+                           const int32_t n) {
+  // GELU(x) = x * sigmoid(2z) where z = sqrt(2/pi) * (x + 0.044715*x^3)
+  // sigmoid(2z) = e2z / (e2z + 1) where e2z = exp2(2z*log2e)
+  // Compute: e2z vectorized, inv(e2z+1) per-element, then vector multiply.
+  const bfloat16 sqrt2pi = (bfloat16)0.7978515625f;
+  const bfloat16 coeff = (bfloat16)0.044708251953125f;
+  const bfloat16 one_val = (bfloat16)1.0f;
+  const bfloat16 two_log2e = (bfloat16)2.890625f;  // 2*log2(e)
+
+  auto sqrt2pi_v = aie::broadcast<bfloat16, VL>(sqrt2pi);
+  auto coeff_v = aie::broadcast<bfloat16, VL>(coeff);
+  auto one_v = aie::broadcast<bfloat16, VL>(one_val);
+  auto two_log2e_v = aie::broadcast<bfloat16, VL>(two_log2e);
+
+  const int n_iters = n / VL;
+
+  for (int i = 0; i < n_iters; i++) {
+    auto x = aie::load_v<VL>(in + i * VL);
+
+    // z = sqrt(2/pi) * (x + 0.044715 * x^3)
+    auto x2 = aie::mul(x, x).to_vector<bfloat16>();
+    auto x3 = aie::mul(x2, x).to_vector<bfloat16>();
+    auto cx3 = aie::mul(coeff_v, x3).to_vector<bfloat16>();
+    aie::accum<accfloat, VL> sum_acc(x, 0);
+    sum_acc = aie::add(sum_acc, cx3);
+    auto z = aie::mul(sum_acc.to_vector<bfloat16>(), sqrt2pi_v)
+                 .to_vector<bfloat16>();
+
+    // e2z = exp2(2*z*log2e)
+    auto scaled = aie::mul(z, two_log2e_v).to_vector<bfloat16>();
+    aie::accum<accfloat, VL> scaled_acc(scaled, 0);
+    auto e2z = aie::exp2<bfloat16>(scaled_acc.to_vector<float>());
+
+    // sigmoid(2z) = e2z / (e2z + 1) = 1 - inv(e2z + 1)
+    // Compute per-element: write inv results to output buf, load back.
+    aie::accum<accfloat, VL> e2z_acc(e2z, 0);
+    auto e2z_p1 = aie::add(e2z_acc, one_v).to_vector<float>();
+    for (int j = 0; j < VL; j++) {
+      out[i * VL + j] = (bfloat16)aie::inv(e2z_p1[j]);
+    }
+    auto inv_v = aie::load_v<VL>(out + i * VL);
+
+    // sigmoid_v = 1 - inv_v
+    aie::accum<accfloat, VL> sig_acc(one_v, 0);
+    sig_acc = aie::sub(sig_acc, inv_v);
+    auto sigmoid_v = sig_acc.to_vector<bfloat16>();
+
+    // result = x * sigmoid(2z)
+    aie::store_v(out + i * VL,
+                 aie::mul(x, sigmoid_v).to_vector<bfloat16>());
+  }
+}
+)KERNEL";
+
+    TF_RETURN_IF_ERROR(WriteFile(kernel_src, kernel_code));
+
+    std::string kernel_ll = workdir + "/gelu_kernel.ll";
+    std::string kernel_bc = workdir + "/gelu_kernel.opt.bc";
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        peano_clangxx,
+        " --target=", caps.isa_target, "-none-unknown-elf"
+        " -O1 -std=c++20 -S -emit-llvm"
+        " -isystem ", sysroot_include,
+        " -I ", libcxx_include,
+        " -I ", aie_api_include,
+        " ", kernel_src, " -o ", kernel_ll),
+        absl::StrFormat("Step %d/%d: GELU kernel -> LLVM IR",
+                        step++, total_compile_steps)));
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        GetPeanoOptPath(), " '--passes=default<O0>,strip' ",
+        kernel_ll, " -o ", kernel_bc),
+        absl::StrFormat("Step %d/%d: GELU opt",
+                        step++, total_compile_steps)));
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        GetPeanoLlcPath(),
+        " -O2 --aie-loop-aware=false -filetype=obj ",
+        kernel_bc, " -o ", gelu_kernel_obj),
+        absl::StrFormat("Step %d/%d: GELU llc",
+                        step++, total_compile_steps)));
+  }
+
+  // -----------------------------------------------------------------------
+  // Step 2e: Compile LayerNorm C++ kernel with Peano (if needed).
+  // Y = gamma * (X - mean) / sqrt(var + eps) + beta
+  // Uses 3-pass algorithm: mean, variance, normalize.
+  // -----------------------------------------------------------------------
+  std::string layernorm_kernel_obj;
+  if (needs_layernorm_kernel) {
+    std::string peano_clangxx = GetPeanoClangxxPath();
+    std::string sysroot_include = GetPeanoSysrootInclude();
+    std::string libcxx_include = GetLibcxxInclude();
+    std::string aie_api_include = GetAieApiInclude();
+
+    std::string kernel_src = workdir + "/layernorm_kernel.cc";
+    layernorm_kernel_obj = workdir + "/layernorm_kernel.o";
+
+    std::string kernel_code = absl::StrFormat(
+        R"KERNEL(#include <aie_api/aie.hpp>
+#include <stdint.h>
+
+#define VL 32
+#define ROW_LENGTH %d
+
+// Scalar bf16 multiply via single-element vector MAC (avoids __mulsf3).
+static inline bfloat16 mul_bf16(bfloat16 a, bfloat16 b) {
+  auto va = aie::broadcast<bfloat16, VL>(a);
+  auto result = aie::mul(va, b).to_vector<bfloat16>();
+  return result[0];
+}
+
+// Scalar bf16 add via accfloat (avoids __addsf3).
+static inline bfloat16 add_bf16(bfloat16 a, bfloat16 b) {
+  aie::accum<accfloat, VL> acc(aie::broadcast<bfloat16, VL>(a), 0);
+  acc = aie::add(acc, aie::broadcast<bfloat16, VL>(b));
+  return acc.to_vector<bfloat16>()[0];
+}
+
+extern "C" void layernorm_bf16(bfloat16* __restrict X,
+                                bfloat16* __restrict gamma,
+                                bfloat16* __restrict beta,
+                                bfloat16* __restrict Y,
+                                const int32_t row_length) {
+  const int n_iters = ROW_LENGTH / VL;
+  bfloat16 inv_n = (bfloat16)aie::inv((float)ROW_LENGTH);
+
+  // Pass 1: mean = sum(x) / N
+  aie::accum<accfloat, VL> sum_acc = aie::zeros<accfloat, VL>();
+  for (int i = 0; i < n_iters; i++) {
+    auto x = aie::load_v<VL>(X + i * VL);
+    sum_acc = aie::add(sum_acc, x);
+  }
+  bfloat16 total_sum = (bfloat16)aie::reduce_add(sum_acc.to_vector<float>());
+  bfloat16 mean_bf = mul_bf16(total_sum, inv_n);
+  aie::vector<bfloat16, VL> mean_v = aie::broadcast<bfloat16, VL>(mean_bf);
+
+  // Pass 2: var = sum((x - mean)^2) / N
+  aie::accum<accfloat, VL> var_acc = aie::zeros<accfloat, VL>();
+  for (int i = 0; i < n_iters; i++) {
+    auto x = aie::load_v<VL>(X + i * VL);
+    aie::accum<accfloat, VL> d(x, 0);
+    d = aie::sub(d, mean_v);
+    auto diff = d.to_vector<bfloat16>();
+    var_acc = aie::mac(var_acc, diff, diff);
+  }
+  bfloat16 var_sum = (bfloat16)aie::reduce_add(var_acc.to_vector<float>());
+  bfloat16 var_bf = mul_bf16(var_sum, inv_n);
+
+  // rsqrt(var + eps) via hardware invsqrt.
+  bfloat16 eps_bf = (bfloat16)1e-5f;
+  bfloat16 var_eps = add_bf16(var_bf, eps_bf);
+  float inv_std = aie::invsqrt((float)var_eps);
+  bfloat16 inv_std_bf = (bfloat16)inv_std;
+  aie::vector<bfloat16, VL> inv_std_v =
+      aie::broadcast<bfloat16, VL>(inv_std_bf);
+
+  // Pass 3: Y = gamma * (X - mean) * inv_std + beta
+  for (int i = 0; i < n_iters; i++) {
+    auto x = aie::load_v<VL>(X + i * VL);
+    auto g = aie::load_v<VL>(gamma + i * VL);
+    auto b = aie::load_v<VL>(beta + i * VL);
+
+    aie::accum<accfloat, VL> c(x, 0);
+    c = aie::sub(c, mean_v);
+    auto centered = c.to_vector<bfloat16>();
+
+    auto normed = aie::mul(centered, inv_std_v).to_vector<bfloat16>();
+
+    aie::accum<accfloat, VL> out = aie::mul(g, normed);
+    out = aie::add(out, b);
+    aie::store_v(Y + i * VL, out.to_vector<bfloat16>());
+  }
+}
+)KERNEL", layernorm_row_length);
+
+    TF_RETURN_IF_ERROR(WriteFile(kernel_src, kernel_code));
+
+    std::string kernel_ll = workdir + "/layernorm_kernel.ll";
+    std::string kernel_bc = workdir + "/layernorm_kernel.opt.bc";
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        peano_clangxx,
+        " --target=", caps.isa_target, "-none-unknown-elf"
+        " -O1 -std=c++20 -S -emit-llvm"
+        " -isystem ", sysroot_include,
+        " -I ", libcxx_include,
+        " -I ", aie_api_include,
+        " ", kernel_src, " -o ", kernel_ll),
+        absl::StrFormat("Step %d/%d: LayerNorm kernel -> LLVM IR",
+                        step++, total_compile_steps)));
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        GetPeanoOptPath(), " '--passes=default<O0>,strip' ",
+        kernel_ll, " -o ", kernel_bc),
+        absl::StrFormat("Step %d/%d: LayerNorm opt",
+                        step++, total_compile_steps)));
+
+    TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
+        GetPeanoLlcPath(),
+        " -O2 --aie-loop-aware=false -filetype=obj ",
+        kernel_bc, " -o ", layernorm_kernel_obj),
+        absl::StrFormat("Step %d/%d: LayerNorm llc",
                         step++, total_compile_steps)));
   }
 
@@ -1427,6 +1660,10 @@ extern "C" void attention_bf16(
       absl::StrAppend(&extra_objs, " ", softmax_kernel_obj);
     if (!attention_kernel_obj.empty())
       absl::StrAppend(&extra_objs, " ", attention_kernel_obj);
+    if (!gelu_kernel_obj.empty())
+      absl::StrAppend(&extra_objs, " ", gelu_kernel_obj);
+    if (!layernorm_kernel_obj.empty())
+      absl::StrAppend(&extra_objs, " ", layernorm_kernel_obj);
     TF_RETURN_IF_ERROR(RunCommand(absl::StrCat(
         peano_clang,
         " -O2 --target=", caps.isa_target, "-none-elf -nostdlib"

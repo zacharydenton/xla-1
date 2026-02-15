@@ -50,6 +50,9 @@ struct AieLoweringResult {
   int64_t attention_seq_len = 0;  // Fused attention: seq_len for kernel gen.
   int64_t attention_dk = 0;  // Fused attention: dk for kernel gen.
   int64_t attention_m_per_core = 0;  // Fused attention: rows per core.
+  bool needs_gelu_kernel = false;  // GELU: compile AIE API C++ kernel.
+  bool needs_layernorm_kernel = false;  // LayerNorm: compile AIE API C++ kernel.
+  int64_t layernorm_row_length = 0;  // LayerNorm: row length for kernel gen.
 };
 
 // Lowers a linalg-on-tensors MLIR module to AIE dialect MLIR text.

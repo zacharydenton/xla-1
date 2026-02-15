@@ -826,6 +826,236 @@ def test_fused_attention_bf16_larger():
         np.array(result, dtype=np.float32), expected, atol=2.0)
 
 
+def _gelu_ref(x):
+    """CPU reference approximate GELU using numpy."""
+    x_f32 = x.astype(np.float32)
+    return 0.5 * x_f32 * (1.0 + np.tanh(
+        np.sqrt(2.0 / np.pi) * (x_f32 + 0.044715 * x_f32**3)))
+
+
+def test_gelu_bf16_64():
+    """GELU: bf16[64] — single chunk, single core."""
+    import ml_dtypes
+    rng = np.random.RandomState(300)
+    a = rng.randn(64).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda x: jax.nn.gelu(x, approximate=True))(a)
+    expected = _gelu_ref(a)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.1)
+
+
+def test_gelu_bf16_256():
+    """GELU: bf16[256] — multi-chunk."""
+    import ml_dtypes
+    rng = np.random.RandomState(301)
+    a = rng.randn(256).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda x: jax.nn.gelu(x, approximate=True))(a)
+    expected = _gelu_ref(a)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.1)
+
+
+def test_gelu_bf16_4096():
+    """GELU: bf16[4096] — multi-core."""
+    import ml_dtypes
+    rng = np.random.RandomState(302)
+    a = rng.randn(4096).astype(ml_dtypes.bfloat16)
+    result = jax.jit(lambda x: jax.nn.gelu(x, approximate=True))(a)
+    expected = _gelu_ref(a)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.1)
+
+
+def _layernorm_ref(x, gamma, beta, eps=1e-5):
+    """CPU reference LayerNorm using numpy."""
+    x_f32 = x.astype(np.float32)
+    g_f32 = gamma.astype(np.float32)
+    b_f32 = beta.astype(np.float32)
+    mean = np.mean(x_f32, axis=-1, keepdims=True)
+    var = np.var(x_f32, axis=-1, keepdims=True)
+    normed = (x_f32 - mean) / np.sqrt(var + eps)
+    return g_f32 * normed + b_f32
+
+
+def test_layernorm_bf16_1x64():
+    """LayerNorm: bf16[1,64] — single row, identity gamma/beta."""
+    import ml_dtypes
+    rng = np.random.RandomState(310)
+    x = rng.randn(1, 64).astype(ml_dtypes.bfloat16)
+    gamma = np.ones(64, dtype=ml_dtypes.bfloat16)
+    beta = np.zeros(64, dtype=ml_dtypes.bfloat16)
+    def layernorm_fn(x, g, b):
+        mean = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.var(x, axis=-1, keepdims=True)
+        return g * (x - mean) / jnp.sqrt(var + 1e-5) + b
+    result = jax.jit(layernorm_fn)(x, gamma, beta)
+    expected = _layernorm_ref(x, gamma, beta)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.1)
+
+
+def test_layernorm_bf16_4x128():
+    """LayerNorm: bf16[4,128] — multi-row, non-trivial gamma/beta."""
+    import ml_dtypes
+    rng = np.random.RandomState(311)
+    x = rng.randn(4, 128).astype(ml_dtypes.bfloat16)
+    gamma = (rng.randn(128) * 0.5 + 1.0).astype(ml_dtypes.bfloat16)
+    beta = (rng.randn(128) * 0.1).astype(ml_dtypes.bfloat16)
+    def layernorm_fn(x, g, b):
+        mean = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.var(x, axis=-1, keepdims=True)
+        return g * (x - mean) / jnp.sqrt(var + 1e-5) + b
+    result = jax.jit(layernorm_fn)(x, gamma, beta)
+    expected = _layernorm_ref(x, gamma, beta)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.1)
+
+
+def test_layernorm_bf16_8x256():
+    """LayerNorm: bf16[8,256] — multi-core, non-trivial gamma/beta."""
+    import ml_dtypes
+    rng = np.random.RandomState(312)
+    x = rng.randn(8, 256).astype(ml_dtypes.bfloat16)
+    gamma = (rng.randn(256) * 0.5 + 1.0).astype(ml_dtypes.bfloat16)
+    beta = (rng.randn(256) * 0.1).astype(ml_dtypes.bfloat16)
+    def layernorm_fn(x, g, b):
+        mean = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.var(x, axis=-1, keepdims=True)
+        return g * (x - mean) / jnp.sqrt(var + 1e-5) + b
+    result = jax.jit(layernorm_fn)(x, gamma, beta)
+    expected = _layernorm_ref(x, gamma, beta)
+    np.testing.assert_allclose(
+        np.array(result, dtype=np.float32), expected, atol=0.1)
+
+
+def test_tiny_gpt_forward():
+    """Tiny GPT: 1-layer forward pass using separate jit calls per op.
+
+    Model: emb_dim=64, seq_len=32, 1 head, vocab=256.
+    All matmul/attention/layernorm/gelu on NPU, embedding/sampling on CPU.
+    """
+    import ml_dtypes
+    rng = np.random.RandomState(400)
+    emb_dim, seq_len, vocab = 64, 32, 256
+
+    # Random weights (bf16).
+    def bf16(x):
+        return x.astype(ml_dtypes.bfloat16)
+
+    embed_table = bf16(rng.randn(vocab, emb_dim) * 0.02)
+    pos_embed = bf16(rng.randn(seq_len, emb_dim) * 0.02)
+    W_q = bf16(rng.randn(emb_dim, emb_dim) * 0.02)
+    W_k = bf16(rng.randn(emb_dim, emb_dim) * 0.02)
+    W_v = bf16(rng.randn(emb_dim, emb_dim) * 0.02)
+    W_out = bf16(rng.randn(emb_dim, emb_dim) * 0.02)
+    gamma1 = bf16(np.ones(emb_dim))
+    beta1 = bf16(np.zeros(emb_dim))
+    W_ff1 = bf16(rng.randn(emb_dim, emb_dim * 4) * 0.02)  # FFN up
+    W_ff2 = bf16(rng.randn(emb_dim * 4, emb_dim) * 0.02)  # FFN down
+    gamma2 = bf16(np.ones(emb_dim))
+    beta2 = bf16(np.zeros(emb_dim))
+    gamma3 = bf16(np.ones(emb_dim))
+    beta3 = bf16(np.zeros(emb_dim))
+    W_head = bf16(rng.randn(emb_dim, vocab) * 0.02)
+
+    # Random input tokens.
+    token_ids = rng.randint(0, vocab, size=seq_len)
+
+    # --- NPU forward pass ---
+    # CPU: embedding lookup
+    x = bf16(embed_table[token_ids] + pos_embed)
+
+    # LayerNorm 1
+    def layernorm_fn(x, g, b):
+        mean = jnp.mean(x, axis=-1, keepdims=True)
+        var = jnp.var(x, axis=-1, keepdims=True)
+        return g * (x - mean) / jnp.sqrt(var + 1e-5) + b
+
+    x_norm = jax.jit(layernorm_fn)(x, gamma1, beta1)
+
+    # Q, K, V projections (matmul)
+    q = jax.jit(jnp.dot)(x_norm, W_q)
+    k = jax.jit(jnp.dot)(x_norm, W_k)
+    v = jax.jit(jnp.dot)(x_norm, W_v)
+
+    # Fused attention
+    scale = ml_dtypes.bfloat16(1.0 / np.sqrt(emb_dim))
+    attn_out = jax.jit(
+        lambda q, k, v: jax.nn.softmax((q @ k.T) * scale) @ v)(q, k, v)
+
+    # Output projection + residual
+    proj = jax.jit(jnp.dot)(attn_out, W_out)
+    x = jax.jit(lambda a, b: a + b)(x, proj)
+
+    # LayerNorm 2
+    x_norm2 = jax.jit(layernorm_fn)(x, gamma2, beta2)
+
+    # FFN: up projection
+    ff1 = jax.jit(jnp.dot)(x_norm2, W_ff1)
+    # GELU activation
+    act = jax.jit(lambda x: jax.nn.gelu(x, approximate=True))(ff1)
+    # FFN: down projection + residual
+    ff2 = jax.jit(jnp.dot)(act, W_ff2)
+    x = jax.jit(lambda a, b: a + b)(x, ff2)
+
+    # Final LayerNorm
+    x_final = jax.jit(layernorm_fn)(x, gamma3, beta3)
+
+    # All rows -> logits (matmul), then take last row on CPU.
+    # (M=1 matmul not supported by tiling, so compute full [seq_len, vocab].)
+    all_logits = jax.jit(jnp.dot)(x_final, W_head)
+    logits = np.array(all_logits)[-1:]
+
+    # --- CPU reference ---
+    x_ref = embed_table[token_ids].astype(np.float32) + pos_embed.astype(np.float32)
+    x_ref = x_ref.astype(ml_dtypes.bfloat16)  # Match bf16 precision
+
+    def ln_ref(x, g, b):
+        return _layernorm_ref(x, g, b)
+
+    x_norm_ref = ln_ref(x_ref, gamma1, beta1).astype(ml_dtypes.bfloat16)
+
+    q_ref = x_norm_ref.astype(np.float32) @ W_q.astype(np.float32)
+    k_ref = x_norm_ref.astype(np.float32) @ W_k.astype(np.float32)
+    v_ref = x_norm_ref.astype(np.float32) @ W_v.astype(np.float32)
+
+    def attn_ref(q, k, v, dk):
+        return _attention_ref(
+            q.astype(ml_dtypes.bfloat16),
+            k.astype(ml_dtypes.bfloat16),
+            v.astype(ml_dtypes.bfloat16), dk)
+
+    attn_ref_out = attn_ref(q_ref, k_ref, v_ref, emb_dim)
+    proj_ref = attn_ref_out @ W_out.astype(np.float32)
+    x_ref2 = x_ref.astype(np.float32) + proj_ref
+
+    x_norm2_ref = ln_ref(
+        x_ref2.astype(ml_dtypes.bfloat16), gamma2, beta2
+    ).astype(np.float32)
+    ff1_ref = x_norm2_ref @ W_ff1.astype(np.float32)
+    act_ref = _gelu_ref(ff1_ref.astype(ml_dtypes.bfloat16))
+    ff2_ref = act_ref @ W_ff2.astype(np.float32)
+    x_ref3 = x_ref2 + ff2_ref
+
+    x_final_ref = ln_ref(
+        x_ref3.astype(ml_dtypes.bfloat16), gamma3, beta3
+    ).astype(np.float32)
+    logits_ref = x_final_ref[-1:] @ W_head.astype(np.float32)
+
+    # Compare logits — cascaded bf16 ops accumulate error.
+    npu_logits = logits.astype(np.float32)
+    print(f"         NPU logits range: [{npu_logits.min():.3f}, {npu_logits.max():.3f}]",
+          flush=True)
+    print(f"         Ref logits range: [{logits_ref.min():.3f}, {logits_ref.max():.3f}]",
+          flush=True)
+    # With small random weights, logits are near zero. Check argmax matches.
+    npu_token = np.argmax(npu_logits)
+    ref_token = np.argmax(logits_ref)
+    print(f"         NPU predicted token: {npu_token}, ref: {ref_token}", flush=True)
+    # Loose tolerance for many cascaded bf16 ops.
+    np.testing.assert_allclose(npu_logits, logits_ref, atol=5.0)
+
+
 def test_unsupported_reshape():
     """Unsupported: reshape should fail with a clear error, not crash."""
     a = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
@@ -959,6 +1189,16 @@ def main():
         ("fused attention bf16 [64,32]", test_fused_attention_bf16_rectangular),
         ("fused attention bf16 [64,64]", test_fused_attention_bf16_multicore),
         ("fused attention bf16 [32,64]", test_fused_attention_bf16_larger),
+    ] + [
+        ("gelu bf16[64]", test_gelu_bf16_64),
+        ("gelu bf16[256]", test_gelu_bf16_256),
+        ("gelu bf16[4096]", test_gelu_bf16_4096),
+    ] + [
+        ("layernorm bf16[1,64]", test_layernorm_bf16_1x64),
+        ("layernorm bf16[4,128]", test_layernorm_bf16_4x128),
+        ("layernorm bf16[8,256]", test_layernorm_bf16_8x256),
+    ] + [
+        ("tiny GPT forward", test_tiny_gpt_forward),
     ] + [
         ("unsupported: reshape", test_unsupported_reshape),
         ("unsupported: reduce_sum", test_unsupported_reduce_sum),

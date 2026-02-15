@@ -189,6 +189,21 @@ struct AttentionProgramInfo {
   std::string element_type;  // "bf16" only
 };
 
+// GELU program description for AIE lowering.
+// GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+struct GeluProgramInfo {
+  int64_t num_elements;
+  std::string element_type;  // "bf16"
+};
+
+// LayerNorm program description for AIE lowering.
+// Y = gamma * (X - mean) / sqrt(var + eps) + beta
+struct LayerNormProgramInfo {
+  int64_t num_rows;        // product of all dims except last
+  int64_t row_length;      // last dimension (normalization axis)
+  std::string element_type;  // "bf16"
+};
+
 // Returns true if the given op name is a supported body op for DAG analysis.
 bool IsSupportedBodyOp(llvm::StringRef name) {
   return name == "arith.addf" || name == "arith.subf" || name == "arith.mulf" ||
@@ -3173,13 +3188,656 @@ absl::StatusOr<AieLoweringResult> LowerSoftmaxToAie(
 
   LOG(INFO) << "XDNA softmax lowering: generated AIE MLIR:\n" << aie_mlir;
 
-  return AieLoweringResult{aie_mlir, num_cores,
-                           /*use_aievec=*/false,
-                           /*convert_vector_to_aievec=*/false,
-                           /*needs_matmul_workarounds=*/false,
-                           /*needs_softfloat_stubs=*/true,
-                           /*use_distribute=*/false,
-                           /*needs_softmax_kernel=*/true};
+  AieLoweringResult result;
+  result.aie_mlir = aie_mlir;
+  result.num_cores = num_cores;
+  result.needs_softfloat_stubs = true;
+  result.needs_softmax_kernel = true;
+  return result;
+}
+
+// Detects a GELU activation pattern in the module.
+// XLA decomposes jax.nn.gelu(x, approximate=True) into elementwise ops
+// containing math.tanh. Detection checks:
+//   1. Function: 1 input, 1 output, same shape/type
+//   2. Element type: bf16 only
+//   3. At least one linalg.generic body contains math.tanh
+//   4. All iterators parallel (no reductions)
+//   5. No linalg.matmul ops
+std::optional<GeluProgramInfo> DetectGelu(mlir::ModuleOp module) {
+  mlir::func::FuncOp entry_func;
+  module.walk([&](mlir::func::FuncOp func) {
+    if (func.getName() == "main" || !entry_func) entry_func = func;
+  });
+  if (!entry_func) return std::nullopt;
+
+  // Verify function signature: single input tensor, single result tensor.
+  auto func_type = entry_func.getFunctionType();
+  if (func_type.getNumInputs() != 1 || func_type.getNumResults() != 1)
+    return std::nullopt;
+
+  auto input = mlir::dyn_cast<mlir::RankedTensorType>(func_type.getInput(0));
+  auto output = mlir::dyn_cast<mlir::RankedTensorType>(func_type.getResult(0));
+  if (!input || !output) return std::nullopt;
+  if (input != output) return std::nullopt;
+
+  std::string elem_type = GetElementTypeStr(input.getElementType());
+  if (elem_type != "bf16") return std::nullopt;
+
+  // Look for math.tanh as the unique GELU marker. Reject if matmul or
+  // reduction iterators are present (those indicate matmul/softmax).
+  bool has_tanh = false;
+  bool has_matmul = false;
+  bool has_reduction = false;
+
+  entry_func.walk([&](mlir::Operation* op) {
+    llvm::StringRef name = op->getName().getStringRef();
+    if (name == "linalg.matmul") has_matmul = true;
+  });
+
+  if (has_matmul) return std::nullopt;
+
+  entry_func.walk([&](mlir::linalg::GenericOp generic) {
+    auto iterators = generic.getIteratorTypesArray();
+    for (auto it : iterators) {
+      if (it == mlir::utils::IteratorType::reduction) {
+        has_reduction = true;
+        return;
+      }
+    }
+    mlir::Block& body = generic.getRegion().front();
+    for (mlir::Operation& body_op : body.without_terminator()) {
+      if (body_op.getName().getStringRef() == "math.tanh") has_tanh = true;
+    }
+  });
+
+  if (!has_tanh || has_reduction) return std::nullopt;
+
+  // Compute total elements.
+  int64_t num_elements = 1;
+  for (int64_t dim : input.getShape()) num_elements *= dim;
+
+  // GELU kernel uses 32-wide bf16 vectors.
+  if (num_elements % 32 != 0) return std::nullopt;
+  if (num_elements < 32) return std::nullopt;
+
+  LOG(INFO) << "XDNA: detected GELU pattern: " << num_elements
+            << " elements " << elem_type;
+
+  GeluProgramInfo info;
+  info.num_elements = num_elements;
+  info.element_type = elem_type;
+  return info;
+}
+
+// Generates AIE MLIR for GELU using an external C++ kernel.
+// Same pattern as softmax: 1 input FIFO, 1 output FIFO, chunked processing.
+// Multi-core via per-column independent FIFOs (same as softmax).
+absl::StatusOr<AieLoweringResult> LowerGeluToAie(
+    const GeluProgramInfo& info, const TargetCaps& caps,
+    int max_columns) {
+  // Auto-scale number of cores.
+  int num_cores = std::min(max_columns, caps.num_columns);
+  while (num_cores > 1) {
+    if (info.num_elements % num_cores != 0) { num_cores--; continue; }
+    int64_t per_core = info.num_elements / num_cores;
+    if (per_core % 32 != 0) { num_cores--; continue; }
+    break;
+  }
+  int64_t per_core_elements = info.num_elements / num_cores;
+
+  // L1 budget: 2 FIFOs (in + out) x 2 ping-pong x chunk_size x 2 bytes.
+  // Choose chunk size that fits L1 and divides per_core_elements.
+  int64_t max_chunk = caps.l1_usable_bytes / (2 * 2 * 2);  // 4 * bf16
+  // Also cap to shim DMA d0 limit: 1023 32-bit words = 2046 bf16 elements.
+  max_chunk = std::min(max_chunk, static_cast<int64_t>(2046));
+  // Align chunk to VL=32.
+  max_chunk = (max_chunk / 32) * 32;
+
+  int64_t chunk_size;
+  int64_t num_chunks;
+  if (per_core_elements <= max_chunk) {
+    chunk_size = per_core_elements;
+    num_chunks = 1;
+  } else {
+    // Find largest chunk that fits L1 and divides per_core_elements.
+    chunk_size = max_chunk;
+    while (chunk_size > 32 && per_core_elements % chunk_size != 0)
+      chunk_size -= 32;
+    if (per_core_elements % chunk_size != 0) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "GELU: cannot tile %d elements into L1 chunks", per_core_elements));
+    }
+    num_chunks = per_core_elements / chunk_size;
+  }
+
+  LOG(INFO) << "XDNA GELU lowering: " << info.num_elements << " elements "
+            << info.element_type << " using " << num_cores << " core(s) ("
+            << per_core_elements << " per core, " << num_chunks
+            << " chunks of " << chunk_size << ")";
+
+  int start_col = caps.partition_start_column;
+  int shim_row = caps.shim_row;
+  int compute_row = caps.first_compute_row;
+  int fifo_depth = 2;
+
+  std::string chunk_memref = absl::StrFormat("memref<%dxbf16>", chunk_size);
+  std::string host_memref = absl::StrFormat("memref<%dxbf16>",
+                                             info.num_elements);
+
+  auto fifo_name = [&](int c, const std::string& base) -> std::string {
+    return num_cores > 1 ? absl::StrFormat("c%d_%s", c, base) : base;
+  };
+
+  std::string aie_mlir;
+  absl::StrAppend(&aie_mlir, "module {\n");
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "  aie.device(%s) {\n", DeviceNameForColumns(num_cores)));
+
+  // Tile declarations.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, shim_row, col, shim_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, caps.mem_tile_row, col, caps.mem_tile_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, compute_row, col, compute_row));
+  }
+
+  // ObjectFIFOs and links (shim -> mem -> compute, same as softmax).
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string shim = absl::StrFormat("tile_%d_%d", col, shim_row);
+    std::string mem = absl::StrFormat("tile_%d_%d", col, caps.mem_tile_row);
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+
+    // Input: shim -> mem (L2) -> compute (L1).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_L2"), shim, mem, fifo_depth, chunk_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in"), mem, compute, fifo_depth, chunk_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "in_L2"), fifo_name(c, "in")));
+
+    // Output: compute -> mem (L2) -> shim.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out"), compute, mem, fifo_depth, chunk_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out_L2"), mem, shim, fifo_depth, chunk_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "out"), fifo_name(c, "out_L2")));
+  }
+
+  // External function declaration.
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    func.func private @gelu_bf16(%s, %s, i32) -> ()\n",
+      chunk_memref, chunk_memref));
+
+  // Core bodies.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+    std::string subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", chunk_memref);
+
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%core_%d_%d = aie.core(%%%s) {\n", col, compute_row, compute));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%c0 = arith.constant 0 : index\n"
+        "      %%c1 = arith.constant 1 : index\n"
+        "      %%num_chunks = arith.constant %d : index\n"
+        "      %%chunk_sz = arith.constant %d : i32\n",
+        num_chunks, chunk_size));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      scf.for %%i = %%c0 to %%num_chunks step %%c1 {\n"
+        "        %%in_sub = aie.objectfifo.acquire @%s(Consume, 1) : %s\n"
+        "        %%in_buf = aie.objectfifo.subview.access %%in_sub[0] "
+        ": %s -> %s\n"
+        "        %%out_sub = aie.objectfifo.acquire @%s(Produce, 1) : %s\n"
+        "        %%out_buf = aie.objectfifo.subview.access %%out_sub[0] "
+        ": %s -> %s\n"
+        "        func.call @gelu_bf16(%%in_buf, %%out_buf, %%chunk_sz) "
+        ": (%s, %s, i32) -> ()\n"
+        "        aie.objectfifo.release @%s(Consume, 1)\n"
+        "        aie.objectfifo.release @%s(Produce, 1)\n"
+        "      }\n",
+        fifo_name(c, "in"), subview_ty, subview_ty, chunk_memref,
+        fifo_name(c, "out"), subview_ty, subview_ty, chunk_memref,
+        chunk_memref, chunk_memref,
+        fifo_name(c, "in"), fifo_name(c, "out")));
+    absl::StrAppend(&aie_mlir, "      aie.end\n    }\n");
+  }
+
+  // Runtime sequence (DMA).
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.runtime_sequence(%%arg0: %s, %%arg1: %s) {\n",
+      host_memref, host_memref));
+
+  int dma_id = 0;
+  for (int c = 0; c < num_cores; c++) {
+    int64_t offset = c * per_core_elements;
+
+    // Input DMA.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg0"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        offset, num_chunks, chunk_size, chunk_size,
+        dma_id++, fifo_name(c, "in_L2"), host_memref));
+
+    // Output DMA.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg1"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        offset, num_chunks, chunk_size, chunk_size,
+        dma_id++, fifo_name(c, "out_L2"), host_memref));
+  }
+
+  // Wait for all DMAs.
+  for (int c = 0; c < num_cores; c++) {
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "out_L2")));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "in_L2")));
+  }
+
+  absl::StrAppend(&aie_mlir, "    }\n");  // end runtime_sequence
+  absl::StrAppend(&aie_mlir, "  }\n");    // end aie.device
+  absl::StrAppend(&aie_mlir, "}\n");      // end module
+
+  LOG(INFO) << "XDNA GELU lowering: generated AIE MLIR:\n" << aie_mlir;
+
+  AieLoweringResult result;
+  result.aie_mlir = aie_mlir;
+  result.num_cores = num_cores;
+  result.needs_gelu_kernel = true;
+  return result;
+}
+
+// Detects a LayerNorm pattern in the module.
+// XLA decomposes layer_norm into: mean reduction + variance reduction +
+// rsqrt + normalize + scale/shift. Detection checks:
+//   1. Function: 3 inputs, 1 output
+//   2. Input shapes: [..., D], [D], [D]; output: [..., D]
+//   3. Element type: bf16
+//   4. Contains >=2 linalg.generic ops with reduction iterators
+//   5. Contains math.rsqrt (or arith.divf with math.sqrt)
+//   6. No linalg.matmul ops
+std::optional<LayerNormProgramInfo> DetectLayerNorm(mlir::ModuleOp module) {
+  mlir::func::FuncOp entry_func;
+  module.walk([&](mlir::func::FuncOp func) {
+    if (func.getName() == "main" || !entry_func) entry_func = func;
+  });
+  if (!entry_func) return std::nullopt;
+
+  // Verify function signature: 3 inputs, 1 result.
+  auto func_type = entry_func.getFunctionType();
+  if (func_type.getNumInputs() != 3 || func_type.getNumResults() != 1)
+    return std::nullopt;
+
+  // Input 0 must be a ranked tensor (the data).
+  auto x_type = mlir::dyn_cast<mlir::RankedTensorType>(func_type.getInput(0));
+  auto gamma_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      func_type.getInput(1));
+  auto beta_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      func_type.getInput(2));
+  auto out_type = mlir::dyn_cast<mlir::RankedTensorType>(
+      func_type.getResult(0));
+  if (!x_type || !gamma_type || !beta_type || !out_type) return std::nullopt;
+
+  // Element type must be bf16.
+  std::string elem_type = GetElementTypeStr(x_type.getElementType());
+  if (elem_type != "bf16") return std::nullopt;
+
+  // All inputs/outputs must have consistent element type.
+  if (GetElementTypeStr(gamma_type.getElementType()) != elem_type)
+    return std::nullopt;
+  if (GetElementTypeStr(beta_type.getElementType()) != elem_type)
+    return std::nullopt;
+  if (GetElementTypeStr(out_type.getElementType()) != elem_type)
+    return std::nullopt;
+
+  // x must be at least 1D. gamma/beta must be 1D.
+  if (x_type.getRank() < 1) return std::nullopt;
+  if (gamma_type.getRank() != 1 || beta_type.getRank() != 1)
+    return std::nullopt;
+
+  // Last dim of x must match gamma/beta length.
+  int64_t row_length = x_type.getShape().back();
+  if (gamma_type.getShape()[0] != row_length) return std::nullopt;
+  if (beta_type.getShape()[0] != row_length) return std::nullopt;
+
+  // Output must match x shape.
+  if (out_type != x_type) return std::nullopt;
+
+  // No matmul ops allowed.
+  bool has_matmul = false;
+  entry_func.walk([&](mlir::Operation* op) {
+    if (op->getName().getStringRef() == "linalg.matmul") has_matmul = true;
+  });
+  if (has_matmul) return std::nullopt;
+
+  // Count reductions and look for rsqrt/sqrt markers.
+  int reduction_count = 0;
+  bool has_rsqrt = false;
+  bool has_sqrt = false;
+
+  entry_func.walk([&](mlir::linalg::GenericOp generic) {
+    auto iterators = generic.getIteratorTypesArray();
+    bool is_reduction = false;
+    for (auto it : iterators) {
+      if (it == mlir::utils::IteratorType::reduction) {
+        is_reduction = true;
+        break;
+      }
+    }
+    if (is_reduction) reduction_count++;
+
+    mlir::Block& body = generic.getRegion().front();
+    for (mlir::Operation& body_op : body.without_terminator()) {
+      llvm::StringRef name = body_op.getName().getStringRef();
+      if (name == "math.rsqrt") has_rsqrt = true;
+      if (name == "math.sqrt") has_sqrt = true;
+    }
+  });
+
+  // LayerNorm needs at least 2 reductions (mean + variance) and rsqrt/sqrt.
+  if (reduction_count < 2) return std::nullopt;
+  if (!has_rsqrt && !has_sqrt) return std::nullopt;
+
+  // Kernel uses 32-wide bf16 vectors.
+  if (row_length % 32 != 0) return std::nullopt;
+
+  int64_t num_rows = 1;
+  for (int i = 0; i < x_type.getRank() - 1; i++)
+    num_rows *= x_type.getShape()[i];
+  if (num_rows < 1) return std::nullopt;
+
+  LOG(INFO) << "XDNA: detected LayerNorm pattern: " << num_rows << "x"
+            << row_length << " " << elem_type;
+
+  LayerNormProgramInfo info;
+  info.num_rows = num_rows;
+  info.row_length = row_length;
+  info.element_type = elem_type;
+  return info;
+}
+
+// Generates AIE MLIR for LayerNorm using an external C++ kernel.
+// Pattern: 3 inputs (X, gamma, beta), 1 output. Gamma/beta broadcast to all
+// cores (like K/V in attention). Rows distributed across cores.
+absl::StatusOr<AieLoweringResult> LowerLayerNormToAie(
+    const LayerNormProgramInfo& info, const TargetCaps& caps,
+    int max_columns) {
+  // Auto-scale number of cores.
+  int num_cores = std::min(max_columns, caps.num_columns);
+  while (num_cores > 1) {
+    if (info.num_rows % num_cores != 0) { num_cores--; continue; }
+    break;
+  }
+  int64_t rows_per_core = info.num_rows / num_cores;
+  int64_t total_elements = info.num_rows * info.row_length;
+
+  // L1 budget: in_x (depth 2) + gb (depth 2, acquire 2 → 3 bufs) + out (depth 2).
+  // All buffers are row_length * 2 bytes (bf16).
+  int64_t in_l1 = 2 * info.row_length * 2;   // depth 2 ping-pong
+  int64_t gb_l1 = 3 * info.row_length * 2;   // depth 2 + acquire(2) → 3 buffers
+  int64_t out_l1 = 2 * info.row_length * 2;  // depth 2 ping-pong
+  int64_t total_l1 = in_l1 + gb_l1 + out_l1;
+
+  if (total_l1 > caps.l1_usable_bytes) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "LayerNorm row_length=%d exceeds L1 budget (%d bytes needed, "
+        "%d available)", info.row_length, total_l1, caps.l1_usable_bytes));
+  }
+
+  // DMA dimension limits.
+  int64_t d0_words = info.row_length * 2 / 4;  // bf16 elements -> 32-bit words
+  if (d0_words > kMaxBdWords) {
+    return absl::InvalidArgumentError(absl::StrFormat(
+        "LayerNorm row_length=%d exceeds DMA d0 limit (%d words, max %d)",
+        info.row_length, d0_words, kMaxBdWords));
+  }
+
+  LOG(INFO) << "XDNA LayerNorm lowering: " << info.num_rows << " rows x "
+            << info.row_length << " " << info.element_type
+            << " using " << num_cores << " core(s) ("
+            << rows_per_core << " rows/core)"
+            << " L1=" << total_l1 << "B";
+
+  int start_col = caps.partition_start_column;
+  int shim_row = caps.shim_row;
+  int compute_row = caps.first_compute_row;
+  int fifo_depth = 2;
+
+  std::string row_memref = absl::StrFormat("memref<%dxbf16>", info.row_length);
+  std::string x_host_memref = absl::StrFormat("memref<%dxbf16>", total_elements);
+  std::string gb_host_memref = absl::StrFormat("memref<%dxbf16>",
+                                                info.row_length);
+  std::string o_host_memref = absl::StrFormat("memref<%dxbf16>", total_elements);
+
+  auto fifo_name = [&](int c, const std::string& base) -> std::string {
+    return num_cores > 1 ? absl::StrFormat("c%d_%s", c, base) : base;
+  };
+
+  std::string aie_mlir;
+  absl::StrAppend(&aie_mlir, "module {\n");
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "  aie.device(%s) {\n", DeviceNameForColumns(num_cores)));
+
+  // Tile declarations.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n", col, shim_row, col, shim_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, caps.mem_tile_row, col, caps.mem_tile_row));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%tile_%d_%d = aie.tile(%d, %d)\n",
+        col, compute_row, col, compute_row));
+  }
+
+  // Gamma/beta broadcast: single chain from start_col shim -> start_col mem ->
+  // all compute tiles. Like K/V in attention: send once, all cores read.
+  {
+    std::string gb_shim = absl::StrFormat("tile_%d_%d", start_col, shim_row);
+    std::string gb_mem = absl::StrFormat("tile_%d_%d", start_col,
+                                          caps.mem_tile_row);
+    // L2: shim(start_col) -> mem(start_col).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @in_gb_L2(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        gb_shim, gb_mem, fifo_depth, row_memref));
+    // L1 broadcast: mem(start_col) -> {all compute tiles}.
+    std::string gb_consumers;
+    for (int c = 0; c < num_cores; c++) {
+      if (c > 0) gb_consumers += ", ";
+      absl::StrAppendFormat(&gb_consumers, "%%tile_%d_%d",
+                            start_col + c, compute_row);
+    }
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @in_gb(%%%s, {%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        gb_mem, gb_consumers, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir,
+        "    aie.objectfifo.link [@in_gb_L2] -> [@in_gb] ([] [])\n");
+  }
+
+  // X input and output per-column (like softmax).
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string shim = absl::StrFormat("tile_%d_%d", col, shim_row);
+    std::string mem = absl::StrFormat("tile_%d_%d", col, caps.mem_tile_row);
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+
+    // X input: shim -> mem -> compute.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_x_L2"), shim, mem, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "in_x"), mem, compute, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "in_x_L2"), fifo_name(c, "in_x")));
+
+    // Output: compute -> mem -> shim.
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out"), compute, mem, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo @%s(%%%s, {%%%s}, %d : i32) "
+        ": !aie.objectfifo<%s>\n",
+        fifo_name(c, "out_L2"), mem, shim, fifo_depth, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    aie.objectfifo.link [@%s] -> [@%s] ([] [])\n",
+        fifo_name(c, "out"), fifo_name(c, "out_L2")));
+  }
+
+  // External function declaration.
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    func.func private @layernorm_bf16(%s, %s, %s, %s, i32) -> ()\n",
+      row_memref, row_memref, row_memref, row_memref));
+
+  // Core bodies.
+  for (int c = 0; c < num_cores; c++) {
+    int col = start_col + c;
+    std::string compute = absl::StrFormat("tile_%d_%d", col, compute_row);
+    std::string x_subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", row_memref);
+    std::string gb_subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", row_memref);
+    std::string o_subview_ty = absl::StrFormat(
+        "!aie.objectfifosubview<%s>", row_memref);
+
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "    %%core_%d_%d = aie.core(%%%s) {\n", col, compute_row, compute));
+    // Acquire gamma/beta (2 elements from broadcast FIFO).
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%gb_sub = aie.objectfifo.acquire @in_gb(Consume, 2) : %s\n"
+        "      %%gamma_buf = aie.objectfifo.subview.access %%gb_sub[0] "
+        ": %s -> %s\n"
+        "      %%beta_buf = aie.objectfifo.subview.access %%gb_sub[1] "
+        ": %s -> %s\n",
+        gb_subview_ty, gb_subview_ty, row_memref,
+        gb_subview_ty, row_memref));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      %%c0 = arith.constant 0 : index\n"
+        "      %%c1 = arith.constant 1 : index\n"
+        "      %%num_rows = arith.constant %d : index\n"
+        "      %%row_len = arith.constant %d : i32\n",
+        rows_per_core, info.row_length));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      scf.for %%i = %%c0 to %%num_rows step %%c1 {\n"
+        "        %%in_sub = aie.objectfifo.acquire @%s(Consume, 1) : %s\n"
+        "        %%in_buf = aie.objectfifo.subview.access %%in_sub[0] "
+        ": %s -> %s\n"
+        "        %%out_sub = aie.objectfifo.acquire @%s(Produce, 1) : %s\n"
+        "        %%out_buf = aie.objectfifo.subview.access %%out_sub[0] "
+        ": %s -> %s\n"
+        "        func.call @layernorm_bf16(%%in_buf, %%gamma_buf, "
+        "%%beta_buf, %%out_buf, %%row_len) "
+        ": (%s, %s, %s, %s, i32) -> ()\n"
+        "        aie.objectfifo.release @%s(Consume, 1)\n"
+        "        aie.objectfifo.release @%s(Produce, 1)\n"
+        "      }\n",
+        fifo_name(c, "in_x"), x_subview_ty, x_subview_ty, row_memref,
+        fifo_name(c, "out"), o_subview_ty, o_subview_ty, row_memref,
+        row_memref, row_memref, row_memref, row_memref,
+        fifo_name(c, "in_x"), fifo_name(c, "out")));
+    absl::StrAppend(&aie_mlir,
+        "      aie.objectfifo.release @in_gb(Consume, 2)\n");
+    absl::StrAppend(&aie_mlir, "      aie.end\n    }\n");
+  }
+
+  // Runtime sequence (DMA): 4 args = X, gamma, beta, output.
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "    aie.runtime_sequence(%%arg0: %s, %%arg1: %s, %%arg2: %s, "
+      "%%arg3: %s) {\n",
+      x_host_memref, gb_host_memref, gb_host_memref, o_host_memref));
+
+  int dma_id = 0;
+
+  // Gamma broadcast via @in_gb_L2 (fills slot 0).
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "      aiex.npu.dma_memcpy_nd(%%arg1"
+      "[0, 0, 0, 0][1, 1, 1, %d][0, 0, 0, 1]) "
+      "{id = %d : i64, metadata = @in_gb_L2, issue_token = true} : %s\n",
+      info.row_length, dma_id++, gb_host_memref));
+
+  // Beta broadcast via @in_gb_L2 (fills slot 1).
+  absl::StrAppend(&aie_mlir, absl::StrFormat(
+      "      aiex.npu.dma_memcpy_nd(%%arg2"
+      "[0, 0, 0, 0][1, 1, 1, %d][0, 0, 0, 1]) "
+      "{id = %d : i64, metadata = @in_gb_L2, issue_token = true} : %s\n",
+      info.row_length, dma_id++, gb_host_memref));
+
+  // X per-column.
+  for (int c = 0; c < num_cores; c++) {
+    int64_t offset = c * rows_per_core * info.row_length;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg0"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        offset, rows_per_core, info.row_length, info.row_length,
+        dma_id++, fifo_name(c, "in_x_L2"), x_host_memref));
+  }
+
+  // O per-column.
+  for (int c = 0; c < num_cores; c++) {
+    int64_t offset = c * rows_per_core * info.row_length;
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_memcpy_nd(%%arg3"
+        "[0, 0, 0, %d][1, 1, %d, %d][0, 0, %d, 1]) "
+        "{id = %d : i64, metadata = @%s, issue_token = true} : %s\n",
+        offset, rows_per_core, info.row_length, info.row_length,
+        dma_id++, fifo_name(c, "out_L2"), o_host_memref));
+  }
+
+  // Wait for all channels.
+  absl::StrAppend(&aie_mlir,
+      "      aiex.npu.dma_wait { symbol = @in_gb_L2 }\n");
+  for (int c = 0; c < num_cores; c++) {
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "out_L2")));
+    absl::StrAppend(&aie_mlir, absl::StrFormat(
+        "      aiex.npu.dma_wait { symbol = @%s }\n",
+        fifo_name(c, "in_x_L2")));
+  }
+
+  absl::StrAppend(&aie_mlir, "    }\n");  // end runtime_sequence
+  absl::StrAppend(&aie_mlir, "  }\n");    // end aie.device
+  absl::StrAppend(&aie_mlir, "}\n");      // end module
+
+  LOG(INFO) << "XDNA LayerNorm lowering: generated AIE MLIR:\n" << aie_mlir;
+
+  AieLoweringResult result;
+  result.aie_mlir = aie_mlir;
+  result.num_cores = num_cores;
+  result.needs_layernorm_kernel = true;
+  result.layernorm_row_length = info.row_length;
+  return result;
 }
 
 absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
@@ -3193,6 +3851,17 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
               << " dk=" << attention_info->dk << " "
               << attention_info->element_type;
     return LowerAttentionToAie(*attention_info, caps, config.num_columns);
+  }
+
+  // Check for LayerNorm before matmul (LayerNorm has reductions that could
+  // confuse matmul detection if checked first).
+  auto layernorm_info = DetectLayerNorm(linalg_module);
+  if (layernorm_info.has_value()) {
+    LOG(INFO) << "XDNA AIE lowering: detected LayerNorm "
+              << layernorm_info->num_rows << "x"
+              << layernorm_info->row_length << " "
+              << layernorm_info->element_type;
+    return LowerLayerNormToAie(*layernorm_info, caps, config.num_columns);
   }
 
   // Check for matmul before elementwise analysis.
@@ -3211,6 +3880,14 @@ absl::StatusOr<AieLoweringResult> LowerLinalgToAie(
               << softmax_info->num_rows << "x" << softmax_info->row_length
               << " " << softmax_info->element_type;
     return LowerSoftmaxToAie(*softmax_info, caps, config.num_columns);
+  }
+
+  // Check for GELU before elementwise analysis.
+  auto gelu_info = DetectGelu(linalg_module);
+  if (gelu_info.has_value()) {
+    LOG(INFO) << "XDNA AIE lowering: detected GELU "
+              << gelu_info->num_elements << " " << gelu_info->element_type;
+    return LowerGeluToAie(*gelu_info, caps, config.num_columns);
   }
 
   // Step 1: Analyze the linalg module (elementwise path).
